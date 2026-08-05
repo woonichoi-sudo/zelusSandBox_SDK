@@ -47,13 +47,38 @@ vcpkg가 포트를 빌드할 때 PATH에서 cmake를 다시 찾으므로, PATH �
 
 저장소가 `D:\z-emotion\zelusSandBox_Cobalt` → 현재 위치로 **이동**했다. `cmake_build`, `cmake_build_src`, `cmake_build_cuda` 세 캐시 모두 `CMAKE_HOME_DIRECTORY`에 옛 경로가 박혀 있어 **제자리 재구성이 불가능하다.** 새 빌드 디렉토리를 쓸 것.
 
-### vcpkg 재빌드(~12분) 회피
+### vcpkg 재빌드(~12분) 회피 — 그리고 그 함정
 
 `cmake_build/vcpkg_installed`에 의존성이 이미 빌드돼 있다(include 106개). 새 구성에서 재사용:
 
 ```
 -D VCPKG_INSTALLED_DIR=d:/z-emotion/Cobalt/zelusSandBox_Cobalt/cmake_build/vcpkg_installed
 ```
+
+⚠️ **`VCPKG_INSTALLED_DIR`는 읽기 전용이 아니다.** 소스 디렉토리에 `vcpkg.json`이 있으면
+vcpkg가 **매니페스트 모드**로 켜지고, 이 디렉토리를 자기 소유로 간주해 매니페스트에 맞춰
+**기존 내용을 지운다.** 중간에 포트 빌드가 실패하면 트리가 망가진 채로 남는다
+(실제로 106개 → 2개로 날아간 적이 있다).
+
+- 저장소를 `-S`로 구성하면(`vcpkg.json`이 루트에 있으므로) 반드시 매니페스트 모드가 켜진다.
+  **원본 트리를 가리키지 말고 별도 install root를 쓸 것.**
+- 저장소 밖 프로젝트(`backend/native` 등)는 `vcpkg.json`이 없어 매니페스트가 꺼지므로
+  원본 트리를 안전하게 참조한다. 지금 헤드리스 빌드가 이 방식이다.
+
+복구가 필요하면:
+
+```powershell
+$vs = "C:\Program Files\...\CMake\bin"; $env:PATH = "$vs;$env:PATH"
+& <repo>\vcpkg\vcpkg.exe install --triplet x64-windows `
+    --x-manifest-root=<repo> --x-install-root=<repo>\cmake_build\vcpkg_installed
+```
+
+### PATH 조작은 PowerShell에서 할 것
+
+vcpkg는 포트를 빌드할 때 PATH에서 cmake를 다시 찾는다. **Git Bash에서 `export PATH=...`로
+앞에 붙여도 vcpkg가 `C:\Program Files\CMake\bin\cmake.exe`(4.3.2)를 집는 경우가 있다.**
+그러면 cryptopp가 `Compatibility with CMake < 3.5 has been removed`로 죽는다.
+PowerShell에서 `$env:PATH`를 잡으면 3.31.6이 제대로 우선된다.
 
 ### 두 가지 빌드 모드
 
