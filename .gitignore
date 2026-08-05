@@ -1,0 +1,33 @@
+# 회사 저장소 — 별개 git repo. 읽기 전용이며 이 저장소에 포함하지 않는다.
+zelusSandBox_Cobalt/
+
+# Claude Code 로컬 설정
+.claude/settings.local.json
+
+# ── C++ / CMake ──────────────────────────────
+build/
+cmake-build*/
+out/
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# ── Go ───────────────────────────────────────
+*.exe
+*.exe~
+*.test
+vendor/
+
+# ── Node / TypeScript ────────────────────────
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# ── 에디터 / OS ──────────────────────────────
+.vs/
+.idea/
+Thumbs.db
+desktop.ini
