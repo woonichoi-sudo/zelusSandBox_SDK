@@ -9,6 +9,8 @@
 // 세터로 대체 가능하므로, 이렇게 하면 "로드·시뮬·익스포트가 GL-free인가"만
 // 순수하게 검증할 수 있다. --init 플래그로 GL 경로를 따로 실험한다.
 
+#include "protocol.h"
+
 #include <ZestManager.h>
 
 #include <ztDesignClothPattern.h>
@@ -37,14 +39,18 @@ struct Options
     bool        callInitialize = false;  // --init : GL 경로를 일부러 밟아본다
     bool        exportZbin    = false;
     bool        dumpFrames    = false;  // --dump-frames : 프레임별 메시 추출 측정
+    bool        serve         = false;  // --serve : JSON Lines 프로토콜 루프
 };
 
 void PrintUsage()
 {
     std::cerr <<
         "usage: zelusSandBoxd --load <file.zls> [options]\n"
+        "       zelusSandBoxd --serve            (JSON Lines 프로토콜)\n"
         "\n"
-        "  --load <path>      로드할 .zls (필수)\n"
+        "  --serve            stdin/stdout으로 JSON Lines 프로토콜을 돌린다.\n"
+        "                     게이트웨이가 자식 프로세스로 띄우는 모드.\n"
+        "  --load <path>      로드할 .zls (--serve 아니면 필수)\n"
         "  --frames <n>       시뮬레이션할 프레임 수 (기본 100, 0이면 시뮬 안 함)\n"
         "  --export <path>    결과를 glTF로 익스포트\n"
         "  --zbin             glTF 대신 .zbin으로 익스포트\n"
@@ -93,6 +99,7 @@ bool ParseArgs(int argc, char** argv, Options& opt)
         else if (std::strcmp(a, "--zbin") == 0)       { opt.exportZbin = true; }
         else if (std::strcmp(a, "--init") == 0)       { opt.callInitialize = true; }
         else if (std::strcmp(a, "--dump-frames") == 0){ opt.dumpFrames = true; }
+        else if (std::strcmp(a, "--serve") == 0)      { opt.serve = true; }
         else if (std::strcmp(a, "--help") == 0 || std::strcmp(a, "-h") == 0)
         {
             PrintUsage();
@@ -106,9 +113,10 @@ bool ParseArgs(int argc, char** argv, Options& opt)
         }
     }
 
-    if (opt.loadPath.empty())
+    // --serve 는 씬을 프로토콜로 받으므로 --load가 필요 없다.
+    if (!opt.serve && opt.loadPath.empty())
     {
-        std::cerr << "[error] --load 는 필수입니다\n";
+        std::cerr << "[error] --load 는 필수입니다 (--serve 사용 시 제외)\n";
         PrintUsage();
         return false;
     }
@@ -264,6 +272,14 @@ int main(int argc, char** argv)
         Log("Initialize() 호출 — InitMaterialFolders()가 GL 텍스처 생성에 도달할 수 있음");
         manager.Initialize();
         Log("Initialize() 통과 — GL 없이 머티리얼 폴더 초기화 성공");
+    }
+
+    // ── 프로토콜 모드 ────────────────────────────────────────
+    // 여기부터는 stdout이 프로토콜 전용이 되므로 CLI 경로와 섞이지 않는다.
+    if (opt.serve)
+    {
+        Log("프로토콜 모드 (JSON Lines). stdin으로 요청, stdout으로 응답.");
+        return RunProtocolLoop(manager);
     }
 
     // ── 콜백 등록 ────────────────────────────────────────────

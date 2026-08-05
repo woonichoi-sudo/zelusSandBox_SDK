@@ -119,6 +119,8 @@ set(SANDBOX_SOURCES
 
 add_executable(${PROJECT_NAME}
     src/main.cpp
+    src/protocol.h
+    src/protocol.cpp          # JSON Lines 프로토콜 (게이트웨이와의 대화)
     src/stb_impl.cpp          # nanovg를 링크하지 않으므로 stb_image를 직접 제공
     ${SANDBOX_SOURCES}
 )

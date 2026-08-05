@@ -40,7 +40,9 @@
       "Bash(awk '/class ztChangeTracker|template.*ztChangeTracker/,/^};/' d:/z-emotion/Cobalt/zelusSandBox_Cobalt/SDK/include/ztChangeTracker.h)",
       "Bash(find d:/z-emotion/Cobalt/zelusSandBox_Cobalt/cmake_build/vcpkg_installed -iname *tbb*.cmake)",
       "Bash([ -f \"$L\" ])",
-      "Bash('C:/Program Files/Microsoft Visual Studio/2022/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe' -S d:/z-emotion/Cobalt/backend/native -B d:/z-emotion/Cobalt/backend/native/build -G 'Visual Studio 17 2022' -A x64 -D CMAKE_TOOLCHAIN_FILE=__TRACKED_VAR__/vcpkg/scripts/buildsystems/vcpkg.cmake -D VCPKG_TARGET_TRIPLET=x64-windows -D VCPKG_INSTALLED_DIR=__TRACKED_VAR__/cmake_build/vcpkg_installed)"
+      "Bash('C:/Program Files/Microsoft Visual Studio/2022/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe' -S d:/z-emotion/Cobalt/backend/native -B d:/z-emotion/Cobalt/backend/native/build -G 'Visual Studio 17 2022' -A x64 -D CMAKE_TOOLCHAIN_FILE=__TRACKED_VAR__/vcpkg/scripts/buildsystems/vcpkg.cmake -D VCPKG_TARGET_TRIPLET=x64-windows -D VCPKG_INSTALLED_DIR=__TRACKED_VAR__/cmake_build/vcpkg_installed)",
+      "Bash(awk '/enum class ztLiveEditType/,/};/' d:/z-emotion/Cobalt/zelusSandBox_Cobalt/SDK/include/ztLiveEditUtil.h)",
+      "Bash('C:/Program Files/Microsoft Visual Studio/2022/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe' -S d:/z-emotion/Cobalt/backend/native -B d:/z-emotion/Cobalt/backend/native/build)"
     ],
     "additionalDirectories": [
       "C:\\Users\\wooni\\AppData\\Local\\Temp\\claude\\d--z-emotion-Cobalt\\8278d176-8564-49b7-a189-aff124b9add5\\tasks"
