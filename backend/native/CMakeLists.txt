@@ -52,20 +52,37 @@ else()
     set(OUTPUT_NAME "zelusSandBoxd-demo")
     set(REQUIRES_LICENSE 0)
 
-    set(SRC_BUILD "${SANDBOX_REPO}/cmake_build_src")
+    # 라이선스 없는 엔진은 두 곳에 있고, 구성에 따라 이름과 위치가 다르다.
+    #
+    #   Debug   저장소의 cmake_build_src   → Zest_debug.lib
+    #   Release 우리가 빌드한 engine-build → Zest.lib
+    #
+    # (Debug도 우리 트리에서 빌드하면 통일되지만, 저장소에 이미 있는 걸
+    #  다시 만들 이유가 없어 그대로 쓴다.)
+    set(ENGINE_DEBUG_DIR   "${SANDBOX_REPO}/cmake_build_src")
+    set(ENGINE_RELEASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/engine-build")
 
-    if (NOT EXISTS "${SRC_BUILD}/lib/Debug/Zest_debug.lib")
+    if (NOT EXISTS "${ENGINE_DEBUG_DIR}/lib/Debug/Zest_debug.lib")
         message(FATAL_ERROR
-            "소스 빌드 엔진을 찾을 수 없음: ${SRC_BUILD}/lib/Debug\n"
+            "Debug 엔진을 찾을 수 없음: ${ENGINE_DEBUG_DIR}/lib/Debug\n"
             "라이선스가 있다면 -D USE_SDK_ENGINE=ON 으로 SDK를 쓰십시오.")
     endif()
 
+    if (NOT EXISTS "${ENGINE_RELEASE_DIR}/lib/Release/Zest.lib")
+        message(WARNING
+            "Release 엔진이 없습니다: ${ENGINE_RELEASE_DIR}/lib/Release\n"
+            "engine/CMakeLists.txt 로 먼저 빌드하십시오. Debug는 그대로 됩니다.")
+    endif()
+
+    set(ENG_DIR "$<IF:$<CONFIG:Debug>,${ENGINE_DEBUG_DIR},${ENGINE_RELEASE_DIR}>")
+    set(ENG_SUF "$<$<CONFIG:Debug>:_debug>")
+
     set(ENGINE_LIBS
-        "${SRC_BUILD}/lib/$<CONFIG>/Zest_debug.lib"
-        "${SRC_BUILD}/lib/$<CONFIG>/Zelus_debug.lib"
-        "${SRC_BUILD}/lib/$<CONFIG>/Lumia_debug.lib"
+        "${ENG_DIR}/lib/$<CONFIG>/Zest${ENG_SUF}.lib"
+        "${ENG_DIR}/lib/$<CONFIG>/Zelus${ENG_SUF}.lib"
+        "${ENG_DIR}/lib/$<CONFIG>/Lumia${ENG_SUF}.lib"
     )
-    set(ENGINE_BIN_DIR "${SRC_BUILD}/bin/$<CONFIG>")
+    set(ENGINE_BIN_DIR "${ENG_DIR}/bin/$<CONFIG>")
 
     # find_package를 쓰지 않으므로 imported target이 주던 INTERFACE 속성을
     # 직접 재현해야 한다. 특히 ZS_OS_WINDOWS가 없으면 ztCommon.h가 GCC 분기로
