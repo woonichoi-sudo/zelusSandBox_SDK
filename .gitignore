@@ -6,8 +6,13 @@ zelusSandBox_Cobalt/
 
 # ── C++ / CMake ──────────────────────────────
 build/
+build-*/
+engine-build/
 cmake-build*/
 out/
+
+# vcpkg 의존성 설치 트리 (우리 전용. 저장소 원본과 별개)
+vcpkg_installed/
 *.obj
 *.lib
 *.exp
