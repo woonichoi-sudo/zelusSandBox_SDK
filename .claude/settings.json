@@ -32,7 +32,12 @@
       "Bash(time ./zelusSandBoxd.exe --init --load __TRACKED_VAR__/Zest/testing/sdk/sample.zls --frames 10 --timeout 900 --export out.gltf)",
       "Bash(F=\"C:/Users/wooni/AppData/Local/Temp/claude/d--z-emotion-Cobalt/8278d176-8564-49b7-a189-aff124b9add5/tasks/bkeq1cw3p.output\" *)",
       "Bash(python -c ' *)",
-      "Bash(grep -nB3 -A2 -iE license d:/z-emotion/Cobalt/zelusSandBox_Cobalt/SDK/include/zsSimulationWorld.h)"
+      "Bash(grep -nB3 -A2 -iE license d:/z-emotion/Cobalt/zelusSandBox_Cobalt/SDK/include/zsSimulationWorld.h)",
+      "Bash(awk 'NR>=760 && NR<=790 {printf \"%4d| %s\\\\n\", NR, $0}' Renderer3D.cpp)",
+      "Bash(awk '/class .*ztDesignTriMesh|struct .*ztDesignTriMesh/,/^};/' d:/z-emotion/Cobalt/zelusSandBox_Cobalt/SDK/include/ztDesignTriMesh.h)",
+      "Bash(grep -vE \"^\\\\s*//|^\\\\s*$\")",
+      "Bash(grep -vE '^\\\\s*//|^\\\\s*$' d:/z-emotion/Cobalt/zelusSandBox_Cobalt/SDK/include/zsTriMesh.h)",
+      "Bash(awk '/class ztChangeTracker|template.*ztChangeTracker/,/^};/' d:/z-emotion/Cobalt/zelusSandBox_Cobalt/SDK/include/ztChangeTracker.h)"
     ],
     "additionalDirectories": [
       "C:\\Users\\wooni\\AppData\\Local\\Temp\\claude\\d--z-emotion-Cobalt\\8278d176-8564-49b7-a189-aff124b9add5\\tasks"

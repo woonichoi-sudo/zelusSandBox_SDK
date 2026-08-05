@@ -11,10 +11,17 @@
 
 #include <ZestManager.h>
 
+#include <ztDesignClothPattern.h>
+#include <ztDesignTriMesh.h>
+#include <ztScene.h>
+#include <ztSceneQueryInterface.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 
@@ -29,6 +36,7 @@ struct Options
     int         timeoutSec    = 300;
     bool        callInitialize = false;  // --init : GL 경로를 일부러 밟아본다
     bool        exportZbin    = false;
+    bool        dumpFrames    = false;  // --dump-frames : 프레임별 메시 추출 측정
 };
 
 void PrintUsage()
@@ -82,8 +90,9 @@ bool ParseArgs(int argc, char** argv, Options& opt)
             if (!v) return false;
             opt.timeoutSec = std::atoi(v);
         }
-        else if (std::strcmp(a, "--zbin") == 0)   { opt.exportZbin = true; }
-        else if (std::strcmp(a, "--init") == 0)   { opt.callInitialize = true; }
+        else if (std::strcmp(a, "--zbin") == 0)       { opt.exportZbin = true; }
+        else if (std::strcmp(a, "--init") == 0)       { opt.callInitialize = true; }
+        else if (std::strcmp(a, "--dump-frames") == 0){ opt.dumpFrames = true; }
         else if (std::strcmp(a, "--help") == 0 || std::strcmp(a, "-h") == 0)
         {
             PrintUsage();
@@ -110,6 +119,99 @@ bool ParseArgs(int argc, char** argv, Options& opt)
 void Log(const std::string& msg)
 {
     std::cerr << "[zelusSandBoxd] " << msg << std::endl;
+}
+
+// ── 프레임별 메시 추출 ───────────────────────────────────────
+//
+// 웹으로 지오메트리를 스트리밍하려면 프레임마다 메시를 꺼낼 수 있어야 한다.
+// 데스크톱 렌더러가 쓰는 경로를 그대로 쓴다 (Renderer3D.cpp:768):
+//
+//   clothPattern->GetSimulationOutputMesh()  -> ztChangeTracker<ztDesignTriMesh>
+//     .QueryForUpdate(listener)  변경 여부 (리스너별로 추적)
+//     .Read()                    실제 메시
+//       .vertices / .normals     프레임마다 변함  ← 이것만 보내면 된다
+//       .indices  / .uvs         토폴로지. 프레임 간 고정
+//
+// 여기서는 추출이 되는지, 값이 실제로 변하는지, 비용이 얼마인지만 잰다.
+struct FrameMeshStats
+{
+    std::size_t patterns   = 0;
+    std::size_t changed    = 0;
+    std::size_t vertices   = 0;
+    std::size_t triangles  = 0;
+    double      checksum   = 0.0;   // 위치가 실제로 변하는지 확인용
+    double      elapsedMs  = 0.0;
+
+    // 헤더 주석은 "sim output mesh is in 2D design space"라고 하는데
+    // 데스크톱 3D 렌더러가 이걸 그대로 쓴다. 좌표 범위로 실제를 확인한다.
+    float minX = 0, maxX = 0, minY = 0, maxY = 0, minZ = 0, maxZ = 0;
+    bool  hasBounds = false;
+};
+
+FrameMeshStats ExtractFrameMeshes(ZestManager& manager, void* listener)
+{
+    FrameMeshStats st;
+
+    const auto start = std::chrono::steady_clock::now();
+
+    ztScene* scene = manager.GetSceneManager()->GetCurrentScene();
+    if (!scene)
+    {
+        return st;
+    }
+
+    ztSceneQueryInterface* qi = scene->GetQueryInterface();
+    if (!qi)
+    {
+        return st;
+    }
+
+    for (const auto& entry : qi->GetClothPatterns())
+    {
+        const ztDesignClothPattern* pattern = entry.second.get();
+        if (!pattern)
+        {
+            continue;
+        }
+
+        const ztChangeTracker<ztDesignTriMesh>& tracker = pattern->GetSimulationOutputMesh();
+
+        ++st.patterns;
+        if (tracker.QueryForUpdate(listener))
+        {
+            ++st.changed;
+        }
+
+        const ztDesignTriMesh& mesh = tracker.Read();
+
+        st.vertices  += mesh.vertices.size();
+        st.triangles += mesh.indices.size() / 3;
+
+        for (std::size_t i = 0; i < mesh.vertices.size(); ++i)
+        {
+            const ZELUS::zsVector3& v = mesh.vertices[i];
+            st.checksum += v.x + v.y + v.z;
+
+            if (!st.hasBounds)
+            {
+                st.minX = st.maxX = v.x;
+                st.minY = st.maxY = v.y;
+                st.minZ = st.maxZ = v.z;
+                st.hasBounds = true;
+            }
+            else
+            {
+                st.minX = (std::min)(st.minX, v.x);  st.maxX = (std::max)(st.maxX, v.x);
+                st.minY = (std::min)(st.minY, v.y);  st.maxY = (std::max)(st.maxY, v.y);
+                st.minZ = (std::min)(st.minZ, v.z);  st.maxZ = (std::max)(st.maxZ, v.z);
+            }
+        }
+    }
+
+    st.elapsedMs = std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - start).count();
+
+    return st;
 }
 
 // 어느 엔진과 링크됐는지. 빌드가 두 종류라 실행 파일만 보고는 알 수 없어서
@@ -221,7 +323,28 @@ int main(int argc, char** argv)
             if (f > lastReported)
             {
                 lastReported = f;
-                Log("  frame " + std::to_string(f));
+
+                if (opt.dumpFrames)
+                {
+                    // 리스너 주소는 안정적이기만 하면 된다.
+                    static int listenerToken = 0;
+                    const FrameMeshStats st = ExtractFrameMeshes(manager, &listenerToken);
+
+                    std::ostringstream os;
+                    os << "  frame " << f
+                       << " | 패턴 " << st.patterns << " (변경 " << st.changed << ")"
+                       << " | 정점 " << st.vertices
+                       << " | 삼각형 " << st.triangles
+                       << " | 추출 " << std::fixed << std::setprecision(2) << st.elapsedMs << "ms"
+                       << " | bbox X[" << std::setprecision(1) << st.minX << ".." << st.maxX
+                       << "] Y[" << st.minY << ".." << st.maxY
+                       << "] Z[" << st.minZ << ".." << st.maxZ << "]";
+                    Log(os.str());
+                }
+                else
+                {
+                    Log("  frame " + std::to_string(f));
+                }
             }
 
             manager.UpdateFrame();   // 대기 중인 라이브에디팅 반영
