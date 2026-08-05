@@ -31,3 +31,4 @@ dist/
 .idea/
 Thumbs.db
 desktop.ini
+.claude/settings.json.tmp.*
