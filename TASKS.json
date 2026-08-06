@@ -71,7 +71,7 @@
       "files": ["backend/src/server/index.ts", "backend/src/server/smoke.ts", "backend/package.json"],
       "depends": [],
       "status": "done",
-      "commit": "ef7efad"
+      "commit": "ef7efad, 50b8dc6"
     },
     {
       "id": 5,
