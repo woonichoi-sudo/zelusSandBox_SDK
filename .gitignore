@@ -31,6 +31,10 @@ dist/
 .vite/
 *.tsbuildinfo
 
+# 런타임 데이터 — 업로드된 씬(.zls)과 익스포트 산출물.
+# sample.zls 한 건이 103MB다. 절대 커밋되면 안 된다.
+backend/data/
+
 # ── 에디터 / OS ──────────────────────────────
 .vs/
 .idea/

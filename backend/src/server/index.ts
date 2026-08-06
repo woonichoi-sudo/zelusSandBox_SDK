@@ -20,8 +20,11 @@
 
 import { createServer as createHttpServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import path from 'node:path';
 
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
+
+import { createSceneRoutes, SceneStore } from './files.ts';
 
 /**
  * 라우트 모듈이 받는 것.
@@ -76,6 +79,25 @@ export interface GatewayOptions {
    * 여기가 아니라 #configure의 내장 목록에 넣는다.
    */
   routes?: RouteRegistrar[];
+  /**
+   * 업로드된 씬을 둘 디렉토리. 기본은 `backend/data/scenes`.
+   * 회사 저장소 밖이어야 한다 — 기본값도 그렇게 잡혀 있다.
+   * 테스트는 임시 디렉토리를 넘겨 서버 인스턴스마다 격리할 수 있다.
+   */
+  sceneDir?: string;
+  /** 업로드 1건의 상한(바이트). 기본 DEFAULT_MAX_SCENE_BYTES (512MiB) */
+  maxSceneBytes?: number;
+}
+
+/**
+ * 기본 씬 디렉토리 = `<backend>/data/scenes`.
+ *
+ * cwd가 아니라 **이 모듈 위치**를 기준으로 잡는다. cwd 기준이면 어디서
+ * 띄우느냐에 따라 씬이 흩어지고, 최악의 경우 읽기 전용인 회사 저장소 안에
+ * 생긴다. src/server/ 에서든 dist/server/ 에서든 두 단계 위가 backend/ 다.
+ */
+export function defaultSceneDir(): string {
+  return path.resolve(import.meta.dirname, '..', '..', 'data', 'scenes');
 }
 
 /** start()가 알려주는 실제 바인딩 결과 */
@@ -127,9 +149,14 @@ export class Gateway {
   #startedAt = 0;
   /** 등록된 라우트 모듈이 돌려준 수명 훅. start()가 소비한다 */
   #routeHooks: RouteHooks[] = [];
+  #scenes: SceneStore;
 
   constructor(opts: GatewayOptions = {}) {
     this.#opts = opts;
+    this.#scenes = new SceneStore({
+      dir: opts.sceneDir ?? defaultSceneDir(),
+      ...(opts.maxSceneBytes === undefined ? {} : { maxBytes: opts.maxSceneBytes }),
+    });
     this.#app = express();
     this.#configure(this.#app);
     this.#http = createHttpServer(this.#app);
@@ -157,6 +184,17 @@ export class Gateway {
   /** WebSocket 업그레이드가 필요할 때 (#6) */
   get server(): Server {
     return this.#http;
+  }
+
+  /**
+   * 업로드된 씬 저장소.
+   *
+   * #6이 세션에 씬을 물릴 때 필요하다. 클라이언트는 id만 알고, 워커의 load
+   * op은 절대경로를 받으므로, 그 변환은 `gw.scenes.pathOf(id)` 한 곳에서만
+   * 일어난다 — 경로가 응답 JSON으로 새는 길을 아예 만들지 않기 위해서다.
+   */
+  get scenes(): SceneStore {
+    return this.#scenes;
   }
 
   get listening(): boolean {
@@ -211,14 +249,13 @@ export class Gateway {
       if (hooks) this.#routeHooks.push(hooks);
     };
 
-    // (a) 내장 라우트 모듈. #5부터 여기에 한 줄씩 는다:
-    //
-    //       use(createFileRoutes({ uploadDir: this.#opts.uploadDir ?? defaultUploadDir() }));
+    // (a) 내장 라우트 모듈. 여기에 한 줄씩 는다.
     //
     //     의존성은 팩토리 인자로 넘기고, 바깥에서 바꿔야 하는 값이면
     //     GatewayOptions에 필드를 추가해 생성자 시점에 받는다.
     //     await가 필요한 준비는 팩토리가 RouteHooks.prepare로 돌려주면
     //     start()가 리스닝 직전에 처리한다 — 생성자에서 await할 필요가 없다.
+    use(createSceneRoutes(this.#scenes)); // #5 POST/GET /api/scenes
 
     // (b) 바깥에서 주입한 라우트. 내장 뒤, catch-all 앞.
     for (const register of this.#opts.routes ?? []) use(register);
@@ -307,10 +344,13 @@ export function createServer(opts: GatewayOptions = {}): Gateway {
 /** CLI 경로: node --experimental-strip-types src/server/index.ts */
 async function main(): Promise<void> {
   const port = Number(process.env['PORT'] ?? 3000);
+  const maxSceneBytes = Number(process.env['MAX_SCENE_BYTES'] ?? Number.NaN);
   const gateway = createServer({
     port,
     host: process.env['HOST'] ?? '127.0.0.1',
     onLog: (line) => console.log(line),
+    ...(process.env['SCENE_DIR'] ? { sceneDir: process.env['SCENE_DIR'] } : {}),
+    ...(Number.isFinite(maxSceneBytes) ? { maxSceneBytes } : {}),
   });
 
   const shutdown = (signal: string): void => {
@@ -328,6 +368,7 @@ async function main(): Promise<void> {
 
   const { url } = await gateway.start();
   console.log(`health: ${url}/api/health`);
+  console.log(`씬 디렉토리: ${gateway.scenes.dir} (상한 ${gateway.scenes.maxBytes} 바이트)`);
 }
 
 if (process.argv[1] && import.meta.filename === process.argv[1]) {
