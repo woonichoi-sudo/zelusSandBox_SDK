@@ -94,8 +94,8 @@
       "verify": "auto",
       "files": ["backend/src/server/sessions.ts"],
       "depends": [4],
-      "status": "todo",
-      "commit": null
+      "status": "done",
+      "commit": "f077d0f"
     },
     {
       "id": 7,
