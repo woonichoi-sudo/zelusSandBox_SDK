@@ -13,7 +13,13 @@
     "smoke": "node --experimental-strip-types src/sdk/smoke.ts"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^22.10.2",
+    "@types/ws": "^8.18.1",
     "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "ws": "^8.21.2"
   }
 }
