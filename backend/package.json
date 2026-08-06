@@ -1,0 +1,19 @@
+{
+  "name": "@zelus/backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "zelusSandBoxd 헤드리스 워커를 구동하는 SDK와 게이트웨이",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "smoke": "node --experimental-strip-types src/sdk/smoke.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}

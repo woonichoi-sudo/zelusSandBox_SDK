@@ -47,7 +47,15 @@
       "Bash([ -f \"$F\" ])",
       "Bash(tail -12 C:/Users/wooni/AppData/Local/Temp/claude/d--z-emotion-Cobalt/8278d176-8564-49b7-a189-aff124b9add5/tasks/bh7zy0mw3.output)",
       "Bash(echo \" 로그 없음\")",
-      "Bash(echo)"
+      "Bash(echo)",
+      "Bash(npm --version)",
+      "Bash(echo \"npm : $\\(npm --version 2>/dev/null || echo '미설치'\\)\")",
+      "Bash(pnpm --version)",
+      "Bash(echo \"pnpm: $\\(pnpm --version 2>/dev/null || echo '없음'\\)\")",
+      "Bash(yarn --version)",
+      "Bash(node --experimental-strip-types src/sdk/smoke.ts)",
+      "Bash(npm install *)",
+      "Bash(npx tsc *)"
     ],
     "additionalDirectories": [
       "C:\\Users\\wooni\\AppData\\Local\\Temp\\claude\\d--z-emotion-Cobalt\\8278d176-8564-49b7-a189-aff124b9add5\\tasks"
