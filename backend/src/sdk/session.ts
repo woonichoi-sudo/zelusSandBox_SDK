@@ -16,6 +16,7 @@ import {
   type SetParamsResult,
   type SimulationParams,
   type StatusResult,
+  type SubscribeResult,
   type VersionResult,
 } from './protocol.ts';
 import { Worker, type WorkerOptions } from './worker.ts';
@@ -155,6 +156,18 @@ export class Session extends EventEmitter {
 
   step(): Promise<{ mode: string }> {
     return this.#call('step');
+  }
+
+  /**
+   * frame 이벤트에 메시를 실어 보내라고 켠다.
+   * 현재는 플래그만 선다 — 실제 첨부는 다음 단계다.
+   */
+  subscribe(): Promise<SubscribeResult> {
+    return this.#call('subscribe');
+  }
+
+  unsubscribe(): Promise<SubscribeResult> {
+    return this.#call('unsubscribe');
   }
 
   status(): Promise<StatusResult> {

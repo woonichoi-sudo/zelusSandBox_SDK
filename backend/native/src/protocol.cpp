@@ -393,6 +393,14 @@ int RunProtocolLoop(ZestManager& manager)
     bool running       = true;
     int  exitCode      = 0;
 
+    // 프레임 이벤트에 메시를 실어 보낼지. 지금은 상태만 들고 있고 실제 첨부는
+    // 다음 단계다 — 토글이 안 되는 것과 페이로드가 안 실리는 것을 따로 보기
+    // 위해서다.
+    //
+    // 씬 상태가 아니라 클라이언트의 전송 취향이므로 load/clear/reset에서
+    // 건드리지 않는다. 프로세스(=세션) 수명 내내 유지된다.
+    bool subscribed = false;
+
     while (running)
     {
         // 1) 프레임 진행 이벤트
@@ -504,6 +512,16 @@ int RunProtocolLoop(ZestManager& manager)
                 manager.SetAnimationMode(ZestManager::AnimationMode::STEP);
                 result = json{ { "mode", "step" } };
             }
+            else if (op == "subscribe")
+            {
+                subscribed = true;
+                result = json{ { "subscribed", true } };
+            }
+            else if (op == "unsubscribe")
+            {
+                subscribed = false;
+                result = json{ { "subscribed", false } };
+            }
             else if (op == "status")
             {
                 result = json{
@@ -512,6 +530,7 @@ int RunProtocolLoop(ZestManager& manager)
                     { "mode",         ModeName(manager.GetAnimationMode()) },
                     { "frame",        curFrame.load() },
                     { "maxFrame",     maxFrame.load() },
+                    { "subscribed",   subscribed },
                 };
             }
             else if (op == "getParams")

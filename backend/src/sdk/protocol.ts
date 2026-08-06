@@ -17,6 +17,8 @@ export type Request =
   | { id: number; op: 'pause' }
   | { id: number; op: 'reset' }
   | { id: number; op: 'step' }
+  | { id: number; op: 'subscribe' }
+  | { id: number; op: 'unsubscribe' }
   | { id: number; op: 'status' }
   | { id: number; op: 'getParams' }
   | { id: number; op: 'setParams'; params: Partial<SimulationParams> }
@@ -75,6 +77,16 @@ export interface StatusResult {
   mode: 'play' | 'pause' | 'reset' | 'step' | 'unknown';
   frame: number;
   maxFrame: number;
+  /**
+   * frame 이벤트에 메시를 실어 보낼지. 씬 상태가 아니라 클라이언트의 전송
+   * 취향이므로 load/clear/reset이 건드리지 않는다 — 워커 수명 내내 유지된다.
+   */
+  subscribed: boolean;
+}
+
+/** subscribe / unsubscribe 의 결과. 요청한 방향을 그대로 확인해준다. */
+export interface SubscribeResult {
+  subscribed: boolean;
 }
 
 export interface PatternInfo {

@@ -65,6 +65,24 @@ async function main(): Promise<void> {
       `zelus=${JSON.stringify(ver.zelus)}, lumia=${JSON.stringify(ver.lumia)}`,
     );
 
+    // 구독 토글도 씬 로드 없이 ready 직후에 답해야 한다.
+    // status가 실제로 그 상태를 들고 있는지가 핵심이다.
+    const sub = await session.subscribe();
+    const stSub = await session.status();
+    check(
+      'subscribe → 구독 켜짐',
+      sub.subscribed === true && stSub.subscribed === true,
+      `result=${sub.subscribed}, status=${stSub.subscribed}`,
+    );
+
+    const unsub = await session.unsubscribe();
+    const stUnsub = await session.status();
+    check(
+      'unsubscribe → 구독 꺼짐',
+      unsub.subscribed === false && stUnsub.subscribed === false,
+      `result=${unsub.subscribed}, status=${stUnsub.subscribed}`,
+    );
+
     // ── 2. 씬 로드 ────────────────────────────────────────
     t = performance.now();
     await session.load(ZLS);
