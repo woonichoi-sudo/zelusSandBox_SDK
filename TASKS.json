@@ -106,8 +106,8 @@
       "verify": "auto",
       "files": ["backend/src/server/bridge.ts"],
       "depends": [6],
-      "status": "todo",
-      "commit": null
+      "status": "done",
+      "commit": "9c41e56"
     },
     {
       "id": 8,
@@ -137,7 +137,7 @@
       "id": 10,
       "group": "gateway",
       "title": "export + glTF 다운로드",
-      "detail": "GET /api/exports/:id. 세션이 실제로 만든 파일을 받아야 의미가 있어 브리지 뒤에 둔다.",
+      "detail": "GET /api/exports/:id. 세션이 실제로 만든 파일을 받아야 의미가 있어 브리지 뒤에 둔다. 7번이 export op을 화이트리스트에서 빼 뒀으므로 bridge.ts의 OPS 테이블에서 그 줄을 여는 것도 이 작업이다 — 지금 거부 문구가 \"#10에서 다운로드와 함께 열립니다\"라고 안내한다. 7번에서 미리 열었다면 서버가 경로를 정한 파일이 아무도 지우지 않고 아무도 내려받을 수 없는 채로 쌓였을 것이다. 기능은 0이고 디스크 고갈 경로만 남으므로, 산출물 위치·다운로드·정리·세션당 개수를 함께 정해야 한다. export는 파일을 쓰기 때문에 load(읽기)보다 위험하다 — 클라이언트가 준 경로를 그대로 쓰는 일은 없어야 하며, 5번(파일명이 경로 조립에 쓰이지 않는다)과 7번(응답에서 서버 경로를 지운다)의 결정을 그대로 잇는다.",
       "test": "세션에서 export 실행 → 그 파일이 HTTP로 받아지고 바이트가 일치",
       "verify": "auto",
       "files": ["backend/src/server/files.ts"],
