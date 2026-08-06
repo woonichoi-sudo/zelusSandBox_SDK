@@ -70,8 +70,8 @@
       "verify": "auto",
       "files": ["backend/src/server/index.ts", "backend/src/server/smoke.ts", "backend/package.json"],
       "depends": [],
-      "status": "todo",
-      "commit": null
+      "status": "done",
+      "commit": "ef7efad"
     },
     {
       "id": 5,
