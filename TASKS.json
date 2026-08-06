@@ -1,0 +1,285 @@
+{
+  "project": "zelusSandBox_Cobalt 웹 서비스화",
+  "updated": "2026-08-06",
+  "source": "DESIGN.md §10 구현 순서를 테스트 가능한 단위로 분할한 것",
+  "principle": "작은 단위 → 테스트 작성 → 통과 → 커밋 → 다음. 단위 크기 기준은 '최소'가 아니라 '테스트가 원인을 지목할 수 있는 최소'.",
+
+  "legend": {
+    "status": {
+      "todo": "미착수",
+      "doing": "진행 중",
+      "done": "테스트 통과 + 커밋 완료",
+      "blocked": "선행 조건 미충족"
+    },
+    "verify": {
+      "auto": "스크립트로 검증. 통과 기준이 참/거짓으로 판정됨",
+      "manual": "사람이 화면으로 확인. 자동화 비용이 지금 단계에 과함"
+    }
+  },
+
+  "groups": {
+    "worker": "C++ 헤드리스 워커 — backend/native. 프로토콜 확장은 protocol.cpp와 sdk/protocol.ts를 반드시 같이 고칠 것",
+    "gateway": "Node 게이트웨이 — backend/src/server",
+    "frontend": "웹 UI — frontend"
+  },
+
+  "tasks": [
+    {
+      "id": 1,
+      "group": "worker",
+      "title": "version op",
+      "detail": "엔진 버전 문자열을 돌려주는 op. Zelus/Lumia 각각. 데스크톱 기능 #58·#59에 대응하고, C++ 왕복과 증분 빌드를 확인하는 워밍업을 겸한다.",
+      "test": "version 호출 → zelus/lumia 두 문자열이 비어있지 않음",
+      "verify": "auto",
+      "files": ["backend/native/src/protocol.cpp", "backend/src/sdk/protocol.ts", "backend/src/sdk/session.ts"],
+      "depends": [],
+      "status": "todo",
+      "commit": null
+    },
+    {
+      "id": 2,
+      "group": "worker",
+      "title": "subscribe / unsubscribe 토글",
+      "detail": "구독 상태만 켜고 끈다. 메시 푸시는 3번에서. 상태와 페이로드를 분리해야 실패 원인이 좁혀진다.",
+      "test": "subscribe → status에 구독 상태 true → unsubscribe → false",
+      "verify": "auto",
+      "files": ["backend/native/src/protocol.cpp", "backend/src/sdk/protocol.ts", "backend/src/sdk/session.ts"],
+      "depends": [1],
+      "status": "todo",
+      "commit": null
+    },
+    {
+      "id": 3,
+      "group": "worker",
+      "title": "구독 중 프레임에 메시 첨부",
+      "detail": "구독 상태면 frame 이벤트에 positions를 실어 보낸다. 지금은 클라이언트가 프레임마다 meshData를 요청해야 해서 왕복이 낭비된다. 게이트웨이의 프레임 중계·백프레셔 설계가 이 op에 의존하므로 게이트웨이보다 먼저 한다.",
+      "test": "load → start → 프레임 N개 수신, 각 프레임의 positions.length == 정점수*3",
+      "verify": "auto",
+      "note": "zsVector3는 SIMD 정렬로 16바이트다. C++에서 float3로 재포장해 보낼 것 (DESIGN.md §5.4)",
+      "files": ["backend/native/src/protocol.cpp", "backend/src/sdk/protocol.ts", "backend/src/sdk/session.ts"],
+      "depends": [2],
+      "status": "todo",
+      "commit": null
+    },
+    {
+      "id": 4,
+      "group": "gateway",
+      "title": "HTTP 골격 + /api/health + 스모크 하네스",
+      "detail": "Express 기동과 테스트 러너를 세운다. health 자체의 가치는 낮지만 이후 단위가 전부 이 하네스 위에 쌓인다. 테스트 스타일은 sdk/smoke.ts를 따른다 — 프레임워크 도입 없음.",
+      "test": "서버 기동 → GET /api/health 200",
+      "verify": "auto",
+      "files": ["backend/src/server/index.ts", "backend/src/server/smoke.ts", "backend/package.json"],
+      "depends": [],
+      "status": "todo",
+      "commit": null
+    },
+    {
+      "id": 5,
+      "group": "gateway",
+      "title": "씬 업로드 + 목록",
+      "detail": "POST /api/scenes, GET /api/scenes. 다운로드는 export 결과물이 있어야 진짜 테스트가 되므로 10번으로 분리했다.",
+      "test": "업로드 → 목록에 뜸 → 저장된 바이트가 원본과 일치",
+      "verify": "auto",
+      "files": ["backend/src/server/files.ts"],
+      "depends": [4],
+      "status": "todo",
+      "commit": null
+    },
+    {
+      "id": 6,
+      "group": "gateway",
+      "title": "WS 연결 = 세션 수명",
+      "detail": "연결 시 pool.acquire(), 종료 시 pool.release(). 아직 op 중계는 없다. 세션 = 프로세스 1개는 엔진의 static 상태 때문에 구조적으로 강제된 것이다 (CLAUDE.md).",
+      "test": "연결 → pool.stats.busy == 1 → 종료 → 0. maxTotal 초과 시 거부 코드로 닫힘",
+      "verify": "auto",
+      "files": ["backend/src/server/sessions.ts"],
+      "depends": [4],
+      "status": "todo",
+      "commit": null
+    },
+    {
+      "id": 7,
+      "group": "gateway",
+      "title": "요청/응답 중계 + op 화이트리스트",
+      "detail": "클라이언트 → 워커 방향. quit 등 클라이언트가 불러선 안 되는 op은 거부한다.",
+      "test": "ping 왕복 성공. quit 요청은 거부되고 세션이 살아 있음",
+      "verify": "auto",
+      "files": ["backend/src/server/bridge.ts"],
+      "depends": [6],
+      "status": "todo",
+      "commit": null
+    },
+    {
+      "id": 8,
+      "group": "gateway",
+      "title": "이벤트 역방향 중계",
+      "detail": "워커 → 클라이언트 방향. frame, engineMessage.",
+      "test": "load → start → 클라이언트에 frame 이벤트 도착",
+      "verify": "auto",
+      "files": ["backend/src/server/bridge.ts"],
+      "depends": [7, 3],
+      "status": "todo",
+      "commit": null
+    },
+    {
+      "id": 9,
+      "group": "gateway",
+      "title": "백프레셔 latest-wins",
+      "detail": "시뮬이 브라우저보다 빠를 수 있다. ws.bufferedAmount가 임계값을 넘으면 중간 프레임을 버리고 최신 것만 보낸다. 시뮬 속도와 전송 속도를 분리한다.",
+      "test": "느린 소비자 흉내 → 중간 프레임이 드롭되고 최신 프레임이 도착",
+      "verify": "auto",
+      "files": ["backend/src/server/bridge.ts"],
+      "depends": [8],
+      "status": "todo",
+      "commit": null
+    },
+    {
+      "id": 10,
+      "group": "gateway",
+      "title": "export + glTF 다운로드",
+      "detail": "GET /api/exports/:id. 세션이 실제로 만든 파일을 받아야 의미가 있어 브리지 뒤에 둔다.",
+      "test": "세션에서 export 실행 → 그 파일이 HTTP로 받아지고 바이트가 일치",
+      "verify": "auto",
+      "files": ["backend/src/server/files.ts"],
+      "depends": [7, 5],
+      "status": "todo",
+      "commit": null
+    },
+    {
+      "id": 11,
+      "group": "frontend",
+      "title": "Vite 골격 + WS 클라이언트",
+      "detail": "렌더링 전에 순수 로직부터. 프레임 디코딩, id 상관, 재연결. 여기가 프론트에서 자동 테스트가 붙는 유일한 층이다.",
+      "test": "Float32Array 디코딩 길이·정렬 검증, 요청 id 상관, 끊김 후 재연결",
+      "verify": "auto",
+      "files": ["frontend/vite.config.ts", "frontend/src/protocol/"],
+      "depends": [8],
+      "status": "todo",
+      "commit": null
+    },
+    {
+      "id": 12,
+      "group": "frontend",
+      "title": "three.js 3D 뷰",
+      "detail": "토폴로지(indices, uvs)는 최초 1회, positions만 매 프레임 교체. 카메라 조작은 전부 클라이언트에서 끝나 서버 왕복이 없다. 이 프로젝트의 첫 결승선.",
+      "test": "브라우저에 옷이 뜬다",
+      "verify": "manual",
+      "files": ["frontend/src/viewer3d/"],
+      "depends": [11],
+      "status": "todo",
+      "commit": null
+    },
+    {
+      "id": 13,
+      "group": "frontend",
+      "title": "프레임 스트리밍",
+      "detail": "구독한 프레임을 positionAttr에 덮어쓴다. 3,022정점 × 12B = 36KB/프레임, 25fps면 약 900KB/s.",
+      "test": "옷이 움직인다",
+      "verify": "manual",
+      "files": ["frontend/src/viewer3d/"],
+      "depends": [12],
+      "status": "todo",
+      "commit": null
+    },
+    {
+      "id": 14,
+      "group": "frontend",
+      "title": "재생 컨트롤",
+      "detail": "Start/Pause, Reset, Clear. 데스크톱 기능 #4·#5·#6과 키보드 #60~#63에 대응.",
+      "test": "버튼 → 상태 전이 자동 검증 + 화면 확인",
+      "verify": "auto",
+      "files": ["frontend/src/panels/"],
+      "depends": [13],
+      "status": "todo",
+      "commit": null
+    },
+    {
+      "id": 15,
+      "group": "frontend",
+      "title": "2D 펼침 뷰 + 모핑",
+      "detail": "추가 데이터가 필요 없다. 같은 indices에 위치만 vertices → uvs로 바꾸고 정사영 카메라를 쓴다. 두 값을 보간하면 3D↔2D 모핑이 나온다.",
+      "test": "좌표 변환 자동 검증 + 화면 확인",
+      "verify": "auto",
+      "files": ["frontend/src/viewer2d/"],
+      "depends": [12],
+      "status": "todo",
+      "commit": null
+    },
+    {
+      "id": 16,
+      "group": "frontend",
+      "title": "스키마 기반 파라미터 패널",
+      "detail": "위젯 54개를 손으로 쓰지 않는다. 스키마 하나가 패널 렌더링 + setParams 페이로드 + 타입 검증을 덮는다. !IsSimulationInitialized()일 때만 만질 수 있는 항목은 lockedWhenSimInit 플래그로 처리. v1 위젯은 lil-gui.",
+      "test": "스키마 → setParams 페이로드 변환 자동 검증 + 슬라이더가 시뮬에 반영되는지 화면 확인",
+      "verify": "auto",
+      "files": ["frontend/src/panels/"],
+      "depends": [14],
+      "status": "todo",
+      "commit": null
+    }
+  ],
+
+  "backlog": {
+    "note": "데스크톱 68개 기능 중 서버가 담당할 54개 기준. 24개는 이미 프로토콜에 있고 아래 30개가 남았다. 화면이 나온 뒤(16번 이후) 착수한다 — 검증 없이 쌓지 않기 위해.",
+    "groups": [
+      {
+        "key": "params",
+        "title": "A. 파라미터 확장 — 17개",
+        "cost": "낮음. C++ 파라미터 매핑 테이블에 줄 추가가 대부분",
+        "items": [
+          { "ui": [16, 17], "what": "stretch / bend spring", "note": "UpdateLiveEditing(UpdateClothPhysicsParameters) 호출이 따라붙는다" },
+          { "ui": [26, 27, 28, 29, 31, 32], "what": "collisionType 비트 6개" },
+          { "ui": [30], "what": "pinch stabilization" },
+          { "ui": [33, 34, 35, 36], "what": "Full/Partial DCD·CCD 반복 4개" },
+          { "ui": [37], "what": "thicknessScaling" },
+          { "ui": [38], "what": "collision solver", "warn": "데스크톱은 이걸 solverType(적분기)에 쓴다 — PROJECT_ANALYSIS.md §9 ①의 버그. 반드시 별도 필드명으로 노출할 것" },
+          { "ui": [39], "what": "boundingVolumeType", "note": "!simInitialized일 때만 유효" },
+          { "ui": [40], "what": "broadPhaseType + gpuCollisionResolver", "note": "!simInitialized일 때만 유효" }
+        ]
+      },
+      {
+        "key": "scene",
+        "title": "B. 씬 인벤토리 & 편집 — 새 op 6개",
+        "cost": "중간. ZestManager에 전부 있고 프로토콜에 노출만 안 돼 있다",
+        "items": [
+          { "ui": [45, 46, 47], "op": "drapingItems / loadDrapingItem", "zest": "GetDrapingItems / LoadDrapingItem" },
+          { "ui": [49], "op": "surfaces", "zest": "GetSurfaceInfos + GetSurfaceSize" },
+          { "ui": [51, 52], "op": "setSurfaceSize", "zest": "UpdateSizeSurface" },
+          { "ui": [50], "op": "setFabric", "zest": "SetFabricMaterial" },
+          { "ui": [48], "op": "setEndPose", "zest": "SetEndPose" }
+        ]
+      },
+      {
+        "key": "misc",
+        "title": "C. 나머지",
+        "items": [
+          { "ui": [8], "op": "saveZls", "zest": "SaveZls" }
+        ]
+      }
+    ],
+    "deferred": [
+      { "ui": [19], "what": "GPU 솔버", "why": "CUDA 빌드가 미완성이다. v1은 CPU 전용 (CLAUDE.md)" },
+      { "ui": [67], "what": "그래빙 (Ctrl+드래그)", "why": "왕복 지연이 체감된다. DESIGN.md §9에서 v1 제외 검토 중" },
+      { "what": "바이너리 채널", "why": "base64 제거로 33% 감소 + 파싱 제거. DESIGN.md §10의 7단계" },
+      { "what": "디자인 기반 2D (커브·노치·시접·봉제선)", "why": "메시가 아니라 디자인 엔티티라 프로토콜 확장이 필요하다. DESIGN.md §7.3" },
+      { "what": "배치 모드 + 동시 인스턴스 측정", "why": "서버 사양 확정. DESIGN.md §10의 8단계" }
+    ]
+  },
+
+  "clientOnly": {
+    "note": "데스크톱 68개 중 14개는 서버가 관여하지 않는다. 프로토콜에 넣지 말 것.",
+    "items": [
+      { "ui": [1], "what": "framerate 표시" },
+      { "ui": [53, 54, 55, 56], "what": "RenderOption 4개 — show avatar/pattern/sewing/wireframe" },
+      { "ui": [57], "what": "키/마우스 치트시트" },
+      { "ui": [60, 61, 62, 63], "what": "키보드 단축키 — 재생 op으로 매핑" },
+      { "ui": [64, 65, 66], "what": "카메라 회전·팬·줌" },
+      { "ui": [68], "what": "윈도우 리사이즈" }
+    ]
+  },
+
+  "openQuestions": [
+    { "id": 1, "what": "라이선스 미확보", "impact": "배포용 빌드를 검증하지 못했다. 동접 = 인스턴스 수이므로 계약 조건이 실질적 상한이 된다" },
+    { "id": 2, "what": "동시 인스턴스 미측정", "impact": "세션당 360MB는 알지만 CPU가 먼저 막힐 가능성이 있다" }
+  ]
+}
