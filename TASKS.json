@@ -82,8 +82,8 @@
       "verify": "auto",
       "files": ["backend/src/server/files.ts"],
       "depends": [4],
-      "status": "todo",
-      "commit": null
+      "status": "done",
+      "commit": "41ff68e"
     },
     {
       "id": 6,
