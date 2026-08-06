@@ -12,12 +12,56 @@
  *
  * express 의 app.listen 대신 node:http 서버를 직접 만든다. WebSocket
  * 업그레이드(#6)가 http.Server 인스턴스를 필요로 하기 때문이다.
+ *
+ * 라우트를 추가하려면 #configure 안의 "라우트 등록 지점"을 볼 것. 404
+ * catch-all이 같은 함수 안에서 등록되므로, 그 뒤에 붙은 라우트는 조용히
+ * 죽는다 — 그래서 등록 자리를 한 곳으로 고정했다 (app 게터 주석 참고).
  */
 
 import { createServer as createHttpServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
+
+/**
+ * 라우트 모듈이 받는 것.
+ *
+ * Gateway 내부(#opts, #log)를 직접 만지지 않고도 필요한 걸 얻게 하는 통로다.
+ * 라우트별 의존성(#5의 업로드 디렉토리 등)은 `GatewayOptions`에 필드를 늘리고
+ * 여기 `options`로 읽거나, 팩토리 인자로 직접 넘긴다 — 아래 RouteRegistrar 참고.
+ */
+export interface RouteContext {
+  /** 생성자에 들어온 옵션 그대로 */
+  readonly options: Readonly<GatewayOptions>;
+  /** onLog와 같은 경로. 지정 안 했으면 조용하다 */
+  log(line: string): void;
+}
+
+/** 라우트 모듈이 돌려줄 수 있는 수명 훅 */
+export interface RouteHooks {
+  /**
+   * 디렉토리 생성처럼 await가 필요한 준비.
+   *
+   * 생성자는 await할 수 없으므로 여기로 뺀다. start()가 **리스닝 직전에**
+   * 부르므로, 준비가 끝나기 전에 요청이 라우트에 닿는 일이 없다.
+   * start()는 close() 후 재기동될 수 있으니 멱등해야 한다.
+   */
+  prepare?: () => Promise<void>;
+}
+
+/**
+ * 라우트 등록 함수.
+ *
+ * 의존성이 필요하면 이 함수를 직접 export하지 말고 **팩토리**로 만든다:
+ *
+ *   export function createFileRoutes(deps: { uploadDir: string }): RouteRegistrar {
+ *     return (app, ctx) => {
+ *       app.post('/api/files', ...);
+ *       return { prepare: () => mkdir(deps.uploadDir, { recursive: true }).then(() => {}) };
+ *     };
+ *   }
+ */
+export type RouteRegistrar = (app: Express, ctx: RouteContext) => void | RouteHooks;
 
 export interface GatewayOptions {
   /** 바인딩 포트. 0이면 임의 포트. 기본 0 */
@@ -26,6 +70,12 @@ export interface GatewayOptions {
   host?: string;
   /** 로그 훅. 지정하지 않으면 조용하다 (SDK의 onLog와 같은 규약) */
   onLog?: (line: string) => void;
+  /**
+   * 바깥에서 주입하는 추가 라우트. 내장 라우트 **뒤**, 404 catch-all **앞**에
+   * 등록된다. 테스트·임베딩용이며, 항상 켜져 있어야 하는 기능 라우트는
+   * 여기가 아니라 #configure의 내장 목록에 넣는다.
+   */
+  routes?: RouteRegistrar[];
 }
 
 /** start()가 알려주는 실제 바인딩 결과 */
@@ -46,12 +96,37 @@ export interface HealthBody {
   time: string;
 }
 
+/**
+ * 에러가 들고 온 HTTP 상태코드를 꺼낸다. 없거나 수상하면 500.
+ *
+ * express.json()은 파싱 실패 시 `status`/`statusCode` = 400을 붙여 던지고,
+ * http-errors 계열도 같은 규약을 쓴다. 이걸 무시하고 전부 500으로 덮으면
+ * 클라이언트가 "내 요청이 잘못됐다"와 "서버가 터졌다"를 구분할 수 없다.
+ *
+ * `status`를 먼저 본다 — http-errors가 정본으로 두는 쪽이고, `statusCode`는
+ * 그 별칭이다. 값은 신뢰하지 않는다: 400~599 정수가 아니면(예: 라이브러리가
+ * errno나 문자열을 넣은 경우) res.status()가 던지므로 500으로 떨어뜨린다.
+ * 3xx 이하도 에러 응답의 상태로는 말이 안 되므로 제외한다.
+ */
+function errorStatus(err: unknown): number {
+  if (typeof err !== 'object' || err === null) return 500;
+  const { status, statusCode } = err as { status?: unknown; statusCode?: unknown };
+  for (const value of [status, statusCode]) {
+    if (typeof value === 'number' && Number.isInteger(value) && value >= 400 && value <= 599) {
+      return value;
+    }
+  }
+  return 500;
+}
+
 export class Gateway {
   #opts: GatewayOptions;
   #app: Express;
   #http: Server;
   #address: GatewayAddress | null = null;
   #startedAt = 0;
+  /** 등록된 라우트 모듈이 돌려준 수명 훅. start()가 소비한다 */
+  #routeHooks: RouteHooks[] = [];
 
   constructor(opts: GatewayOptions = {}) {
     this.#opts = opts;
@@ -60,7 +135,21 @@ export class Gateway {
     this.#http = createHttpServer(this.#app);
   }
 
-  /** 라우트를 더 얹고 싶을 때. #5 이후 단위가 여기에 붙는다 */
+  /**
+   * 진단·검사용 Express 인스턴스.
+   *
+   * ⛔ **여기에 라우트를 붙이지 마라.** 404 catch-all이 생성자 안(#configure)에서
+   * 이미 등록돼 있고 express는 등록 순서대로 평가하므로, `gw.app.get(...)`으로
+   * 나중에 붙인 핸들러는 catch-all에 가려 **절대 실행되지 않는다** — 요청하면
+   * 조용히 404가 돌아온다. 실제로 확인된 동작이다.
+   *
+   * 라우트를 추가하는 길은 두 개뿐이다:
+   *   - 항상 켜져 있어야 하는 기능 → #configure의 "라우트 등록 지점"에 한 줄
+   *   - 테스트·임베딩용 임시 라우트 → `GatewayOptions.routes`
+   *
+   * 이 게터는 설정 조회(`app.get('trust proxy')`)나 미들웨어 스택 검사처럼
+   * 라우팅을 바꾸지 않는 용도로만 남겨 둔다.
+   */
   get app(): Express {
     return this.#app;
   }
@@ -108,6 +197,32 @@ export class Gateway {
       res.json(body);
     });
 
+    // ── 라우트 등록 지점 ──────────────────────────────────────────────
+    // 후속 단위(#5 파일 API, #7~ 세션 API …)의 라우트는 **여기**에 붙는다.
+    // 아래 404 catch-all보다 나중에 등록되는 라우트는 영원히 실행되지 않으므로,
+    // 등록 자리를 한 곳으로 못 박아 그 실패 모드 자체를 없앤다. 순서가
+    // 이 함수 하나만 읽으면 보인다는 것도 의도한 결과다.
+    const ctx: RouteContext = {
+      options: this.#opts,
+      log: (line) => this.#log(line),
+    };
+    const use = (register: RouteRegistrar): void => {
+      const hooks = register(app, ctx);
+      if (hooks) this.#routeHooks.push(hooks);
+    };
+
+    // (a) 내장 라우트 모듈. #5부터 여기에 한 줄씩 는다:
+    //
+    //       use(createFileRoutes({ uploadDir: this.#opts.uploadDir ?? defaultUploadDir() }));
+    //
+    //     의존성은 팩토리 인자로 넘기고, 바깥에서 바꿔야 하는 값이면
+    //     GatewayOptions에 필드를 추가해 생성자 시점에 받는다.
+    //     await가 필요한 준비는 팩토리가 RouteHooks.prepare로 돌려주면
+    //     start()가 리스닝 직전에 처리한다 — 생성자에서 await할 필요가 없다.
+
+    // (b) 바깥에서 주입한 라우트. 내장 뒤, catch-all 앞.
+    for (const register of this.#opts.routes ?? []) use(register);
+
     // 404도 JSON이어야 한다. 클라이언트가 한 종류의 파서만 쓰게 된다.
     app.use((req: Request, res: Response) => {
       res.status(404).json({ error: `찾을 수 없음: ${req.method} ${req.path}` });
@@ -117,12 +232,17 @@ export class Gateway {
     // 인자 4개여야 에러 핸들러로 인식된다.
     app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
       const message = err instanceof Error ? err.message : String(err);
-      this.#log(`[error] ${message}`);
+      const status = errorStatus(err);
+
+      // 4xx는 클라이언트 잘못이고 서버는 멀쩡하다. 같은 [error]로 찍으면
+      // 깨진 요청 몇 건에 진짜 장애가 묻힌다. 레벨을 갈라 둔다.
+      this.#log(`[${status < 500 ? 'warn' : 'error'}] ${status} ${message}`);
+
       if (res.headersSent) {
         next(err);
         return;
       }
-      res.status(500).json({ error: message });
+      res.status(status).json({ error: message });
     });
   }
 
@@ -132,6 +252,11 @@ export class Gateway {
 
     const host = this.#opts.host ?? '127.0.0.1';
     const port = this.#opts.port ?? 0;
+
+    // 라우트의 비동기 준비를 리스닝 **전에** 끝낸다. 요청이 아직 못 들어오는
+    // 시점이라, 준비 중인 디렉토리를 핸들러가 먼저 만나는 경우가 없다.
+    // 재기동될 수 있으므로 prepare는 멱등이어야 한다(RouteHooks 주석 참고).
+    for (const hooks of this.#routeHooks) await hooks.prepare?.();
 
     const bound = await new Promise<AddressInfo>((resolve, reject) => {
       const onError = (err: Error): void => {
