@@ -9,6 +9,7 @@
 
 export type Request =
   | { id: number; op: 'ping' }
+  | { id: number; op: 'version' }
   | { id: number; op: 'init' }
   | { id: number; op: 'load'; path: string }
   | { id: number; op: 'clear' }
@@ -56,6 +57,17 @@ export function isEvent(msg: Incoming): msg is Event {
 }
 
 // ── 결과 페이로드 ───────────────────────────────────────────
+
+/**
+ * 링크된 엔진의 버전 문자열. 데스크톱 앱의 About 표시와 같은 출처다.
+ * 씬 로드나 init 없이도 호출된다.
+ */
+export interface VersionResult {
+  /** 예: "1.94.19" */
+  zelus: string;
+  /** 예: "3.0.149" */
+  lumia: string;
+}
 
 export interface StatusResult {
   loaded: boolean;

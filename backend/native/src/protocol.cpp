@@ -9,6 +9,10 @@
 #include <ztSceneData.h>
 #include <ztSceneQueryInterface.h>
 
+// 데스크톱 앱의 About 표시(MainGUI.cpp:373-381)와 같은 출처다.
+#include <LumiaVersion.h>
+#include <ZelusVersion.h>
+
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -438,6 +442,14 @@ int RunProtocolLoop(ZestManager& manager)
             if (op == "ping")
             {
                 result = json{ { "pong", true } };
+            }
+            else if (op == "version")
+            {
+                // 씬 로드도 Initialize()도 필요 없다. 링크된 엔진 자체의 버전이다.
+                result = json{
+                    { "zelus", ZELUS::GetZelusFullVersionString() },
+                    { "lumia", ZELUS::GetLumiaFullVersionString() },
+                };
             }
             else if (op == "init")
             {

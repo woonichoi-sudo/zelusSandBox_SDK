@@ -55,6 +55,16 @@ async function main(): Promise<void> {
     const pong = await session.ping();
     check('ping 왕복', pong.pong === true);
 
+    // 버전은 init/load 없이 ready 직후 답해야 한다.
+    // 값은 링크된 엔진에 따라 달라지므로 "비어있지 않음"만 본다.
+    const ver = await session.version();
+    check(
+      'version 조회',
+      typeof ver.zelus === 'string' && ver.zelus.length > 0
+        && typeof ver.lumia === 'string' && ver.lumia.length > 0,
+      `zelus=${JSON.stringify(ver.zelus)}, lumia=${JSON.stringify(ver.lumia)}`,
+    );
+
     // ── 2. 씬 로드 ────────────────────────────────────────
     t = performance.now();
     await session.load(ZLS);

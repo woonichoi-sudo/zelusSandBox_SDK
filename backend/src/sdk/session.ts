@@ -16,6 +16,7 @@ import {
   type SetParamsResult,
   type SimulationParams,
   type StatusResult,
+  type VersionResult,
 } from './protocol.ts';
 import { Worker, type WorkerOptions } from './worker.ts';
 
@@ -115,6 +116,11 @@ export class Session extends EventEmitter {
 
   ping(): Promise<{ pong: boolean }> {
     return this.#call('ping');
+  }
+
+  /** 링크된 엔진(Zelus/Lumia)의 버전 문자열. init/load 없이도 된다. */
+  version(): Promise<VersionResult> {
+    return this.#call('version');
   }
 
   init(): Promise<{ initialized: boolean }> {
