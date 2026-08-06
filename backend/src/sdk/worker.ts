@@ -14,6 +14,7 @@ import {
   isEvent,
   type Event,
   type Incoming,
+  type MeshDataResult,
   type Op,
   type Response,
 } from './protocol.ts';
@@ -39,7 +40,11 @@ interface Pending {
 export class WorkerError extends Error {}
 
 export declare interface Worker {
-  on(event: 'frame', listener: (frame: number) => void): this;
+  /**
+   * mesh는 구독 중일 때만 온다. 인자를 늘리는 쪽을 택했으므로 기존
+   * `(frame) => ...` 리스너는 그대로 동작한다 (waitForFrame 포함).
+   */
+  on(event: 'frame', listener: (frame: number, mesh?: MeshDataResult) => void): this;
   on(event: 'engineMessage', listener: (message: string) => void): this;
   on(event: 'ready', listener: () => void): this;
   on(event: 'exit', listener: (code: number | null) => void): this;
@@ -149,7 +154,9 @@ export class Worker extends EventEmitter {
         break;
       case 'frame':
         this.lastFrame = ev.frame;
-        this.emit('frame', ev.frame);
+        // ev.mesh는 구독 중일 때만 있다. undefined면 인자 하나짜리 emit과
+        // 구분되지 않으므로 비구독 경로의 동작은 이전과 같다.
+        this.emit('frame', ev.frame, ev.mesh);
         break;
       case 'engineMessage':
         if (ev.message) this.emit('engineMessage', ev.message);

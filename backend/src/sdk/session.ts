@@ -36,8 +36,27 @@ export interface DecodedPattern {
   triangles: number;
 }
 
+/**
+ * meshData 응답과 구독 중 frame 이벤트의 mesh는 모양이 같다. 그래서
+ * 디코더도 하나다 — 두 경로가 갈라지면 한쪽만 조용히 깨진다.
+ */
+export function decodePatterns(mesh: MeshDataResult): DecodedPattern[] {
+  return mesh.patterns.map((p: PatternData): DecodedPattern => {
+    const out: DecodedPattern = {
+      uuid: p.uuid,
+      vertices: p.vertices,
+      triangles: p.triangles,
+      positions: p.positions ? decodeFloat32(p.positions) : new Float32Array(0),
+    };
+    if (p.indices) out.indices = decodeInt32(p.indices);
+    if (p.uvs) out.uvs = decodeFloat32(p.uvs);
+    return out;
+  });
+}
+
 export declare interface Session {
-  on(event: 'frame', listener: (frame: number) => void): this;
+  /** mesh는 subscribe() 중일 때만 온다. 기존 `(frame) => ...` 리스너는 그대로다. */
+  on(event: 'frame', listener: (frame: number, mesh?: MeshDataResult) => void): this;
   on(event: 'engineMessage', listener: (message: string) => void): this;
   on(event: 'exit', listener: (code: number | null) => void): this;
   on(event: string, listener: (...args: never[]) => void): this;
@@ -53,9 +72,9 @@ export class Session extends EventEmitter {
   private constructor(worker: Worker) {
     super();
     this.worker = worker;
-    worker.on('frame', (f) => {
+    worker.on('frame', (f, mesh) => {
       this.#touch();
-      this.emit('frame', f);
+      this.emit('frame', f, mesh);
     });
     worker.on('engineMessage', (m) => this.emit('engineMessage', m));
     worker.on('exit', (c) => this.emit('exit', c));
@@ -159,8 +178,11 @@ export class Session extends EventEmitter {
   }
 
   /**
-   * frame 이벤트에 메시를 실어 보내라고 켠다.
-   * 현재는 플래그만 선다 — 실제 첨부는 다음 단계다.
+   * frame 이벤트에 메시(positions)를 실어 보내라고 켠다. 프레임마다
+   * meshData를 되묻는 왕복이 사라진다.
+   *
+   * 토폴로지는 안 온다 — 프레임 간 고정이라 `geometry(true)`로 한 번만
+   * 받아 두고, 이후엔 frame 이벤트의 positions만 갈아끼우면 된다.
    */
   subscribe(): Promise<SubscribeResult> {
     return this.#call('subscribe');
@@ -192,18 +214,7 @@ export class Session extends EventEmitter {
 
   /** meshData를 받아 base64를 TypedArray로 풀어서 돌려준다. */
   async geometry(topology = false): Promise<DecodedPattern[]> {
-    const raw = await this.meshData(topology);
-    return raw.patterns.map((p: PatternData): DecodedPattern => {
-      const out: DecodedPattern = {
-        uuid: p.uuid,
-        vertices: p.vertices,
-        triangles: p.triangles,
-        positions: p.positions ? decodeFloat32(p.positions) : new Float32Array(0),
-      };
-      if (p.indices) out.indices = decodeInt32(p.indices);
-      if (p.uvs) out.uvs = decodeFloat32(p.uvs);
-      return out;
-    });
+    return decodePatterns(await this.meshData(topology));
   }
 
   export(path: string, format: 'gltf' | 'zbin' = 'gltf'): Promise<{ path: string }> {

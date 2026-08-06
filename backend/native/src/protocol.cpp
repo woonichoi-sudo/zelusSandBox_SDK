@@ -236,6 +236,10 @@ json MeshInfo(ZestManager& manager, void* listener)
 
 // 토폴로지는 프레임 간 고정이므로 최초 1회만 보내면 된다.
 // 프레임마다 필요한 건 positions뿐이다.
+//
+// meshData 응답과 구독 중 frame 이벤트의 mesh 필드가 **같은 함수**를 쓴다.
+// zsVector3 재포장(아래)이 두 곳에 복사되면 언젠가 갈라지고, 그때 어긋난
+// 쪽은 화면이 깨져야만 드러난다.
 json MeshData(ZestManager& manager, bool includeTopology)
 {
     json patterns = json::array();
@@ -243,7 +247,9 @@ json MeshData(ZestManager& manager, bool includeTopology)
     ztSceneQueryInterface* qi = QueryInterface(manager);
     if (!qi)
     {
-        return json{ { "patterns", patterns } };
+        // 씬이 없어도 모양은 같아야 한다. 호출자(응답 / 프레임 이벤트)가
+        // topology 키의 유무로 분기하게 만들면 디코더가 두 갈래가 된다.
+        return json{ { "patterns", patterns }, { "topology", includeTopology } };
     }
 
     for (const auto& entry : qi->GetClothPatterns())
@@ -393,9 +399,7 @@ int RunProtocolLoop(ZestManager& manager)
     bool running       = true;
     int  exitCode      = 0;
 
-    // 프레임 이벤트에 메시를 실어 보낼지. 지금은 상태만 들고 있고 실제 첨부는
-    // 다음 단계다 — 토글이 안 되는 것과 페이로드가 안 실리는 것을 따로 보기
-    // 위해서다.
+    // 프레임 이벤트에 메시를 실어 보낼지.
     //
     // 씬 상태가 아니라 클라이언트의 전송 취향이므로 load/clear/reset에서
     // 건드리지 않는다. 프로세스(=세션) 수명 내내 유지된다.
@@ -408,7 +412,24 @@ int RunProtocolLoop(ZestManager& manager)
         if (f != lastEmitted)
         {
             lastEmitted = f;
-            out.Send(json{ { "event", "frame" }, { "frame", f } });
+
+            json ev{ { "event", "frame" }, { "frame", f } };
+
+            // 구독 중이면 프레임마다 왕복(meshData 요청 → 응답)을 없앤다.
+            // 추출은 이 스레드에서 동기로 한다. 실측 0.03~0.10ms에 base64
+            // 인코딩을 더해도 프레임 간격(~40ms) 대비 미미하고, 비동기로
+            // 빼면 시뮬 스레드가 앞서 나가 어느 프레임의 정점인지 모르게
+            // 된다. 병목은 추출이 아니라 stdout 대역폭이다.
+            //
+            // 토폴로지(indices/uvs)는 싣지 않는다 — 프레임 간 고정이라
+            // 클라이언트가 meshData{topology:true}로 1회만 받으면 된다.
+            // 매 프레임 실으면 대역폭이 몇 배가 된다.
+            if (subscribed)
+            {
+                ev["mesh"] = MeshData(manager, /*includeTopology=*/false);
+            }
+
+            out.Send(ev);
         }
 
         // 2) 요청 처리
@@ -514,6 +535,8 @@ int RunProtocolLoop(ZestManager& manager)
             }
             else if (op == "subscribe")
             {
+                // 이후 frame 이벤트에 mesh(= meshData{topology:false}와 같은
+                // 모양)가 함께 실린다. 이미 시뮬 중이면 다음 프레임부터다.
                 subscribed = true;
                 result = json{ { "subscribed", true } };
             }

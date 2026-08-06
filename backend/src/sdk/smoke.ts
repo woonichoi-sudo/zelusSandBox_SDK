@@ -11,6 +11,8 @@ import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import { SessionPool } from './pool.ts';
+import type { MeshDataResult } from './protocol.ts';
+import { decodePatterns } from './session.ts';
 
 const ROOT = resolve(import.meta.dirname, '../../..');
 const EXE = resolve(ROOT, 'backend/native/build/Release/zelusSandBoxd-demo.exe');
@@ -120,6 +122,16 @@ async function main(): Promise<void> {
     const frames: number[] = [];
     session.on('frame', (f) => frames.push(f));
 
+    // 회귀 확인용. 이 구간은 §1에서 unsubscribe로 끝났으므로 비구독 상태다.
+    // 구독을 켜기 전에 리스너를 떼야 §5.5의 프레임이 섞이지 않는다.
+    let plainFrames = 0;
+    let plainWithMesh = 0;
+    const onPlainFrame = (_f: number, mesh?: MeshDataResult): void => {
+      plainFrames++;
+      if (mesh !== undefined) plainWithMesh++;
+    };
+    session.on('frame', onPlainFrame);
+
     t = performance.now();
     await session.start();
     const reached = await session.waitForFrame(10, 120_000);
@@ -128,6 +140,14 @@ async function main(): Promise<void> {
 
     check('프레임 이벤트 수신', frames.length > 0, `${frames.length}개`);
     check('목표 프레임 도달', reached >= 10, `frame ${reached}, ${ms(simMs)}`);
+
+    // 구독하지 않았을 때 frame 이벤트는 이전과 같아야 한다 (mesh 없음).
+    session.off('frame', onPlainFrame);
+    check(
+      '비구독 프레임에 mesh 없음',
+      plainFrames > 0 && plainWithMesh === 0,
+      `${plainFrames}개 중 mesh 실린 프레임 ${plainWithMesh}개`,
+    );
 
     // ── 5. 지오메트리 ─────────────────────────────────────
     t = performance.now();
@@ -170,6 +190,63 @@ async function main(): Promise<void> {
     }
 
     console.log(`         지오메트리 취득 ${ms(geoMs)}`);
+
+    // ── 5.5 구독 중 프레임에 메시 ─────────────────────────
+    // 씬 로드와 시뮬 실행이 있어야 성립하므로 ready 직후 그룹(§1)에 둘 수
+    // 없다. §5 뒤에 두어 §4·§5의 기존 단언이 구독 상태에 노출되지 않게 한다.
+    const WANT = 5;
+    const subFrames: { frame: number; mesh: MeshDataResult | undefined }[] = [];
+    const onSubFrame = (f: number, mesh?: MeshDataResult): void => {
+      subFrames.push({ frame: f, mesh });
+    };
+
+    await session.subscribe();
+    session.on('frame', onSubFrame);
+
+    try {
+      const target = session.worker.lastFrame + WANT;
+      await session.start();
+      await session.waitForFrame(target, 120_000);
+    } finally {
+      // 구독은 워커 수명 내내 유지된다. 켠 채로 나가면 이후 테스트와
+      // 풀 재사용 세션까지 샌다.
+      await session.pause();
+      session.off('frame', onSubFrame);
+      await session.unsubscribe();
+    }
+
+    check('구독 중 프레임 수신', subFrames.length >= WANT, `${subFrames.length}개 (목표 ${WANT})`);
+
+    let bad: string | null = null;
+    let patternsChecked = 0;
+    for (const ev of subFrames) {
+      if (!ev.mesh) {
+        bad = `frame ${ev.frame}: mesh 없음`;
+        break;
+      }
+      const pats = decodePatterns(ev.mesh);
+      if (pats.length === 0) {
+        bad = `frame ${ev.frame}: 패턴 0개`;
+        break;
+      }
+      for (const p of pats) {
+        patternsChecked++;
+        if (p.positions.length !== p.vertices * 3) {
+          bad = `frame ${ev.frame} / ${p.uuid}: positions ${p.positions.length} != ${p.vertices} × 3`;
+          break;
+        }
+      }
+      if (bad) break;
+    }
+
+    check(
+      '각 프레임 positions.length == 정점수 × 3',
+      bad === null,
+      bad ?? `프레임 ${subFrames.length}개 / 패턴 ${patternsChecked}개 검사`,
+    );
+
+    const stAfterSub = await session.status();
+    check('구독 정리됨', stAfterSub.subscribed === false, `subscribed=${stAfterSub.subscribed}`);
 
     // ── 6. 세션 재사용 ────────────────────────────────────
     await session.clear();

@@ -49,7 +49,18 @@ export type Response<T = unknown> = OkResponse<T> | ErrResponse;
 
 export type Event =
   | { event: 'ready'; protocol: number; session: string }
-  | { event: 'frame'; frame: number }
+  | {
+      event: 'frame';
+      frame: number;
+      /**
+       * 구독(subscribe) 중일 때만 붙는다. meshData{topology:false}의 결과와
+       * **같은 모양**이므로 디코더를 하나만 쓰면 된다 (decodePatterns).
+       *
+       * indices/uvs는 없다 — 프레임 간 고정이라 meshData{topology:true}로
+       * 한 번만 받으면 되고, 매 프레임 실으면 대역폭이 몇 배가 된다.
+       */
+      mesh?: MeshDataResult;
+    }
   | { event: 'engineMessage'; message: string };
 
 export type Incoming = Response | Event;
@@ -78,8 +89,9 @@ export interface StatusResult {
   frame: number;
   maxFrame: number;
   /**
-   * frame 이벤트에 메시를 실어 보낼지. 씬 상태가 아니라 클라이언트의 전송
-   * 취향이므로 load/clear/reset이 건드리지 않는다 — 워커 수명 내내 유지된다.
+   * frame 이벤트에 메시(positions)를 실어 보낼지. 씬 상태가 아니라
+   * 클라이언트의 전송 취향이므로 load/clear/reset이 건드리지 않는다 —
+   * 워커 수명 내내 유지된다.
    */
   subscribed: boolean;
 }
