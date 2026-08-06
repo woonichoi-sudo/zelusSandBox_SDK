@@ -22,12 +22,18 @@
  * withServer 콜백이 끝나는 순간 그 서버 인스턴스와 함께 사라진다.
  */
 
+import { execFile } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { Readable } from 'node:stream';
+import { Readable, type Duplex } from 'node:stream';
+import { promisify } from 'node:util';
 
+import { WebSocket } from 'ws';
+
+import { PoolExhaustedError, SessionPool } from '../sdk/index.ts';
 import {
   createServer,
   type Gateway,
@@ -36,6 +42,14 @@ import {
   type RouteContext,
   type RouteRegistrar,
 } from './index.ts';
+import {
+  CLOSE_SESSION_LOST,
+  CLOSE_SHUTDOWN,
+  defaultWorkerExe,
+  type PoolStats,
+  type SessionLike,
+  type SessionSource,
+} from './sessions.ts';
 
 let failures = 0;
 
@@ -107,6 +121,30 @@ async function expectRefused(url: string): Promise<string | null> {
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
 }
+
+/** 거절 본문(`{ error }` JSON)에서 문구만. 파싱 실패는 빈 문자열 */
+function errorOf(body: string): string {
+  try {
+    const v: unknown = JSON.parse(body);
+    return isRecord(v) && typeof v['error'] === 'string' ? v['error'] : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 503 두 가지의 **문구**. 상태코드도 Retry-After도 같아서 클라이언트가
+ * 둘을 가를 수 있는 단서가 이 문구뿐이다:
+ *
+ *   NOT_ACCEPTING  아직 안 열렸거나 세션 계층이 이미 닫힌 뒤 — 업그레이드 자체를 안 받는다
+ *   SHUTTING_DOWN  받긴 받았고 세션까지 얻었는데 그 사이 게이트웨이가 닫혔다
+ *
+ * 앞은 "다시 걸면 언젠가 된다", 뒤는 "이 게이트웨이는 지금 죽는 중"이다.
+ * 운영에서 재시도 로직과 원인 추적이 갈리는 지점이라 **계약으로 고정한다** —
+ * 통일하려는 손이 오면 여기가 먼저 깨진다.
+ */
+const REFUSE_NOT_ACCEPTING = '게이트웨이가 세션을 받을 수 있는 상태가 아닙니다';
+const REFUSE_SHUTTING_DOWN = '게이트웨이가 종료 중입니다';
 
 // ── §6 도우미 ────────────────────────────────────────────────────────
 // 씬 API는 **디스크 상태**를 갖는 첫 라우트다. 앞 섹션들과 달리 서버를
@@ -246,6 +284,246 @@ async function waitFor<T>(probe: () => Promise<T | null>, timeoutMs = 5_000): Pr
     if (v !== null) return v;
     if (Date.now() >= until) return null;
     await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+// ── §7 도우미 (WS 세션) ──────────────────────────────────────────────
+// 이 단위가 지키는 불변식은 하나다: **열린 소켓 하나 = 살아 있는 워커 하나.**
+// 그래서 도우미도 그 등식의 양쪽을 각각 볼 수 있게 만든다 —
+// 게이트웨이 쪽은 `stats.busy`/`connections`로, OS 쪽은 pid로.
+//
+// 가짜 풀(FakePool)과 실제 풀(TracingPool)을 둘 다 두는 이유:
+//   - 가짜: 프로세스를 안 띄우므로 즉시 돌고, acquire를 게이트로 붙잡아
+//     "110ms 창"처럼 실제로는 재현이 불안정한 타이밍을 **결정적으로** 만든다.
+//   - 실제: 가짜만 쓰면 "진짜 프로세스가 진짜로 죽는가"를 한 번도 확인하지
+//     않게 된다. 이 단위가 지키려는 게 정확히 그것이므로 7-1은 실제 exe를 쓴다.
+
+const execFileAsync = promisify(execFile);
+
+/** `ws://host:port/ws` + 쿼리 */
+function wsUrlOf(addr: GatewayAddress, query = ''): string {
+  return `${addr.url.replace(/^http/, 'ws')}/ws${query}`;
+}
+
+/**
+ * 핸드셰이크의 결말.
+ *
+ * 이 설계에서 거절은 **업그레이드 전 HTTP 응답**이라, 결과가 둘 중 하나로
+ * 갈린다: 소켓이 열리거나(ws), 상태코드가 돌아오거나(status). Node의 ws는
+ * 'unexpected-response'로 본문·헤더까지 읽을 수 있다 — 브라우저는 못 읽는다.
+ */
+interface WsOutcome {
+  ws: WebSocket | null;
+  status: number | null;
+  retryAfter: string | null;
+  body: string;
+  error: string | null;
+}
+
+async function connect(url: string, opts: { autoPong?: boolean } = {}): Promise<WsOutcome> {
+  const client = new WebSocket(url, opts);
+  const blank: WsOutcome = { ws: null, status: null, retryAfter: null, body: '', error: null };
+  return new Promise<WsOutcome>((resolve) => {
+    client.once('open', () => {
+      // open 뒤에 오는 오류(서버가 소켓을 파괴하는 경우 등)를 삼킨다.
+      // 리스너가 없으면 EventEmitter가 throw 해서 스모크가 죽는다.
+      client.on('error', () => {});
+      resolve({ ...blank, ws: client });
+    });
+    client.once('unexpected-response', (_req, res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (c: Buffer) => chunks.push(c));
+      res.on('end', () => {
+        const ra = res.headers['retry-after'];
+        resolve({
+          ...blank,
+          status: res.statusCode ?? 0,
+          retryAfter: typeof ra === 'string' ? ra : null,
+          body: Buffer.concat(chunks).toString('utf8'),
+        });
+      });
+    });
+    client.once('error', (err: Error) => resolve({ ...blank, error: err.message }));
+  });
+}
+
+/** 매달리지 않는 await. 시간 안에 안 풀리면 fallback */
+function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise<T>((resolve) => {
+    const t = setTimeout(() => resolve(fallback), ms);
+    void p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      () => {
+        clearTimeout(t);
+        resolve(fallback);
+      },
+    );
+  });
+}
+
+/** 조건이 참이 될 때까지 폴링. `stats.busy`는 release가 비동기라 즉시 읽으면 틀린다 */
+async function until(cond: () => boolean | Promise<boolean>, timeoutMs = 5_000): Promise<boolean> {
+  return (await waitFor(async () => ((await cond()) ? true : null), timeoutMs)) === true;
+}
+
+/** close 프레임의 code/reason. **닫기 전에** 불러 두어야 놓치지 않는다 */
+function closedWith(ws: WebSocket): Promise<{ code: number; reason: string }> {
+  return new Promise((resolve) => {
+    ws.once('close', (code: number, reason: Buffer) => resolve({ code, reason: reason.toString('utf8') }));
+  });
+}
+
+/** 메시지 하나를 보내고 응답 하나를 받는다. 응답이 없으면 null */
+async function ask(
+  ws: WebSocket,
+  payload: unknown,
+  opts: { raw?: string; binary?: Uint8Array } = {},
+): Promise<Record<string, unknown> | null> {
+  const got = new Promise<string>((resolve) => {
+    ws.once('message', (data: Buffer) => resolve(data.toString('utf8')));
+  });
+  if (opts.binary) ws.send(opts.binary, { binary: true });
+  else if (opts.raw !== undefined) ws.send(opts.raw);
+  else ws.send(JSON.stringify(payload));
+  const text = await withTimeout(got, 2_000, '');
+  try {
+    const v: unknown = JSON.parse(text);
+    return isRecord(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * pid 하나가 아직 살아 있는가.
+ *
+ * exe **개수**를 세지 않는 게 핵심이다. 같은 exe를 다른 프로세스가 띄우고
+ * 있으면(SDK 스모크 병행 실행 등) 개수는 오탐을 낸다. 우리가 만든 pid만
+ * 확인하면 그 오탐이 구조적으로 사라진다. 이미지명까지 함께 보는 건
+ * pid 재사용 방어다.
+ */
+async function pidAlive(pid: number): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync('tasklist', ['/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV']);
+    return stdout.includes(`"${pid}"`) && stdout.toLowerCase().includes('zelussandboxd-demo.exe');
+  } catch {
+    return false;
+  }
+}
+
+/** 진단용 전체 개수. 판정에는 쓰지 않는다 (다른 프로세스가 띄운 것도 세므로) */
+async function exeCount(): Promise<number> {
+  try {
+    const { stdout } = await execFileAsync(
+      'tasklist', ['/FI', 'IMAGENAME eq zelusSandBoxd-demo.exe', '/NH', '/FO', 'CSV'],
+    );
+    return stdout.split('\n').filter((l) => l.toLowerCase().includes('zelussandboxd-demo.exe')).length;
+  } catch {
+    return -1;
+  }
+}
+
+/** 프로세스를 안 띄우는 세션. SessionLike가 요구하는 표면이 이게 전부다 */
+class FakeSession extends EventEmitter implements SessionLike {
+  alive = true;
+  readonly worker = { pid: 0 };
+
+  /** 워커가 스스로 죽는 상황 (엔진 크래시) */
+  die(code: number | null = 1): void {
+    this.alive = false;
+    this.emit('exit', code);
+  }
+}
+
+interface FakePoolOptions {
+  /** 동시 상한. 넘으면 PoolExhaustedError (실제 풀과 같은 예외 타입) */
+  maxTotal?: number;
+  /** acquire를 붙잡아 둔다. "110ms 창"을 결정적으로 만드는 장치 */
+  gate?: Promise<void>;
+  /** acquire가 PoolExhaustedError가 **아닌** 오류로 실패 (워커 기동 실패) */
+  boom?: boolean;
+  /** acquire에 들어온 순간 */
+  onEnter?: () => void;
+}
+
+class FakePool implements SessionSource {
+  acquired = 0;
+  released = 0;
+  closed = 0;
+  readonly live = new Set<FakeSession>();
+  #o: FakePoolOptions;
+
+  constructor(o: FakePoolOptions = {}) {
+    this.#o = o;
+  }
+
+  async acquire(): Promise<SessionLike> {
+    this.#o.onEnter?.();
+    if (this.#o.gate) await this.#o.gate;
+    if (this.#o.boom) throw new Error('가짜 워커 기동 실패');
+    const max = this.#o.maxTotal;
+    if (max !== undefined && this.live.size >= max) {
+      throw new PoolExhaustedError(`세션 상한 도달 (${max}). 동시 인스턴스 수는 라이선스와 직결됩니다.`);
+    }
+    const s = new FakeSession();
+    this.live.add(s);
+    this.acquired++;
+    return s;
+  }
+
+  async release(session: SessionLike): Promise<void> {
+    // 실제 풀과 같은 순서: busy에서 먼저 빼고 정리한다.
+    this.live.delete(session as FakeSession);
+    (session as FakeSession).alive = false;
+    this.released++;
+  }
+
+  get stats(): PoolStats {
+    return { idle: 0, busy: this.live.size, total: this.live.size };
+  }
+
+  async close(): Promise<void> {
+    this.closed++;
+    for (const s of this.live) s.alive = false;
+    this.live.clear();
+  }
+}
+
+/**
+ * 실제 SessionPool을 감싸 **pid를 기록**한다.
+ *
+ * SessionInfo에는 pid가 없다(설계상 밖으로 내보내지 않는다). 그런데 이 단위의
+ * 진짜 주장은 "프로세스가 죽는다"이므로 OS에 물어볼 열쇠가 필요하다.
+ * 풀을 갈아 끼우는 대신 감싸기만 하므로 검증 대상은 그대로 실제 풀이다.
+ */
+class TracingPool implements SessionSource {
+  readonly pids: number[] = [];
+  #inner: SessionSource;
+
+  constructor(inner: SessionSource) {
+    this.#inner = inner;
+  }
+
+  async acquire(): Promise<SessionLike> {
+    const s = await this.#inner.acquire();
+    const pid = s.worker?.pid;
+    if (typeof pid === 'number') this.pids.push(pid);
+    return s;
+  }
+
+  release(session: SessionLike): Promise<void> {
+    return this.#inner.release(session);
+  }
+
+  get stats(): PoolStats {
+    return this.#inner.stats;
+  }
+
+  close(): Promise<void> {
+    return this.#inner.close();
   }
 }
 
@@ -1041,6 +1319,681 @@ async function main(): Promise<void> {
       const alive = await get(`${addr.url}/api/health`);
       check('중단 뒤 서버 생존', alive.status === 200, `status=${alive.status}`);
     }, { onLog: (line) => logs.push(line) });
+  }
+
+  // ── §7. WS 연결 = 세션 수명 (TASKS #6) ────────────────
+  // 통과 기준: "연결 → stats.busy == 1 → 종료 → 0. maxTotal 초과 시 거부
+  // 코드로 닫힘". 7-1이 그 한 줄을 **실제 워커 프로세스로** 확인하고,
+  // 나머지는 그 등식이 깨지는 경로들을 가짜 풀로 결정적으로 재현한다.
+  //
+  // 세션 = 워커 프로세스 = 라이선스 인스턴스다. 그래서 누수는 버그가 아니라
+  // 동접 상한을 깎아먹는 사건이고, 여기서 잡지 못하면 운영에서 만난다.
+
+  section('7-1. 연결 수명 = 프로세스 수명 (실제 워커, 통과 기준)');
+  const strayPids: number[] = [];
+  {
+    const before = await exeCount();
+    // 실제 exe를 쓰는 유일한 섹션이다. 기동이 ~110ms라 케이스마다 띄우면
+    // 스모크가 몇 배로 느려진다 — 그래서 여기서만 3개를 띄우고,
+    // 정상 종료 / 급단절 / 게이트웨이 종료라는 서로 다른 세 경로에 하나씩 쓴다.
+    //
+    // 풀을 미리 만들어 팩토리가 그대로 돌려준다. createPool이 팩토리인 건
+    // 재기동 때문인데, 이 섹션은 start()를 한 번만 하므로 안전하다.
+    const traced = new TracingPool(new SessionPool({
+      exePath: defaultWorkerExe(),
+      idleTimeout: 0,   // 유휴 프로세스는 라이선스를 계속 문다
+      maxTotal: 1,      // 상한 거절을 실제 풀로도 확인하기 위해 1
+      onLog: () => {},
+    }));
+
+    await withServer(async (gw, addr) => {
+      // ① 연결 → busy == 1, 그리고 **OS에 프로세스가 실제로 있다**
+      const t0 = performance.now();
+      const first = await connect(wsUrlOf(addr));
+      const openMs = Math.round(performance.now() - t0);
+      check(
+        '연결 성립 (onopen = 세션 준비 완료)',
+        first.ws !== null,
+        first.ws ? `${openMs}ms` : `status=${String(first.status)}, error=${String(first.error)} — exe가 없으면 여기서 깨진다`,
+      );
+      check(
+        'stats.busy == 1',
+        gw.sessions.stats.busy === 1 && gw.sessions.stats.total === 1,
+        JSON.stringify(gw.sessions.stats),
+      );
+      check(
+        'connections도 1건 (stats와 어긋나면 새고 있다)',
+        gw.sessions.connections.length === 1 && gw.sessions.connections[0]?.sceneId === null,
+        `${gw.sessions.connections.length}건, id=${gw.sessions.connections[0]?.id ?? '(없음)'}`,
+      );
+
+      const pid1 = traced.pids[0];
+      strayPids.push(...traced.pids);
+      check(
+        '워커 프로세스가 OS에 실제로 존재',
+        pid1 !== undefined && await pidAlive(pid1),
+        pid1 === undefined ? 'pid를 얻지 못했다' : `pid=${pid1}`,
+      );
+
+      // ② 상한 초과 → 거부. 실제 풀이므로 "워커를 안 띄운다"까지 확인된다.
+      const t1 = performance.now();
+      const over = await connect(wsUrlOf(addr));
+      const refuseMs = Math.round(performance.now() - t1);
+      check(
+        'maxTotal 초과 → 503 + Retry-After (업그레이드 전 HTTP 거절)',
+        over.ws === null && over.status === 503 && over.retryAfter === '5',
+        `status=${String(over.status)}, retry-after=${String(over.retryAfter)}, ${refuseMs}ms, body=${over.body.slice(0, 80)}`,
+      );
+      check(
+        '거절은 워커를 띄우지 않는다 (pid 추가 없음)',
+        traced.pids.length === 1,
+        `누적 pid ${traced.pids.length}개`,
+      );
+      check(
+        '거절 뒤에도 기존 세션은 OPEN',
+        first.ws?.readyState === WebSocket.OPEN && gw.sessions.stats.busy === 1,
+        `readyState=${String(first.ws?.readyState)}, busy=${gw.sessions.stats.busy}`,
+      );
+
+      // ③ 정상 종료 → busy 0 **그리고 프로세스 소멸**
+      first.ws?.close();
+      const drained = await until(() => gw.sessions.stats.busy === 0);
+      check(
+        '연결 종료 → stats.busy == 0',
+        drained && gw.sessions.connections.length === 0,
+        `${JSON.stringify(gw.sessions.stats)}, connections=${gw.sessions.connections.length}건`,
+      );
+      const gone1 = pid1 !== undefined && await until(async () => !(await pidAlive(pid1)));
+      check(
+        '워커 프로세스도 함께 사라진다 (라이선스 인스턴스 반납)',
+        gone1,
+        pid1 === undefined ? 'pid 없음' : `pid=${pid1}`,
+      );
+
+      // ④ 급단절(terminate). close 프레임 없이 TCP가 끊기는 실제 상황이다 —
+      //    브라우저 탭을 죽이거나 네트워크가 끊기면 이 경로로 온다.
+      const second = await connect(wsUrlOf(addr));
+      const pid2 = traced.pids[1];
+      strayPids.push(...traced.pids.slice(1));
+      check('두 번째 연결 성립 (상한이 반납으로 풀렸다)', second.ws !== null, `pid=${String(pid2)}`);
+      second.ws?.terminate();
+      const gone2 = pid2 !== undefined && await until(async () => !(await pidAlive(pid2)));
+      check(
+        '급단절(terminate)에도 프로세스가 회수된다',
+        gone2 && gw.sessions.stats.busy === 0,
+        `pid=${String(pid2)}, busy=${gw.sessions.stats.busy}`,
+      );
+
+      // ⑤ 게이트웨이 종료 중 살아 있는 연결 → 1001, 프로세스 소멸.
+      //    close()가 반납까지 기다리지 않으면 여기서 exe가 남는다.
+      const third = await connect(wsUrlOf(addr));
+      const pid3 = traced.pids[2];
+      strayPids.push(...traced.pids.slice(2));
+      const bye = third.ws ? closedWith(third.ws) : Promise.resolve({ code: -1, reason: '' });
+      const t2 = performance.now();
+      await gw.close();
+      const closeMs = Math.round(performance.now() - t2);
+      const info = await withTimeout(bye, 3_000, { code: -1, reason: '' });
+      check(
+        'close() → 클라이언트가 1001 수신',
+        info.code === CLOSE_SHUTDOWN,
+        `code=${info.code} (기대 ${CLOSE_SHUTDOWN}), reason=${info.reason}, close ${closeMs}ms`,
+      );
+      const gone3 = pid3 !== undefined && await until(async () => !(await pidAlive(pid3)));
+      check('close() 후 워커 프로세스 0개', gone3, `pid=${String(pid3)}`);
+      check(
+        'close() 후 stats 전부 0 + isOpen false',
+        gw.sessions.stats.total === 0 && gw.sessions.isOpen === false,
+        `${JSON.stringify(gw.sessions.stats)}, isOpen=${String(gw.sessions.isOpen)}`,
+      );
+
+      note('워커 pid', traced.pids.join(', ') || '없음');
+    }, { sessions: { createPool: () => traced, heartbeatIntervalMs: 0 } });
+
+    const after = await exeCount();
+    note(
+      '섹션 전후 exe 개수',
+      `${before} → ${after} (판정 아님 — 다른 프로세스가 띄운 것도 세므로 pid로만 판정한다)`,
+    );
+  }
+
+  // ── 7-2. 거절은 업그레이드 **전** HTTP 응답 ───────────
+  // 이 설계의 값어치는 "열린 소켓에는 항상 살아 있는 세션이 있다"는 불변식이다.
+  // 거절이 소켓을 연 뒤에 일어나면 #7·#8이 "세션 없는 연결" 상태를 다뤄야 한다.
+  // 그러므로 각 거절이 (a) 상태코드로 끝나고 (b) **acquire 자체를 안 한다**는
+  // 두 가지를 함께 본다. 프로세스를 안 띄우므로 가짜 풀로 충분하다.
+  section('7-2. 핸드셰이크 거절 (업그레이드 전 HTTP)');
+  {
+    const fake = new FakePool({ maxTotal: 1 });
+    await withScenes(async (gw, addr) => {
+      const wrongPath = await connect(`${addr.url.replace(/^http/, 'ws')}/nope`);
+      check(
+        '경로가 /ws가 아님 → 404',
+        wrongPath.ws === null && wrongPath.status === 404,
+        `status=${String(wrongPath.status)}, body=${wrongPath.body.slice(0, 80)}`,
+      );
+
+      const badScene = await connect(wsUrlOf(addr, '?scene=not-a-hex-id'));
+      check(
+        '?scene= 형식 오류 → 400',
+        badScene.ws === null && badScene.status === 400,
+        `status=${String(badScene.status)}, body=${badScene.body.slice(0, 80)}`,
+      );
+
+      const missing = await connect(wsUrlOf(addr, `?scene=${'f'.repeat(32)}`));
+      check(
+        '?scene= 씬 없음 → 404',
+        missing.ws === null && missing.status === 404,
+        `status=${String(missing.status)}, body=${missing.body.slice(0, 80)}`,
+      );
+
+      check(
+        '거절 3건이 세션을 하나도 잡지 않았다',
+        fake.acquired === 0 && fake.stats.busy === 0,
+        `acquired=${fake.acquired}, busy=${fake.stats.busy}`,
+      );
+
+      // 거절 본문은 REST와 같은 { error } JSON이어야 한다 — 클라이언트 파서가 하나다.
+      let parsed = false;
+      try {
+        parsed = isRecord(JSON.parse(missing.body)) && typeof (JSON.parse(missing.body) as Record<string, unknown>)['error'] === 'string';
+      } catch {
+        parsed = false;
+      }
+      check('거절 본문이 { error } JSON', parsed, missing.body.slice(0, 80));
+
+      // 유효한 씬 id는 통과하고, 이번 단위는 **로드하지 않는다** (#7의 일).
+      const up = await upload(addr, 'ws.zls', randomBytes(2048));
+      const id = String(sceneOf(up)?.['id'] ?? '');
+      const withScene = await connect(wsUrlOf(addr, `?scene=${id}`));
+      check(
+        '유효한 ?scene= → 연결 성립 + sceneId 기록',
+        withScene.ws !== null && gw.sessions.connections[0]?.sceneId === id,
+        `status=${String(withScene.status)}, sceneId=${gw.sessions.connections[0]?.sceneId ?? '(없음)'}`,
+      );
+
+      // 상한이 1이므로 다음 연결은 503. 가짜 풀도 실제와 같은 예외 타입을 던진다.
+      const over = await connect(wsUrlOf(addr));
+      check(
+        'maxTotal 초과 → 503 + Retry-After',
+        over.ws === null && over.status === 503 && over.retryAfter === '5',
+        `status=${String(over.status)}, retry-after=${String(over.retryAfter)}`,
+      );
+
+      withScene.ws?.close();
+      check('거절 뒤 정리', await until(() => fake.stats.busy === 0), JSON.stringify(fake.stats));
+    }, { sessions: { createPool: () => fake, heartbeatIntervalMs: 0 } });
+  }
+
+  // 워커 기동 실패 → 502. 실제 풀을 쓰되 엔진을 띄우지 않는다 —
+  // node 자신을 `--serve`로 부르면 즉시 exit 9라 "기동 중 죽는 워커"가 된다.
+  {
+    await withServer(async (gw, addr) => {
+      const r = await connect(wsUrlOf(addr));
+      check(
+        '워커가 기동 중 죽으면 → 502',
+        r.ws === null && r.status === 502,
+        `status=${String(r.status)}, body=${r.body.slice(0, 100)}`,
+      );
+      check('502 뒤 세션 누수 없음', gw.sessions.stats.total === 0, JSON.stringify(gw.sessions.stats));
+    }, { sessions: { exePath: process.execPath, heartbeatIntervalMs: 0 } });
+  }
+
+  // 게이트웨이가 세션을 받을 수 없는 상태(종료 중)의 업그레이드.
+  {
+    const fake = new FakePool();
+    await withServer(async (gw, addr) => {
+      await gw.sessions.shutdown(); // HTTP는 살아 있고 세션만 닫힌 상태
+      const r = await connect(wsUrlOf(addr));
+      check(
+        '세션이 닫힌 뒤 업그레이드 → 503',
+        r.ws === null && r.status === 503 && r.retryAfter === '5',
+        `status=${String(r.status)}, retry-after=${String(r.retryAfter)}`,
+      );
+      // 두 503은 문구로만 갈린다. 여기가 "업그레이드를 아예 안 받는" 쪽이다 —
+      // 7-3의 "종료 중 취소"와 같은 문구가 되면 진단이 사라진다.
+      check(
+        '문구가 "받을 수 없는 상태" 쪽 (7-3의 종료 중 취소와 구분)',
+        errorOf(r.body) === REFUSE_NOT_ACCEPTING
+          && errorOf(r.body) !== REFUSE_SHUTTING_DOWN,
+        errorOf(r.body) || r.body.slice(0, 80),
+      );
+      check('그 상태의 stats는 전부 0', gw.sessions.stats.total === 0 && !gw.sessions.isOpen);
+      check('풀이 정확히 한 번 닫혔다', fake.closed === 1, `closed=${fake.closed}`);
+    }, { sessions: { createPool: () => fake, heartbeatIntervalMs: 0 } });
+  }
+
+  // ── 7-2b. exe 경로가 아예 없을 때 (ISSUE-006 회귀) ────
+  // 이 케이스는 원래 **테스트로 만들 수 없었다.** child_process는 spawn 실패를
+  // 'exit'이 아니라 'error'로 알리는데, 그 리스너가 없으면 EventEmitter가
+  // unhandled로 승격시켜 게이트웨이 = 스모크 프로세스를 통째로 죽였다.
+  // 그래서 note로만 남아 있었다. sdk/worker.ts가 'error'를 받아 "세션 하나의
+  // 실패"로 국한하면서 비로소 정식 케이스가 됐다.
+  //
+  // 위의 exit 9 케이스와 다른 점 두 가지를 함께 못 박는다:
+  //   - 프로세스가 시작조차 못 했으므로 exit code가 **null**이다
+  //   - 실패한 exe 경로는 502 본문이 아니라 **게이트웨이 로그**에 있다
+  section('7-2b. exe 없음 → 502, 게이트웨이 생존 (ISSUE-006)');
+  {
+    const logs: string[] = [];
+    // 랜덤 이름이라 우연히 존재할 수 없다. 디렉토리는 실제 워커와 같은 곳에
+    // 두어 "경로는 맞고 파일만 없다"는 상황으로 좁힌다.
+    const ghost = path.join(
+      path.dirname(defaultWorkerExe()),
+      `no-such-worker-${randomBytes(6).toString('hex')}.exe`,
+    );
+
+    await withServer(async (gw, addr) => {
+      const r = await connect(wsUrlOf(addr));
+      const msg = errorOf(r.body);
+
+      check(
+        '없는 exe로 연결 → 502 (크래시가 아니라 응답)',
+        r.ws === null && r.status === 502,
+        `status=${String(r.status)}, error=${String(r.error)}, body=${r.body.slice(0, 120)}`,
+      );
+      check(
+        '502 본문이 { error } JSON + 기동 실패 문구',
+        msg.startsWith('워커를 시작하지 못했습니다:'),
+        msg || `(파싱 실패) ${r.body.slice(0, 80)}`,
+      );
+      // spawn 실패는 'exit'이 오지 않는다 — code가 숫자로 오면 어딘가에서
+      // "정상 종료"로 오인하고 있다는 뜻이다.
+      check(
+        'exit code가 null (spawn 실패엔 exit이 없다)',
+        msg.includes('code=null'),
+        msg || '(본문 없음)',
+      );
+      check('502 뒤 세션 누수 없음', gw.sessions.stats.total === 0, JSON.stringify(gw.sessions.stats));
+
+      // ★ 이 단위의 핵심. 예전엔 여기까지 오지도 못했다 — 프로세스가 이미
+      //   죽어 있었다. **같은 pid**로 health가 200이어야 "게이트웨이가 그대로
+      //   살아 있다"가 된다 (죽고 되살아난 게 아니다).
+      const health = await get(`${addr.url}/api/health`);
+      const hpid = isRecord(health.body) ? health.body['pid'] : undefined;
+      check(
+        '게이트웨이 프로세스 생존 — 같은 pid로 health 200',
+        health.status === 200 && hpid === process.pid,
+        `status=${health.status}, health.pid=${String(hpid)}, 스모크 pid=${process.pid}`,
+      );
+
+      // 같은 풀에 한 번 더. 실패가 풀에 상태를 남겼다면 두 번째는 다르게 깨진다.
+      const again = await connect(wsUrlOf(addr));
+      check(
+        '두 번째 시도도 똑같이 502 (풀에 상태가 남지 않는다)',
+        again.ws === null && again.status === 502 && errorOf(again.body).includes('code=null')
+        && gw.sessions.stats.total === 0,
+        `status=${String(again.status)}, stats=${JSON.stringify(gw.sessions.stats)}`,
+      );
+    }, { onLog: (l) => logs.push(l), sessions: { exePath: ghost, heartbeatIntervalMs: 0 } });
+
+    // 502 본문에는 경로가 없다(세션 계층의 문구가 그대로 나간다). 그러면
+    // "어느 exe가 없었는가"는 로그에만 남는데, 그게 없으면 운영에서 원인을
+    // 영영 못 찾는다. 로그 쪽을 계약으로 잡아 둔다.
+    check(
+      '실패한 exe 경로가 게이트웨이 로그에 남는다',
+      logs.some((l) => l.includes(ghost)),
+      logs.filter((l) => l.includes('워커')).join(' / ').slice(0, 200) || '로그 없음',
+    );
+
+    // 그리고 그 다음이 진짜로 도는가. spawn 실패가 이 프로세스에 아무것도
+    // 남기지 않았다는 것을 **실제 워커로** 확인한다 (§7-1과 같은 경로, 순서만 뒤).
+    const traced = new TracingPool(new SessionPool({
+      exePath: defaultWorkerExe(),
+      idleTimeout: 0,
+      onLog: () => {},
+    }));
+    await withServer(async (gw, addr) => {
+      const ok = await connect(wsUrlOf(addr));
+      strayPids.push(...traced.pids);
+      check(
+        '기동 실패 뒤에도 정상 exe로는 연결된다',
+        ok.ws !== null && gw.sessions.stats.busy === 1,
+        `status=${String(ok.status)}, error=${String(ok.error)}, `
+        + `stats=${JSON.stringify(gw.sessions.stats)}, pid=${String(traced.pids[0])}`,
+      );
+      const reply = ok.ws ? await ask(ok.ws, { id: 1, op: 'ping' }) : null;
+      check(
+        '그 세션으로 왕복이 된다',
+        reply?.['id'] === 1 && reply?.['ok'] === false,
+        JSON.stringify(reply),
+      );
+      ok.ws?.close();
+      check(
+        '종료 → busy 0',
+        await until(() => gw.sessions.stats.busy === 0),
+        JSON.stringify(gw.sessions.stats),
+      );
+    }, { sessions: { createPool: () => traced, heartbeatIntervalMs: 0 } });
+  }
+
+  // 502로 가는 다른 갈래: PoolExhaustedError가 **아닌** 오류.
+  {
+    const fake = new FakePool({ boom: true });
+    await withServer(async (gw, addr) => {
+      const r = await connect(wsUrlOf(addr));
+      check(
+        '풀이 일반 오류를 던지면 → 502 (503과 구분)',
+        r.ws === null && r.status === 502,
+        `status=${String(r.status)}, body=${r.body.slice(0, 80)}`,
+      );
+      check('502 뒤 busy 0', gw.sessions.stats.busy === 0);
+    }, { sessions: { createPool: () => fake, heartbeatIntervalMs: 0 } });
+  }
+
+  // ── 7-3. acquire 도중 단절 (110ms 창) ─────────────────
+  // 여기가 이 단위에서 가장 값진 회귀 테스트다. 실제 워커는 이 창이 110ms라
+  // 타이밍을 맞추기가 불안정하지만, 가짜 풀의 acquire를 게이트로 붙잡으면
+  // 창을 **원하는 만큼** 열어둘 수 있다 — 시간이 아니라 순서로 재현한다.
+  //
+  // 이 그물이 없으면: (1) 주인 없는 워커가 라이선스를 문 채 남고,
+  // (2) 연결 수명 Promise가 영원히 매달려 close()가 멈춘다.
+  section('7-3. acquire 도중 단절 (110ms 창)');
+  {
+    // (1) 클라이언트가 핸드셰이크 도중 사라진다.
+    const logs: string[] = [];
+    const gate = deferred();
+    const entered = deferred();
+    const fake = new FakePool({ gate: gate.promise, onEnter: () => entered.open() });
+
+    await withServer(async (gw, addr) => {
+      const client = new WebSocket(wsUrlOf(addr));
+      client.on('error', () => {}); // 중단 시 오는 오류를 삼킨다
+
+      await withTimeout(entered.promise, 3_000, undefined);
+      check(
+        'acquire 진입 시점에는 아직 연결이 없다',
+        gw.sessions.connections.length === 0,
+        `connections=${gw.sessions.connections.length}건`,
+      );
+
+      client.terminate();                              // 소켓을 죽이고
+      await new Promise((r) => setTimeout(r, 30));     // FIN이 서버에 닿게 둔 뒤
+      gate.open();                                     // acquire를 완료시킨다
+
+      const released = await until(() => fake.released === 1);
+      check(
+        '주인 없는 세션이 즉시 반납된다 (좀비 워커 방지)',
+        released && fake.acquired === 1 && fake.stats.busy === 0,
+        `acquired=${fake.acquired}, released=${fake.released}, busy=${fake.stats.busy}`,
+      );
+      check(
+        '연결로 등록되지 않는다',
+        await until(() => gw.sessions.connections.length === 0),
+        `connections=${gw.sessions.connections.length}건`,
+      );
+      check(
+        '취소 경로가 로그에 남는다',
+        logs.some((l) => l.includes('세션 취소')),
+        logs.filter((l) => l.includes('세션')).join(' / ') || '로그 없음',
+      );
+      note(
+        '어느 그물이 잡았는가',
+        logs.find((l) => l.includes('세션 취소')) ?? '(취소 로그 없음)',
+      );
+    }, { onLog: (l) => logs.push(l), sessions: { createPool: () => fake, heartbeatIntervalMs: 0 } });
+
+    // (2) acquire 도중 **게이트웨이가** 닫힌다. close()가 진행 중인 획득을
+    //     기다리지 않으면 아무도 모르는 프로세스가 남고, 반대로 잘못 기다리면
+    //     close()가 영원히 안 끝난다. 둘 다 이 케이스가 잡는다.
+    const gate2 = deferred();
+    const entered2 = deferred();
+    const fake2 = new FakePool({ gate: gate2.promise, onEnter: () => entered2.open() });
+    const gw2 = createServer({
+      onLog: () => {},
+      sessions: { createPool: () => fake2, heartbeatIntervalMs: 0 },
+    });
+    // 업그레이드 소켓을 테스트도 붙잡아 둔다. 리스너를 하나 더 다는 것뿐이라
+    // SessionManager의 처리에는 영향이 없다.
+    //
+    // 예전엔 이 참조가 **하네스 구조용**이었다 — 서버가 소켓을 버리고 return
+    // 하던 시절엔 finally에서 파괴해야 뒤의 close()가 안 매달렸다. 이제는
+    // 서버가 닫는 것이 계약이므로 용도가 뒤집힌다: "우리가 치울 게 없다"를
+    // 단언하는 데 쓴다. finally의 destroy는 회귀 시 스모크가 30초 워치독으로
+    // 죽는 대신 읽을 수 있는 실패로 끝나게 하는 안전망으로만 남긴다
+    // (아래 단언이 먼저 깨지므로 결함을 가릴 수는 없다).
+    let abandoned: Duplex | null = null;
+    gw2.server.on('upgrade', (_req, socket) => {
+      abandoned = socket as Duplex;
+    });
+
+    try {
+      const addr2 = await gw2.start();
+      // await 하지 않는다 — acquire가 게이트에 걸려 핸드셰이크가 진행 중이다.
+      // 결말(503 본문·헤더)은 아래에서 받는다.
+      const pending = connect(wsUrlOf(addr2));
+      await withTimeout(entered2.promise, 3_000, undefined);
+
+      const closing = gw2.close();                     // shutdown이 inflight를 기다린다
+      await new Promise((r) => setTimeout(r, 30));
+      check(
+        'acquire가 안 끝났으면 close()도 안 끝난다',
+        await withTimeout(closing.then(() => false), 100, true),
+        '100ms 안에 끝나면 진행 중인 획득을 버린 것이다',
+      );
+
+      gate2.open();
+      const t3 = performance.now();
+      const finished = await withTimeout(closing.then(() => true), 2_000, false);
+      const closeMs = Math.round(performance.now() - t3);
+      check(
+        'acquire 완료 → close()가 매달리지 않고 끝난다',
+        finished,
+        `${finished ? `${closeMs}ms, ` : ''}`
+        + `acquired=${fake2.acquired}, released=${fake2.released}, closed=${fake2.closed}`
+        + (finished ? '' : ' — 세션 정리(shutdown)는 끝났는데 close()가 안 풀린다'),
+      );
+      check(
+        '그 사이 얻은 세션은 반납된다 (게이트웨이 종료 중)',
+        fake2.acquired === 1 && fake2.released === 1 && fake2.stats.busy === 0,
+        `acquired=${fake2.acquired}, released=${fake2.released}, busy=${fake2.stats.busy}`,
+      );
+      check('풀도 닫힌다', fake2.closed === 1, `closed=${fake2.closed}`);
+
+      // 클라이언트도 매달리지 않는다. 여기가 "close()가 빨라졌다"와 별개로
+      // 지켜야 할 절반이다 — 서버만 빨리 끝나고 클라이언트가 이유도 모른 채
+      // 타임아웃까지 기다리면 고친 게 아니다.
+      const outcome = await withTimeout(pending, 3_000, null);
+      check(
+        '그 클라이언트는 503 + Retry-After를 받는다 (매달리지 않는다)',
+        outcome !== null && outcome.ws === null && outcome.status === 503 && outcome.retryAfter === '5',
+        outcome === null
+          ? '3초 안에 결말이 나지 않았다 — 소켓이 버려졌다는 뜻이다'
+          : `status=${String(outcome.status)}, retry-after=${String(outcome.retryAfter)}, `
+            + `ws=${outcome.ws === null ? 'null' : 'open'}, error=${String(outcome.error)}`,
+      );
+      check(
+        '문구가 "종료 중" 쪽 (기동 전/종료 중 거절과 구분)',
+        outcome !== null && errorOf(outcome.body) === REFUSE_SHUTTING_DOWN
+          && errorOf(outcome.body) !== REFUSE_NOT_ACCEPTING,
+        outcome === null ? '(결말 없음)' : errorOf(outcome.body) || outcome.body.slice(0, 80),
+      );
+
+      // 예전엔 이 소켓이 응답도 파괴도 없이 버려져 http.close()의 콜백이 영영
+      // 오지 않았다(>4000ms 매달림). 이제 서버가 refuse()로 end() 하므로
+      // **테스트가 치울 것이 없어야 한다.** 이 단언이 그 자리를 지킨다.
+      const sock = abandoned as Duplex | null;
+      check(
+        '버려진 업그레이드 소켓이 없다 (서버가 응답하고 닫았다)',
+        sock !== null && sock.writableEnded,
+        sock === null
+          ? '업그레이드 소켓을 잡지 못했다'
+          : `writableEnded=${String(sock.writableEnded)}, destroyed=${String(sock.destroyed)}`,
+      );
+
+      if (!finished) {
+        // 회귀했을 때 원인을 출력에 못 박는다. 종료 중 취소 분기(sessions.ts
+        // #serve의 `this.#pool !== pool`)가 소켓에 응답도 파괴도 하지 않고
+        // return 하면, node의 http 서버는 그 소켓을 계속 세므로 close()의
+        // 콜백이 오지 않는다 — closeAllConnections()도 업그레이드된 소켓은
+        // 못 건드린다. 겸사겸사 하네스도 구한다.
+        sock?.destroy();
+        const afterDestroy = await withTimeout(closing.then(() => true), 1_000, false);
+        note(
+          '버려진 업그레이드 소켓을 테스트가 파괴하면',
+          afterDestroy
+            ? 'close()가 곧바로 끝난다 — 원인은 응답 없이 버려진 그 소켓이다'
+            : '그래도 안 끝난다 — 원인이 다른 데 있다',
+        );
+      }
+      outcome?.ws?.close();
+    } finally {
+      (abandoned as Duplex | null)?.destroy();
+      await gw2.close();
+    }
+  }
+
+  // ── 7-4. 하트비트 ─────────────────────────────────────
+  // WS는 죽은 TCP 연결을 조용히 유지한다(노트북 뚜껑, NAT 만료). 그 연결 하나가
+  // 워커 = 라이선스 인스턴스 하나를 무기한 붙잡으므로, 회수되는지가 곧 검증이다.
+  // 기본 30초를 40ms로 줄이면 시간이 아니라 주기 수로 확인할 수 있다.
+  section('7-4. 하트비트 (죽은 연결 회수)');
+  {
+    const fake = new FakePool();
+    await withServer(async (gw, addr) => {
+      const r = await connect(wsUrlOf(addr), { autoPong: false }); // pong을 안 보낸다
+      check('무응답 클라이언트도 일단 연결된다', r.ws !== null);
+      const t0 = performance.now();
+      const reaped = await until(() => fake.released === 1 && gw.sessions.stats.busy === 0, 3_000);
+      check(
+        'pong 없는 연결은 다음 주기에 회수된다',
+        reaped,
+        `${Math.round(performance.now() - t0)}ms, acquired=${fake.acquired}, released=${fake.released}`,
+      );
+    }, { sessions: { createPool: () => fake, heartbeatIntervalMs: 40 } });
+
+    // 반대 방향. 정상 클라이언트를 끊어버리면 하트비트가 그냥 학살자가 된다.
+    const fake2 = new FakePool();
+    await withServer(async (gw, addr) => {
+      const r = await connect(wsUrlOf(addr)); // ws 기본값은 자동 pong
+      await new Promise((res) => setTimeout(res, 260)); // ~6주기
+      check(
+        '응답하는 연결은 여러 주기를 살아남는다',
+        r.ws?.readyState === WebSocket.OPEN && gw.sessions.stats.busy === 1 && fake2.released === 0,
+        `readyState=${String(r.ws?.readyState)}, busy=${gw.sessions.stats.busy}, released=${fake2.released}`,
+      );
+      r.ws?.close();
+      check('그 뒤 정상 종료', await until(() => fake2.released === 1));
+    }, { sessions: { createPool: () => fake2, heartbeatIntervalMs: 40 } });
+
+    // 끌 수 있어야 한다. 끄면 무응답 클라이언트도 안 끊긴다.
+    const fake3 = new FakePool();
+    await withServer(async (gw, addr) => {
+      const r = await connect(wsUrlOf(addr), { autoPong: false });
+      await new Promise((res) => setTimeout(res, 200));
+      check(
+        'heartbeatIntervalMs: 0 → 하트비트 없음',
+        r.ws?.readyState === WebSocket.OPEN && gw.sessions.stats.busy === 1,
+        `readyState=${String(r.ws?.readyState)}, busy=${gw.sessions.stats.busy}`,
+      );
+      r.ws?.terminate();
+    }, { sessions: { createPool: () => fake3, heartbeatIntervalMs: 0 } });
+  }
+
+  // ── 7-5. 메시지 (중계는 #7의 일) ──────────────────────
+  // 지금 중계하지 않는 건 의도다. 하지만 무시하면 클라이언트가 영원히 기다리므로
+  // **워커 프로토콜과 같은 모양**의 에러를 돌려준다. 형태가 지금 고정돼야
+  // #7이 켜질 때 같은 자리에 성공 응답이 들어올 뿐 계약이 안 바뀐다.
+  section('7-5. 메시지 응답 형태');
+  {
+    const fake = new FakePool();
+    await withServer(async (gw, addr) => {
+      const r = await connect(wsUrlOf(addr));
+      const ws = r.ws;
+      if (!ws) {
+        check('연결 성립', false, '세션을 얻지 못했다');
+        return;
+      }
+
+      const withId = await ask(ws, { id: 7, op: 'ping' });
+      check(
+        'op 요청 → { id, ok:false, error } (id를 그대로 되돌려준다)',
+        withId?.['id'] === 7 && withId?.['ok'] === false && typeof withId?.['error'] === 'string',
+        JSON.stringify(withId),
+      );
+
+      const noId = await ask(ws, { op: 'ping' });
+      check(
+        'id 없는 요청 → id 필드 없이 { ok:false, error }',
+        noId?.['ok'] === false && !('id' in (noId ?? {})),
+        JSON.stringify(noId),
+      );
+
+      const noOp = await ask(ws, { id: 8 });
+      check(
+        'op 누락 → op 필드가 없다는 오류',
+        noOp?.['id'] === 8 && String(noOp?.['error']).includes('op'),
+        JSON.stringify(noOp),
+      );
+
+      const bad = await ask(ws, null, { raw: '{not json' });
+      check(
+        '비 JSON → { ok:false, error }',
+        bad?.['ok'] === false && String(bad?.['error']).includes('JSON'),
+        JSON.stringify(bad),
+      );
+
+      const bin = await ask(ws, null, { binary: new Uint8Array([1, 2, 3]) });
+      check(
+        '바이너리 프레임 → 거절 응답',
+        bin?.['ok'] === false && String(bin?.['error']).includes('바이너리'),
+        JSON.stringify(bin),
+      );
+
+      check(
+        '다섯 번 거절해도 연결과 세션은 유지된다',
+        ws.readyState === WebSocket.OPEN && gw.sessions.stats.busy === 1 && fake.released === 0,
+        `readyState=${ws.readyState}, busy=${gw.sessions.stats.busy}`,
+      );
+
+      ws.close();
+      check('종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+    }, { sessions: { createPool: () => fake, heartbeatIntervalMs: 0 } });
+  }
+
+  // ── 7-6. 워커 자멸 → 4001 ─────────────────────────────
+  // 워커가 스스로 죽으면 세션 상태는 복구 불가다. 연결을 살려두면 이후 op가
+  // 전부 실패하므로, 끊어서 클라이언트가 재연결로 새 세션을 받게 해야 한다.
+  section('7-6. 워커 자멸 → 4001');
+  {
+    const fake = new FakePool();
+    await withServer(async (gw, addr) => {
+      const r = await connect(wsUrlOf(addr));
+      check('연결 성립', r.ws !== null && gw.sessions.stats.busy === 1);
+
+      const [session] = [...fake.live];
+      const bye = r.ws ? closedWith(r.ws) : Promise.resolve({ code: -1, reason: '' });
+      session?.die(3);
+
+      const info = await withTimeout(bye, 3_000, { code: -1, reason: '' });
+      check(
+        '워커가 죽으면 연결이 4001로 닫힌다',
+        info.code === CLOSE_SESSION_LOST,
+        `code=${info.code} (기대 ${CLOSE_SESSION_LOST}), reason=${info.reason}`,
+      );
+      check(
+        '그 세션도 반납된다',
+        await until(() => fake.released === 1 && gw.sessions.stats.busy === 0),
+        `released=${fake.released}, busy=${gw.sessions.stats.busy}`,
+      );
+    }, { sessions: { createPool: () => fake, heartbeatIntervalMs: 0 } });
+  }
+
+  // ── 7-7. 좀비 최종 확인 ───────────────────────────────
+  // 개수가 아니라 **우리가 만든 pid**로 판정한다. 다른 프로세스가 같은 exe를
+  // 띄우고 있어도(SDK 스모크 병행 실행 등) 오탐이 나지 않는다.
+  section('7-7. 좀비 프로세스');
+  {
+    const alive: number[] = [];
+    for (const pid of [...new Set(strayPids)]) {
+      if (await pidAlive(pid)) alive.push(pid);
+    }
+    check(
+      '이 스모크가 띄운 워커가 하나도 남지 않았다',
+      alive.length === 0,
+      alive.length === 0 ? `확인한 pid ${new Set(strayPids).size}개 전부 종료` : `남은 pid=${alive.join(',')}`,
+    );
+    note('전체 exe 개수', `${await exeCount()}개 (다른 프로세스가 띄운 것 포함)`);
   }
 }
 

@@ -25,6 +25,7 @@ import path from 'node:path';
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
 
 import { createSceneRoutes, SceneStore } from './files.ts';
+import { SessionManager, type SessionsOptions } from './sessions.ts';
 
 /**
  * 라우트 모듈이 받는 것.
@@ -87,6 +88,14 @@ export interface GatewayOptions {
   sceneDir?: string;
   /** 업로드 1건의 상한(바이트). 기본 DEFAULT_MAX_SCENE_BYTES (512MiB) */
   maxSceneBytes?: number;
+  /**
+   * WS 세션(#6). 워커 exe 경로·세션 상한·하트비트 등.
+   *
+   * 라우트가 아니라 별도 옵션인 이유는 WS가 Express 스택을 지나지 않기
+   * 때문이다 — 업그레이드는 http.Server의 'upgrade'로 온다.
+   * `createPool`을 넘기면 exe 없이도 연결↔세션 수명을 검증할 수 있다.
+   */
+  sessions?: SessionsOptions;
 }
 
 /**
@@ -150,6 +159,7 @@ export class Gateway {
   /** 등록된 라우트 모듈이 돌려준 수명 훅. start()가 소비한다 */
   #routeHooks: RouteHooks[] = [];
   #scenes: SceneStore;
+  #sessions: SessionManager;
 
   constructor(opts: GatewayOptions = {}) {
     this.#opts = opts;
@@ -160,6 +170,17 @@ export class Gateway {
     this.#app = express();
     this.#configure(this.#app);
     this.#http = createHttpServer(this.#app);
+
+    // WS는 라우트가 아니다. Express 스택(미들웨어·404 catch-all)을 지나지 않고
+    // http.Server의 'upgrade' 이벤트로 온다. 그래서 #configure가 아니라 여기서
+    // 붙는다. 리스너를 다는 순간 업그레이드 소켓의 소유권이 우리에게 오므로,
+    // /ws가 아닌 경로도 SessionManager가 404로 끊는다.
+    this.#sessions = new SessionManager({
+      ...(opts.sessions ?? {}),
+      scenes: this.#scenes,
+      log: (line) => this.#log(line),
+    });
+    this.#sessions.attach(this.#http);
   }
 
   /**
@@ -195,6 +216,16 @@ export class Gateway {
    */
   get scenes(): SceneStore {
     return this.#scenes;
+  }
+
+  /**
+   * WS 세션 관리자 (#6).
+   *
+   * `gw.sessions.stats`가 풀 통계, `gw.sessions.connections`가 현재 연결이다.
+   * 둘이 어긋나면 세션이 새고 있다는 뜻이다.
+   */
+  get sessions(): SessionManager {
+    return this.#sessions;
   }
 
   get listening(): boolean {
@@ -295,19 +326,31 @@ export class Gateway {
     // 재기동될 수 있으므로 prepare는 멱등이어야 한다(RouteHooks 주석 참고).
     for (const hooks of this.#routeHooks) await hooks.prepare?.();
 
-    const bound = await new Promise<AddressInfo>((resolve, reject) => {
-      const onError = (err: Error): void => {
-        this.#http.removeListener('listening', onListening);
-        reject(err);
-      };
-      const onListening = (): void => {
-        this.#http.removeListener('error', onError);
-        resolve(this.#http.address() as AddressInfo);
-      };
-      this.#http.once('error', onError);
-      this.#http.once('listening', onListening);
-      this.#http.listen(port, host);
-    });
+    // 세션 풀도 리스닝 **전에** 연다. 업그레이드 요청이 풀 없는 순간을 만나면
+    // 정상 요청이 503으로 튕긴다. 풀 생성은 프로세스를 띄우지 않으므로 싸다.
+    this.#sessions.open();
+
+    let bound: AddressInfo;
+    try {
+      bound = await new Promise<AddressInfo>((resolve, reject) => {
+        const onError = (err: Error): void => {
+          this.#http.removeListener('listening', onListening);
+          reject(err);
+        };
+        const onListening = (): void => {
+          this.#http.removeListener('error', onError);
+          resolve(this.#http.address() as AddressInfo);
+        };
+        this.#http.once('error', onError);
+        this.#http.once('listening', onListening);
+        this.#http.listen(port, host);
+      });
+    } catch (err) {
+      // 바인딩 실패(포트 점유 등)면 #address가 안 잡히고, close()는 그 경우
+      // 조기 반환한다 — 방금 연 풀·하트비트 타이머를 여기서 되돌려야 한다.
+      await this.#sessions.shutdown().catch(() => {});
+      throw err;
+    }
 
     this.#startedAt = performance.now();
     this.#address = {
@@ -322,11 +365,18 @@ export class Gateway {
   /**
    * 리스닝을 멈추고 소켓을 전부 끊는다.
    * server.close()만으로는 keep-alive 연결이 남아 이벤트 루프가 안 빈다.
+   *
+   * **세션을 먼저 정리한다.** 여기서 워커를 안 죽이면 exe가 좀비로 남고,
+   * 자식 프로세스의 stdio 파이프가 이벤트 루프를 붙잡아 스모크가 매달린다.
+   * closeAllConnections()보다 앞이어야 하는 이유도 같다 — 소켓을 먼저 파괴하면
+   * WS가 close 프레임 없이 끊기고, 반납이 그 뒤로 밀린다.
    */
   async close(): Promise<void> {
     if (!this.#address) return;
     this.#address = null;
     this.#startedAt = 0;
+
+    await this.#sessions.shutdown();
 
     await new Promise<void>((resolve, reject) => {
       this.#http.close((err) => (err ? reject(err) : resolve()));
@@ -345,12 +395,21 @@ export function createServer(opts: GatewayOptions = {}): Gateway {
 async function main(): Promise<void> {
   const port = Number(process.env['PORT'] ?? 3000);
   const maxSceneBytes = Number(process.env['MAX_SCENE_BYTES'] ?? Number.NaN);
+  const maxSessions = Number(process.env['MAX_SESSIONS'] ?? Number.NaN);
+  const idleTimeout = Number(process.env['SESSION_IDLE_TIMEOUT'] ?? Number.NaN);
   const gateway = createServer({
     port,
     host: process.env['HOST'] ?? '127.0.0.1',
     onLog: (line) => console.log(line),
     ...(process.env['SCENE_DIR'] ? { sceneDir: process.env['SCENE_DIR'] } : {}),
     ...(Number.isFinite(maxSceneBytes) ? { maxSceneBytes } : {}),
+    sessions: {
+      // MAX_SESSIONS는 라이선스 인스턴스 수와 직결된다. 안 주면 무제한이므로
+      // 운영에서는 반드시 지정할 것.
+      ...(process.env['WORKER_EXE'] ? { exePath: process.env['WORKER_EXE'] } : {}),
+      ...(Number.isFinite(maxSessions) ? { maxTotal: maxSessions } : {}),
+      ...(Number.isFinite(idleTimeout) ? { idleTimeout } : {}),
+    },
   });
 
   const shutdown = (signal: string): void => {
@@ -369,6 +428,7 @@ async function main(): Promise<void> {
   const { url } = await gateway.start();
   console.log(`health: ${url}/api/health`);
   console.log(`씬 디렉토리: ${gateway.scenes.dir} (상한 ${gateway.scenes.maxBytes} 바이트)`);
+  console.log(`WS: ${url.replace(/^http/, 'ws')}${gateway.sessions.path}  (연결 1개 = 워커 프로세스 1개)`);
 }
 
 if (process.argv[1] && import.meta.filename === process.argv[1]) {

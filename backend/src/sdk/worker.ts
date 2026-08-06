@@ -75,18 +75,52 @@ export class Worker extends EventEmitter {
       opts.onLog?.(line);
     });
 
+    // spawn 자체가 실패하면(exe 경로가 틀림, 권한 없음, fd 고갈) 프로세스는
+    // 시작조차 못 하므로 **'exit'이 오지 않는다.** 그리고 child_process의
+    // 'error'는 리스너가 없으면 EventEmitter가 unhandled로 승격시켜
+    // **게이트웨이 프로세스 전체를 죽인다** (ISSUE-006). 여기서 받아
+    // "세션 하나의 실패"로 국한한다 — 게이트웨이는 이걸 502로 돌려준다.
+    //
+    // 에러는 nextTick으로 오므로(ChildProcess.spawn이 그렇게 예약한다)
+    // Session.create()가 'ready'/'exit' 리스너를 다는 동기 구간보다 늦다.
+    // 따라서 아래 emit('exit')은 반드시 그 대기를 깨운다.
+    child.on('error', (err: Error) => {
+      // err.message에 이미 exe 경로가 들어 있지만(`spawn <path> ENOENT`),
+      // 다른 실패 모드에서도 원인을 알 수 있게 경로를 명시한다.
+      const message = `워커를 시작하지 못했습니다: ${err.message} (exe=${opts.exePath})`;
+      // 이미 죽은 뒤 도착한 에러(kill EPERM 등)라도 로그는 남긴다.
+      opts.onLog?.(message);
+      this.#end(null, () => new WorkerError(message));
+    });
+
     child.on('exit', (code) => {
-      this.#closed = true;
-      // 프로세스가 죽으면 대기 중인 요청은 전부 실패다. 조용히 매달려 있게
-      // 두면 게이트웨이가 영원히 응답을 기다린다.
-      const reason = new WorkerError(`워커가 종료됨 (code=${code})`);
+      this.#end(code, () => new WorkerError(`워커가 종료됨 (code=${code})`));
+    });
+  }
+
+  /**
+   * 프로세스가 끝났다 — 정상 종료든 기동 실패든.
+   *
+   * 'error'와 'exit'은 **둘 다 올 수도, 한쪽만 올 수도** 있다(ENOENT는 'error'만).
+   * 그래서 여기가 유일한 종료 처리 지점이고, 먼저 온 쪽만 통과시킨다.
+   * 두 번 통과하면 'exit'이 두 번 나가 세션이 이미 끝난 뒤에도 다시 정리된다.
+   */
+  #end(code: number | null, reason: () => WorkerError): void {
+    if (this.#closed) return;
+    this.#closed = true;
+
+    // 프로세스가 죽으면 대기 중인 요청은 전부 실패다. 조용히 매달려 있게
+    // 두면 게이트웨이가 영원히 응답을 기다린다.
+    if (this.#pending.size > 0) {
+      const err = reason();
       for (const [, p] of this.#pending) {
         clearTimeout(p.timer);
-        p.reject(reason);
+        p.reject(err);
       }
       this.#pending.clear();
-      this.emit('exit', code);
-    });
+    }
+
+    this.emit('exit', code);
   }
 
   static spawn(opts: WorkerOptions): Worker {
