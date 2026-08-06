@@ -25,7 +25,8 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+import { existsSync, statSync } from 'node:fs';
+import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Readable, type Duplex } from 'node:stream';
@@ -33,8 +34,8 @@ import { promisify } from 'node:util';
 
 import { WebSocket } from 'ws';
 
-import { PoolExhaustedError, SessionPool } from '../sdk/index.ts';
-import type { Op } from '../sdk/protocol.ts';
+import { decodeFloat32, PoolExhaustedError, SessionPool } from '../sdk/index.ts';
+import type { MeshDataResult, Op } from '../sdk/protocol.ts';
 import { allowedOps } from './bridge.ts';
 import {
   createServer,
@@ -400,6 +401,109 @@ async function ask(
 }
 
 /**
+ * 이벤트가 섞여 흐르는 소켓에서 응답을 **id로 상관시킨다** (#8).
+ *
+ * 위의 `ask()`는 `ws.once('message')`라 **시뮬레이션 중에는 쓸 수 없다.**
+ * 구독 중이면 초당 약 80건(frame 40 + engineMessage 40)이 흐르므로 "다음
+ * 메시지 한 건"이 내 응답일 확률이 사실상 0이다. 그래서 #8 섹션은 전부
+ * 이 클래스를 쓴다 — 받은 것을 분류해 쌓아두고, 응답은 id로 골라 꺼낸다.
+ *
+ * ★ 분류 규칙이 곧 게이트웨이가 클라이언트에게 약속한 계약이다:
+ *   **판별은 `'event' in msg` 하나뿐이다.** id 유무로 가르면 안 된다 —
+ *   응답에도 id가 없는 경로가 셋 있다(JSON 파싱 실패 / `op` 누락 / 바이너리
+ *   프레임 거부). 그 셋이 여기서 `events`로 잘못 분류되면 §7-14가 실패한다.
+ *   즉 이 헬퍼는 도우미인 동시에 계약의 실행 가능한 명세다.
+ */
+class Inbox {
+  /** `event` 필드를 가진 것 전부 (도착 순서) */
+  readonly events: Array<Record<string, unknown>> = [];
+  /** 응답인데 id가 없는 것. 위 세 경로가 여기로 온다 */
+  readonly idless: Array<Record<string, unknown>> = [];
+
+  #ws: WebSocket;
+  #waiters = new Map<number, (r: Record<string, unknown>) => void>();
+  #nextId = 1;
+
+  constructor(ws: WebSocket) {
+    this.#ws = ws;
+    ws.on('message', (data: Buffer, isBinary: boolean) => {
+      if (isBinary) return;
+      let m: unknown;
+      try {
+        m = JSON.parse(data.toString('utf8'));
+      } catch {
+        return;
+      }
+      if (!isRecord(m)) return;
+      if ('event' in m) {
+        this.events.push(m);
+        return;
+      }
+      const id = m['id'];
+      if (typeof id !== 'number') {
+        this.idless.push(m);
+        return;
+      }
+      const w = this.#waiters.get(id);
+      if (w) {
+        this.#waiters.delete(id);
+        w(m);
+      }
+    });
+  }
+
+  /** op 하나 왕복. 이벤트가 아무리 흘러도 **내 id의 응답만** 기다린다 */
+  send(req: Record<string, unknown>, timeoutMs = 8_000): Promise<Record<string, unknown> | null> {
+    const id = this.#nextId++;
+    const got = new Promise<Record<string, unknown>>((resolve) => this.#waiters.set(id, resolve));
+    this.#ws.send(JSON.stringify({ id, ...req }));
+    return withTimeout<Record<string, unknown> | null>(got, timeoutMs, null);
+  }
+
+  /** 이름이 name인 이벤트만 */
+  of(name: string): Array<Record<string, unknown>> {
+    return this.events.filter((e) => e['event'] === name);
+  }
+
+  /** name 이벤트가 n건 모일 때까지 기다린다. 못 모으면 모인 만큼 돌려준다 */
+  async collect(name: string, n: number, timeoutMs = 8_000): Promise<Array<Record<string, unknown>>> {
+    await until(() => this.of(name).length >= n, timeoutMs);
+    return this.of(name);
+  }
+}
+
+/** 실제 sample.zls (107MB). SDK 스모크가 쓰는 그 파일이다 */
+const SAMPLE_ZLS = path.resolve(
+  import.meta.dirname, '..', '..', '..',
+  'zelusSandBox_Cobalt', 'Zest', 'testing', 'sdk', 'sample.zls',
+);
+
+/**
+ * 씬을 **디스크에 직접 심는다** (HTTP 업로드를 타지 않는다).
+ *
+ * 업로드 경로는 §6이 전수로 덮었고, #8이 필요로 하는 건 그게 아니라
+ * **엔진이 실제로 시뮬레이션할 수 있는 씬**이다. 다른 §7 섹션들이 올리는
+ * `'not a real zls'` 14바이트로는 frame 이벤트가 한 건도 나오지 않는다.
+ * 107MB를 fetch로 흘리면 이 섹션이 통째로 그 비용이 되므로 복사로 끝낸다
+ * (실측 31ms — 캐시가 식어도 600ms).
+ *
+ * ⚠️ **원본은 읽기만 한다.** 회사 저장소(zelusSandBox_Cobalt)는 읽기 전용이다.
+ */
+async function plantScene(store: { dir: string; pathOf(id: string): string }): Promise<string> {
+  const id = randomBytes(16).toString('hex');
+  await mkdir(store.dir, { recursive: true });
+  await copyFile(SAMPLE_ZLS, store.pathOf(id));
+  const record = {
+    id,
+    name: 'sample.zls',
+    bytes: statSync(SAMPLE_ZLS).size,
+    uploadedAt: new Date().toISOString(),
+  };
+  await writeFile(path.join(store.dir, `${id}.json`), `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+  return id;
+}
+
+/**
  * pid 하나가 아직 살아 있는가.
  *
  * exe **개수**를 세지 않는 게 핵심이다. 같은 exe를 다른 프로세스가 띄우고
@@ -589,6 +693,125 @@ class FakePool implements SessionSource {
     this.closed++;
     for (const s of this.live) s.alive = false;
     this.live.clear();
+  }
+}
+
+/**
+ * **같은 세션 하나를 계속 돌려주는** 풀 (#8).
+ *
+ * FakePool은 acquire마다 새 FakeSession을 만들고 release에서 죽인다 —
+ * 즉 `idleTimeout: 0`(기본값)의 세계다. 그런데 #8의 리스너 누수가 실제로
+ * 피해를 내는 건 **`idleTimeout > 0`이라 세션이 재사용될 때**다: 이전 연결의
+ * 리스너가 세션에 남아 있으면 다음 연결의 프레임이 이미 닫힌 소켓의 conn으로
+ * 계속 들어오고, 리스너가 연결 수만큼 쌓인다.
+ *
+ * 그 세계를 재현하는 게 이 풀이다. 세션이 EventEmitter이므로 **`emit`을 직접
+ * 불러** 워커 없이 게이트웨이 경로 전체(#relayEvents → bridge → #emit → 소켓)를
+ * 결정적으로 검증할 수 있고, `listenerCount`로 누수를 **직접** 읽을 수 있다.
+ */
+class ReusingPool implements SessionSource {
+  readonly session: FakeSession;
+  acquired = 0;
+  released = 0;
+  #busy = 0;
+
+  constructor(relay?: Relay) {
+    this.session = new FakeSession(relay);
+  }
+
+  async acquire(): Promise<SessionLike> {
+    this.acquired++;
+    this.#busy++;
+    return this.session;
+  }
+
+  async release(_session: SessionLike): Promise<void> {
+    // 실제 풀의 release는 pause+clear까지만 하고 **프로세스를 살려둔다**.
+    // 세션 객체도 리스너도 그대로 남는다 — 그게 여기서 재현하려는 상태다.
+    this.released++;
+    this.#busy = Math.max(0, this.#busy - 1);
+  }
+
+  get stats(): PoolStats {
+    return { idle: this.#busy > 0 ? 0 : 1, busy: this.#busy, total: 1 };
+  }
+
+  async close(): Promise<void> {
+    this.session.alive = false;
+  }
+}
+
+/**
+ * `on()`이 **없는** 세션 (#8).
+ *
+ * SessionLike.on은 옵셔널이다 — 그래야 exe 없이 도는 세션들이 이벤트 표면을
+ * 흉내 내지 않아도 된다(sessions.ts 주석). 그런데 FakeSession은 EventEmitter를
+ * 상속하므로 `on`을 **항상 갖는다.** 즉 `#relayEvents`의 `if (!session.on)
+ * return;` 갈래는 기존 스모크에서 한 번도 실행되지 않는다.
+ *
+ * EventEmitter가 아닌 세션을 하나 두어 그 갈래를 덮는다. 주장은 두 가지다:
+ * 게이트웨이가 터지지 않는다는 것과, **op 중계는 그대로 돈다**는 것 —
+ * 이벤트를 못 내는 것이 세션 전체를 못 쓰게 만들면 안 된다.
+ */
+class NoEventSession implements SessionLike {
+  alive = true;
+  readonly worker: {
+    readonly pid?: number | undefined;
+    request?(op: Op, payload?: Record<string, unknown>): Promise<unknown>;
+  };
+
+  /** off로 뗀 이벤트 이름. frame/engineMessage가 여기 오면 안 된다 (달지도 않았으므로) */
+  readonly offCalls: string[] = [];
+
+  #exit: Array<(code: number | null) => void> = [];
+
+  constructor(relay?: Relay) {
+    this.worker = relay
+      ? { pid: 0, request: (op, payload) => relay.handle(op, payload) }
+      : { pid: 0 };
+  }
+
+  once(_event: 'exit', listener: (code: number | null) => void): unknown {
+    this.#exit.push(listener);
+    return this;
+  }
+
+  off(event: 'exit', listener: (code: number | null) => void): unknown;
+  off(event: 'frame', listener: (frame: number, mesh?: MeshDataResult) => void): unknown;
+  off(event: 'engineMessage', listener: (message: string) => void): unknown;
+  off(event: string, _listener: unknown): unknown {
+    this.offCalls.push(event);
+    return this;
+  }
+}
+
+/** NoEventSession을 내주는 풀 */
+class NoEventPool implements SessionSource {
+  readonly sessions: NoEventSession[] = [];
+  #relay: Relay | undefined;
+  #busy = 0;
+
+  constructor(relay?: Relay) {
+    this.#relay = relay;
+  }
+
+  async acquire(): Promise<SessionLike> {
+    const s = new NoEventSession(this.#relay);
+    this.sessions.push(s);
+    this.#busy++;
+    return s;
+  }
+
+  async release(_session: SessionLike): Promise<void> {
+    this.#busy = Math.max(0, this.#busy - 1);
+  }
+
+  get stats(): PoolStats {
+    return { idle: 0, busy: this.#busy, total: this.#busy };
+  }
+
+  async close(): Promise<void> {
+    for (const s of this.sessions) s.alive = false;
   }
 }
 
@@ -2689,6 +2912,585 @@ async function main(): Promise<void> {
       ws.close();
       check('종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
     }, { sessions: { createPool: () => fake, heartbeatIntervalMs: 0, maxInflightRequests: 4 } });
+  }
+
+  // ── §7-12. 이벤트 역방향 중계 (TASKS #8) ──────────────
+  // 통과 기준은 한 줄이다: **load → start → 클라이언트에 frame 이벤트 도착.**
+  //
+  // 이 한 줄만은 실제 워커여야 한다. #8이 주장하는 것은 "게이트웨이가 이벤트를
+  // 잘 포장한다"가 아니라 **"워커가 스스로 밀어 보내는 것이 클라이언트까지
+  // 닿는다"**이고, 가짜 세션의 emit은 그 사슬의 앞쪽 절반(엔진 → SDK Session)을
+  // 통째로 건너뛴다. 실측 비용은 씬 복사 31ms + load 1.1s + 시뮬 0.3s ≈ 2.1s로,
+  // 30초 가드 안에서 충분히 감당된다.
+  //
+  // 반대로 **리스너 수명·구독 물려받기·응답/이벤트 판별**은 실제 워커로 하면
+  // 안 된다 — 전부 "무엇이 오지 않는가"에 대한 주장이라 실제 워커로는
+  // 확률적으로만 확인된다. 그건 §7-13/7-14가 가짜 세션으로 결정적으로 본다.
+  section('7-12. 워커 이벤트 역방향 중계 (실제 워커, 통과 기준)');
+  {
+    const traced = new TracingPool(new SessionPool({
+      exePath: defaultWorkerExe(),
+      idleTimeout: 0,
+      maxTotal: 1,
+      onLog: () => {},
+    }));
+
+    await withScenes(async (gw, addr) => {
+      if (!existsSync(SAMPLE_ZLS)) {
+        check('sample.zls 존재 — 통과 기준에는 진짜 씬이 필요하다', false, SAMPLE_ZLS);
+        return;
+      }
+      const sceneId = await plantScene(gw.scenes);
+
+      const r = await connect(wsUrlOf(addr));
+      const ws = r.ws;
+      strayPids.push(...traced.pids);
+      if (!ws) {
+        check('연결 성립', false, `status=${String(r.status)}, error=${String(r.error)}`);
+        return;
+      }
+      const pid = traced.pids[0];
+      const inbox = new Inbox(ws);
+
+      // ── ① 통과 기준 ────────────────────────────────────
+      const loaded = await inbox.send({ op: 'load', scene: sceneId });
+      check(
+        'load(sample.zls) 성공',
+        loaded?.['ok'] === true
+        && isRecord(loaded['result']) && loaded['result']['loaded'] === true,
+        JSON.stringify(loaded).slice(0, 160),
+      );
+      // load는 1초 넘게 걸리는데 그 사이 이벤트가 없다는 것이, 아래에서 세는
+      // 프레임이 **start 때문에 나온 것**이라는 근거다.
+      check(
+        'load 중에는 이벤트가 오지 않는다 (시뮬이 안 돌고 있으므로)',
+        inbox.events.length === 0,
+        `${inbox.events.length}건`,
+      );
+
+      const started = await inbox.send({ op: 'start' });
+      check('start 성공', started?.['ok'] === true, JSON.stringify(started));
+
+      const frames = await inbox.collect('frame', 5);
+      check(
+        '★ load → start → 클라이언트에 frame 이벤트 도착 (통과 기준)',
+        frames.length > 0,
+        `${frames.length}건, 첫 이벤트=${JSON.stringify(frames[0])}`,
+      );
+
+      // ── ② 이벤트의 모양 — 워커 프로토콜 그대로, 감싸지 않는다 ──
+      const f0 = frames[0];
+      check(
+        'frame 이벤트가 { event:"frame", frame:숫자 } — 봉투를 씌우지 않는다',
+        f0?.['event'] === 'frame' && typeof f0['frame'] === 'number',
+        JSON.stringify(f0),
+      );
+      // ★ 클라이언트 라우팅이 이것 하나에 걸려 있다. 이벤트에 id가 붙으면
+      //   Inbox 같은 상관 로직이 남의 id를 자기 응답으로 착각한다.
+      check(
+        'frame 이벤트에 id가 없다 (응답과 섞이지 않는다)',
+        frames.every((e) => !('id' in e)),
+        `id 달린 이벤트 ${frames.filter((e) => 'id' in e).length}건`,
+      );
+
+      const engineMsgs = inbox.of('engineMessage');
+      check(
+        'engineMessage 이벤트도 중계된다',
+        engineMsgs.length > 0 && typeof engineMsgs[0]?.['message'] === 'string',
+        `${engineMsgs.length}건, 예: ${JSON.stringify(engineMsgs[0]?.['message'])}`,
+      );
+
+      // ── ③ mesh는 **구독 중일 때만** ────────────────────
+      // `null`이 아니라 **키 자체가 없어야** 한다. `"mesh":null`이 섞이면
+      // 클라이언트가 두 가지 "없음"을 다루게 된다(bridge.frameEvent 주석).
+      check(
+        '비구독 frame에는 mesh 키 자체가 없다 (null이 아니다)',
+        frames.every((e) => !('mesh' in e)),
+        `mesh 실린 frame ${frames.filter((e) => 'mesh' in e).length}/${frames.length}건`,
+      );
+
+      const mark = inbox.events.length;
+      const sub = await inbox.send({ op: 'subscribe' });
+      check(
+        'subscribe → { subscribed: true }',
+        sub?.['ok'] === true && isRecord(sub['result']) && sub['result']['subscribed'] === true,
+        JSON.stringify(sub),
+      );
+
+      await until(
+        () => inbox.events.slice(mark).filter((e) => e['event'] === 'frame' && 'mesh' in e).length >= 3,
+        8_000,
+      );
+      const meshFrames = inbox.events
+        .slice(mark)
+        .filter((e) => e['event'] === 'frame' && 'mesh' in e);
+      check(
+        '구독하면 같은 frame 이벤트에 mesh가 실린다',
+        meshFrames.length >= 3,
+        `${meshFrames.length}건, 1건 ${Math.round(JSON.stringify(meshFrames[0] ?? {}).length / 1024)}KB`,
+      );
+
+      // 게이트웨이가 mesh를 **손대지 않고** 넘기는가. positions는 워커가 만든
+      // base64 그대로여야 한다 — 디코드해서 정점 수와 맞아떨어지면, 중간에
+      // 자르거나 다시 인코딩하는 일이 없었다는 뜻이다.
+      const mesh = meshFrames[0]?.['mesh'] as MeshDataResult | undefined;
+      const pats = mesh?.patterns ?? [];
+      let meshBad: string | null = pats.length === 0 ? '패턴 0개' : null;
+      for (const p of pats) {
+        const n = p.positions === undefined ? -1 : decodeFloat32(p.positions).length;
+        if (n !== (p.vertices ?? -1) * 3) {
+          meshBad = `${String(p.uuid)}: positions ${n} != vertices ${String(p.vertices)} × 3`;
+          break;
+        }
+      }
+      check(
+        '각 패턴 positions(base64) 디코드 = 정점수 × 3 — 중계가 메시를 손대지 않는다',
+        meshBad === null,
+        meshBad ?? `패턴 ${pats.length}개 검사`,
+      );
+      // 프레임마다 실으면 대역폭이 몇 배가 된다(protocol.cpp:424). 토폴로지는
+      // meshData{topology:true}로 1회만 받는 것이 계약이다.
+      check(
+        '프레임 메시에 토폴로지가 없다 (topology:false, indices/uvs 없음)',
+        mesh?.topology === false && pats.every((p) => !('indices' in p) && !('uvs' in p)),
+        `topology=${String(mesh?.topology)}`,
+      );
+
+      // ── ③b 이벤트가 쏟아지는 중에도 응답은 id로 상관된다 ──
+      // #11의 라우팅이 정확히 이 상황에 걸려 있다: 구독 중이면 초당 약 80건이
+      // 흐르므로 "다음 메시지"는 거의 항상 남의 이벤트다. 요청 3건을 연달아
+      // 던져 각각 **자기 id의 응답**을 받는지 본다. 하나라도 이벤트를 응답으로
+      // 착각하면 Inbox의 waiter가 안 풀려 null이 돌아온다.
+      const flood = await Promise.all([
+        inbox.send({ op: 'ping' }),
+        inbox.send({ op: 'status' }),
+        inbox.send({ op: 'version' }),
+      ]);
+      check(
+        '★ 메시가 흐르는 중에도 요청 3건이 각자 자기 id의 응답을 받는다',
+        flood.every((m) => m !== null && m['ok'] === true),
+        flood.map((m) => (m === null ? 'null' : `id=${String(m['id'])} ok=${String(m['ok'])}`)).join(' | '),
+      );
+      // 응답에는 event 필드가 없다 — 실제 워커 응답으로도 §7-14의 계약을 본다.
+      check(
+        '실제 워커 응답에도 event 필드가 없다 (판별 필드가 겹치지 않는다)',
+        flood.every((m) => m !== null && !('event' in m)),
+        `${flood.filter((m) => m !== null && 'event' in m).length}건이 event를 달고 왔다`,
+      );
+
+      // ── ④ 흐르는 중에 닫는다 ───────────────────────────
+      // 매 세션 종료마다 실제로 일어나는 경로다(1.9MB/s가 흐르는 중의 close).
+      // 여기서 매달리거나 워커가 남으면 #detach의 fire-and-forget이 잘못된 것이다.
+      const seenBefore = inbox.events.length;
+      ws.close();
+      check('구독 중 종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+      const afterClose = inbox.events.length - seenBefore;
+      await new Promise((res) => setTimeout(res, 150));
+      check(
+        '닫은 뒤 이 소켓에 이벤트가 더 오지 않는다',
+        inbox.events.length - seenBefore === afterClose,
+        `close 직후 ${afterClose}건 → 150ms 뒤 ${inbox.events.length - seenBefore}건`,
+      );
+      check(
+        '워커 프로세스도 사라진다 (시뮬 중이었어도)',
+        pid !== undefined && await until(async () => !(await pidAlive(pid))),
+        `pid=${String(pid)}`,
+      );
+    }, { sessions: { createPool: () => traced, heartbeatIntervalMs: 0 } });
+  }
+
+  // ── §7-13. 리스너는 연결보다 오래 살지 않는다 ─────────
+  // #8의 최악의 실패는 "이벤트가 안 온다"가 아니라 **"다음 연결의 프레임이
+  // 이전 클라이언트로 간다"**이다. 그건 실제 워커로는 재현이 확률적이라
+  // 여기서 세션의 emit을 직접 불러 결정적으로 본다.
+  //
+  // ★ 판정을 `listenerCount`로 하는 이유가 이 섹션의 핵심이다. "닫은 뒤
+  //   emit해도 아무 데도 안 간다"만 보면 **부족하다** — `bridge.close()`가
+  //   이미 그것을 막으므로, #detach가 `off()`를 통째로 빠뜨려도 그 단언은
+  //   통과한다. 실제로 새는 것은 세션에 쌓이는 리스너이고, 그건
+  //   EventEmitter의 장부를 직접 읽어야만 보인다.
+  section('7-13. 이벤트 리스너 수명 (가짜 세션, emit 직접 호출)');
+  {
+    const relay = new Relay();
+    const pool = new ReusingPool(relay);
+    const session = pool.session;
+
+    await withScenes(async (gw, addr) => {
+      const dir = gw.scenes.dir;
+
+      // ── ① 워커 없이 게이트웨이 경로 전체를 지난다 ──────
+      const r1 = await connect(wsUrlOf(addr));
+      const a = r1.ws;
+      if (!a) {
+        check('연결 성립', false, `status=${String(r1.status)}`);
+        return;
+      }
+      const inboxA = new Inbox(a);
+
+      check(
+        '연결되면 세션에 frame/engineMessage 리스너가 하나씩 달린다',
+        session.listenerCount('frame') === 1 && session.listenerCount('engineMessage') === 1,
+        `frame=${session.listenerCount('frame')}, engineMessage=${session.listenerCount('engineMessage')}`,
+      );
+
+      session.emit('frame', 7);
+      await until(() => inboxA.of('frame').length >= 1);
+      check(
+        'session.emit("frame", 7) → 클라이언트에 그대로 도착',
+        JSON.stringify(inboxA.of('frame')[0]) === '{"event":"frame","frame":7}',
+        JSON.stringify(inboxA.of('frame')[0]),
+      );
+
+      // frame 리스너는 인자가 2개다 (frame, mesh?). mesh를 실어 보내면
+      // 게이트웨이가 그대로 통과시켜야 한다.
+      const fakeMesh: MeshDataResult = {
+        patterns: [{ uuid: 'u-1', vertices: 2, triangles: 0, positionStride: 12, positions: 'AAAA' }],
+        topology: false,
+      };
+      session.emit('frame', 8, fakeMesh);
+      await until(() => inboxA.of('frame').length >= 2);
+      const withMesh = inboxA.of('frame')[1];
+      check(
+        'mesh 인자가 있으면 그대로 실린다 (게이트웨이에 두 번째 스위치가 없다)',
+        isRecord(withMesh?.['mesh'])
+        && JSON.stringify(withMesh['mesh']) === JSON.stringify(fakeMesh),
+        JSON.stringify(withMesh),
+      );
+
+      // engineMessage는 엔진이 만드는 사람이 읽는 문자열이라 서버 경로가
+      // 섞일 수 있다. 응답에만 그물을 치고 이벤트에 안 치면 #5·#7이 세운
+      // "경로는 밖으로 안 나간다"가 여기서 새어 나간다(bridge 주석).
+      session.emit('engineMessage', `zls를 열 수 없습니다: ${dir}\\deadbeef.zls`);
+      await until(() => inboxA.of('engineMessage').length >= 1);
+      const em = String(inboxA.of('engineMessage')[0]?.['message'] ?? '');
+      check(
+        'engineMessage의 서버 경로가 이벤트 채널에서도 지워진다',
+        em.includes('<씬 저장소>') && !leaksPath(em, dir),
+        em,
+      );
+
+      // ── ② 연결이 끝나면 리스너가 남지 않는다 ───────────
+      const beforeUnsub = relay.ops.length;
+      a.close();
+      check('A 종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+
+      check(
+        '★ 닫으면 세션에 리스너가 하나도 남지 않는다 (frame/engineMessage/exit)',
+        session.listenerCount('frame') === 0
+        && session.listenerCount('engineMessage') === 0
+        && session.listenerCount('exit') === 0,
+        `frame=${session.listenerCount('frame')}, engineMessage=${session.listenerCount('engineMessage')}, exit=${session.listenerCount('exit')}`,
+      );
+
+      // 구독은 워커 쪽 스위치라 세션이 살아 있는 한 켜진 채로 남는다.
+      // 안 끄면 다음 연결이 subscribe한 적도 없이 1.9MB/s를 받는다.
+      // fire-and-forget이지만 stdin 쓰기(= relay.calls push)는 release보다
+      // **먼저 동기로** 일어나므로, busy가 0이 된 시점엔 이미 기록돼 있다.
+      check(
+        '★ 반납 직전에 unsubscribe가 워커로 나간다 (구독 물려받기 차단)',
+        relay.ops.slice(beforeUnsub).includes('unsubscribe'),
+        `종료 후 워커에 닿은 op=[${relay.ops.slice(beforeUnsub).join(',')}]`,
+      );
+
+      const strayBefore = inboxA.events.length;
+      session.emit('frame', 999);
+      session.emit('engineMessage', '닫힌 뒤');
+      await new Promise((res) => setTimeout(res, 100));
+      check(
+        '닫힌 뒤의 emit은 아무 데도 가지 않는다',
+        inboxA.events.length === strayBefore,
+        `${inboxA.events.length - strayBefore}건 추가 도착`,
+      );
+
+      // ── ③ ★ 재사용된 세션이 이전 클라이언트로 새지 않는다 ──
+      // 이 풀은 **같은 세션 객체**를 다시 내준다 (idleTimeout > 0 의 세계).
+      const r2 = await connect(wsUrlOf(addr));
+      const b = r2.ws;
+      if (!b) {
+        check('재사용 연결 성립', false, `status=${String(r2.status)}`);
+        return;
+      }
+      const inboxB = new Inbox(b);
+      check(
+        '두 번째 연결이 같은 세션 객체를 물려받았다 (재사용 재현)',
+        pool.acquired === 2 && pool.released === 1,
+        `acquired=${pool.acquired}, released=${pool.released}`,
+      );
+
+      const aBefore = inboxA.events.length;
+      session.emit('frame', 42);
+      await until(() => inboxB.of('frame').length >= 1);
+      check(
+        '재사용 세션의 프레임은 새 연결(B)에만 간다',
+        inboxB.of('frame')[0]?.['frame'] === 42 && inboxA.events.length === aBefore,
+        `B=${JSON.stringify(inboxB.of('frame')[0])}, A에 추가 도착 ${inboxA.events.length - aBefore}건`,
+      );
+      check(
+        '리스너도 새 연결 것 하나뿐이다 (이전 것이 쌓이지 않았다)',
+        session.listenerCount('frame') === 1,
+        `frame=${session.listenerCount('frame')}`,
+      );
+
+      b.close();
+      check('B 종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+
+      // ── ④ 반복해도 쌓이지 않는다 ───────────────────────
+      // 누수는 한 번으로는 안 보이고 **누적**으로 보인다. 5회 돌려서
+      // 리스너가 1을 넘긴 적이 있는지 본다.
+      let peak = 0;
+      for (let i = 0; i < 5; i++) {
+        const r = await connect(wsUrlOf(addr));
+        if (!r.ws) break;
+        peak = Math.max(peak, session.listenerCount('frame'));
+        r.ws.close();
+        await until(() => gw.sessions.stats.busy === 0);
+      }
+      check(
+        '연결 5회 반복해도 리스너가 누적되지 않는다',
+        peak === 1 && session.listenerCount('frame') === 0,
+        `연결 중 최대 ${peak}개, 마지막 종료 후 ${session.listenerCount('frame')}개`,
+      );
+    }, { sessions: { createPool: () => pool, heartbeatIntervalMs: 0 } });
+  }
+
+  // ── §7-14. 응답 ≠ 이벤트 (판별 계약) ──────────────────
+  // "id가 없으면 이벤트"는 **틀린 규칙**이다. 응답에도 id가 없는 경로가 셋
+  // 있고(JSON 파싱 실패 / `op` 누락 / 바이너리 거부), 그 셋이 이벤트로
+  // 오인되면 클라이언트가 오류를 조용히 삼킨다. 판별은 `'event' in msg`
+  // 하나뿐이라는 것을 이 셋으로 고정한다.
+  //
+  // Inbox가 정확히 그 규칙으로 분류하므로, 셋이 `idless`에 들어오면 계약이
+  // 지켜진 것이고 `events`에 들어오면 깨진 것이다.
+  section('7-14. id 없는 응답이 이벤트로 오인되지 않는다');
+  {
+    const fake = new FakePool();
+    await withScenes(async (gw, addr) => {
+      const r = await connect(wsUrlOf(addr));
+      const ws = r.ws;
+      if (!ws) {
+        check('연결 성립', false, `status=${String(r.status)}`);
+        return;
+      }
+      const inbox = new Inbox(ws);
+
+      ws.send('{"op":');                       // JSON 파싱 실패
+      ws.send(JSON.stringify({ id: 1 }));      // op 누락 (id가 있어도 응답에 실린다)
+      ws.send(JSON.stringify({ noOp: true })); // op 누락 + id 없음
+      ws.send(new Uint8Array([1, 2, 3]), { binary: true }); // 바이너리 거부
+
+      await until(() => inbox.idless.length >= 3);
+      check(
+        'id 없는 응답 3종이 전부 도착했다',
+        inbox.idless.length === 3,
+        inbox.idless.map((m) => String(m['error'])).join(' | '),
+      );
+      check(
+        '★ 그 셋이 하나도 이벤트로 분류되지 않았다 (판별 = "event" in msg)',
+        inbox.events.length === 0 && inbox.idless.every((m) => !('event' in m)),
+        `이벤트로 샌 것 ${inbox.events.length}건`,
+      );
+      check(
+        '전부 { ok:false, error } 형태다',
+        inbox.idless.every((m) => m['ok'] === false && typeof m['error'] === 'string'),
+        JSON.stringify(inbox.idless),
+      );
+      // 대조군: 이벤트에는 event 필드가 있고 id가 없다. 응답에는 그 반대다.
+      // 둘이 같은 소켓으로 나가는데 겹치는 필드가 없다는 것이 계약의 전부다.
+      check(
+        '반대로 응답에는 event 필드가 없다 (겹치는 판별 필드가 없다)',
+        inbox.idless.every((m) => !('event' in m)),
+        `${inbox.idless.length}건 확인`,
+      );
+
+      ws.close();
+      check('종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+    }, { sessions: { createPool: () => fake, heartbeatIntervalMs: 0 } });
+  }
+
+  // ── §7-15. 반납이 unsubscribe에 붙잡히지 않는다 ───────
+  // #detach는 반납 직전에 워커로 unsubscribe를 **기다리지 않고** 보낸다.
+  // 기다리도록 바꾸면(= `void`를 `await`로) 평소에는 아무 증상이 없다 —
+  // 워커가 1ms 안에 답하기 때문이다. 증상은 **워커가 굳었을 때만** 나오고,
+  // 그때는 requestTimeoutMs(기본 120초)까지 세션이 반납되지 않으며 그 세션을
+  // 기다리는 shutdown()이 통째로 붙잡힌다. 즉 회귀해도 조용하다.
+  //
+  // 그래서 여기서는 **응답하지 않는 워커**와 **거부하는 워커**를 만들어
+  // 두 갈래를 결정적으로 고정한다. 실제 워커로는 재현할 수 없는 상태다.
+  section('7-15. 굳거나 실패하는 워커가 세션 반납을 막지 않는다 (가짜 세션)');
+  {
+    // ── ① 응답하지 않는 워커 ───────────────────────────
+    const relay = new Relay();
+    const pool = new ReusingPool(relay);
+
+    await withScenes(async (gw, addr) => {
+      const r = await connect(wsUrlOf(addr));
+      const ws = r.ws;
+      if (!ws) {
+        check('연결 성립', false, `status=${String(r.status)}`);
+        return;
+      }
+      const inbox = new Inbox(ws);
+      const sub = await inbox.send({ op: 'subscribe' });
+      check('구독해 둔다 (반납 시 unsubscribe가 나갈 조건)', sub?.['ok'] === true, JSON.stringify(sub));
+
+      // 이 시점부터 워커는 어떤 op에도 답하지 않는다.
+      relay.hold = true;
+      const before = relay.ops.length;
+      const t0 = Date.now();
+      ws.close();
+
+      const freed = await until(() => gw.sessions.stats.busy === 0, 3_000);
+      const ms = Date.now() - t0;
+      check(
+        '★ 워커가 unsubscribe에 답하지 않아도 세션은 반납된다 (fire-and-forget)',
+        freed && ms < 2_000,
+        `${ms}ms 만에 busy=${gw.sessions.stats.busy}`,
+      );
+      check(
+        '기다리지 않았을 뿐, unsubscribe는 실제로 워커에 나갔다',
+        relay.ops.slice(before).includes('unsubscribe'),
+        `종료 후 워커에 닿은 op=[${relay.ops.slice(before).join(',')}]`,
+      );
+
+      // 붙잡아 둔 약속을 풀어 준다 — 안 풀면 teardown이 매달릴 수 있다.
+      relay.hold = false;
+      relay.releaseAll();
+    }, { sessions: { createPool: () => pool, heartbeatIntervalMs: 0 } });
+  }
+  {
+    // ── ② 거부하는 워커 ────────────────────────────────
+    // 워커가 이미 죽은 뒤에 닫히는 경로(4001)에서는 unsubscribe가 반드시
+    // 거부된다. `.catch()`가 빠지면 그 자리가 **처리되지 않은 Promise 거부**가
+    // 되어 게이트웨이 프로세스가 통째로 죽는다 — 세션 하나가 끝났다는 이유로.
+    const relay = new Relay();
+    relay.fail = (op) => (op === 'unsubscribe' ? new Error('워커가 종료됨 (code=1)') : null);
+    const pool = new ReusingPool(relay);
+
+    const unhandled: string[] = [];
+    const onUnhandled = (err: unknown): void => {
+      unhandled.push(err instanceof Error ? err.message : String(err));
+    };
+    process.on('unhandledRejection', onUnhandled);
+
+    await withScenes(async (gw, addr) => {
+      const r = await connect(wsUrlOf(addr));
+      const ws = r.ws;
+      if (!ws) {
+        check('연결 성립', false, `status=${String(r.status)}`);
+        return;
+      }
+      const inbox = new Inbox(ws);
+      check('중계는 정상', (await inbox.send({ op: 'ping' }))?.['ok'] === true);
+
+      ws.close();
+      check('종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+      // 거부는 마이크로태스크로 온다. 한 틱 이상 기다려야 잡힌다.
+      await new Promise((res) => setTimeout(res, 100));
+      check(
+        '★ unsubscribe가 거부돼도 처리되지 않은 거부가 생기지 않는다',
+        unhandled.length === 0,
+        unhandled.join(' | ') || '0건',
+      );
+
+      // 게이트웨이가 살아 있는가 — 다음 연결이 그대로 받아진다.
+      const r2 = await connect(wsUrlOf(addr));
+      check('게이트웨이가 살아남아 다음 연결을 받는다', r2.ws !== null, `status=${String(r2.status)}`);
+      r2.ws?.close();
+      await until(() => gw.sessions.stats.busy === 0);
+    }, { sessions: { createPool: () => pool, heartbeatIntervalMs: 0 } });
+
+    process.off('unhandledRejection', onUnhandled);
+  }
+
+  // ── §7-16. 이벤트 경로의 두 경계 ──────────────────────
+  section('7-16. on()이 없는 세션 / 연결별 격리');
+  {
+    // ── ① `on`이 없는 세션도 op 중계는 그대로 돈다 ─────
+    // SessionLike.on이 옵셔널인 것의 대가를 여기서 확인한다. FakeSession은
+    // EventEmitter라 이 갈래를 절대 밟지 않는다 — 그래서 전용 세션을 쓴다.
+    const relay = new Relay();
+    const pool = new NoEventPool(relay);
+
+    await withScenes(async (gw, addr) => {
+      const r = await connect(wsUrlOf(addr));
+      const ws = r.ws;
+      if (!ws) {
+        check('연결 성립', false, `status=${String(r.status)}`);
+        return;
+      }
+      const inbox = new Inbox(ws);
+      const pong = await inbox.send({ op: 'ping' });
+      check(
+        '★ 이벤트를 못 내는 세션이어도 op 중계는 돈다 (연결이 죽지 않는다)',
+        pong?.['ok'] === true,
+        JSON.stringify(pong),
+      );
+      check('이벤트는 당연히 오지 않는다', inbox.events.length === 0, `${inbox.events.length}건`);
+
+      ws.close();
+      check('종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+      // 달지 않은 리스너를 떼려 들면 안 된다. exit만 떼는 것이 맞다.
+      const s = pool.sessions[0];
+      check(
+        '달지 않은 frame/engineMessage 리스너를 떼려 하지 않는다',
+        s !== undefined && s.offCalls.length === 1 && s.offCalls[0] === 'exit',
+        `off된 이벤트=[${(s?.offCalls ?? []).join(',')}]`,
+      );
+    }, { sessions: { createPool: () => pool, heartbeatIntervalMs: 0 } });
+  }
+  {
+    // ── ② 연결이 둘일 때 서로의 프레임이 섞이지 않는다 ──
+    // §7-13은 세션 하나를 **순차로** 물려주는 경우였다. 여기서는 두 세션이
+    // **동시에** 살아 있다 — 게이트웨이가 이벤트를 conn 하나가 아니라 열린
+    // 소켓 전체로 흘리면 여기서만 드러난다.
+    const fake = new FakePool({ relay: new Relay() });
+
+    await withScenes(async (gw, addr) => {
+      const r1 = await connect(wsUrlOf(addr));
+      const r2 = await connect(wsUrlOf(addr));
+      const a = r1.ws;
+      const b = r2.ws;
+      if (!a || !b) {
+        check('연결 2개 성립', false, `${String(r1.status)} / ${String(r2.status)}`);
+        return;
+      }
+      const inboxA = new Inbox(a);
+      const inboxB = new Inbox(b);
+
+      // acquire 순서가 곧 연결 순서다 (위에서 순차로 기다렸다).
+      const [sA, sB] = [...fake.live];
+      if (!sA || !sB) {
+        check('세션 2개', false, `${fake.live.size}개`);
+        return;
+      }
+
+      sA.emit('frame', 11);
+      sB.emit('frame', 22);
+      await until(() => inboxA.of('frame').length >= 1 && inboxB.of('frame').length >= 1);
+      await new Promise((res) => setTimeout(res, 80)); // 새는 것이 있으면 도착할 시간
+
+      check(
+        '★ 각 연결은 자기 세션의 프레임만 받는다',
+        inboxA.of('frame').length === 1 && inboxA.of('frame')[0]?.['frame'] === 11
+        && inboxB.of('frame').length === 1 && inboxB.of('frame')[0]?.['frame'] === 22,
+        `A=${JSON.stringify(inboxA.of('frame'))}, B=${JSON.stringify(inboxB.of('frame'))}`,
+      );
+
+      // A만 닫는다. B는 계속 받아야 한다 — #detach가 남의 리스너까지 떼면
+      // 여기서 B가 조용해진다.
+      a.close();
+      check('A 종료 → busy 1', await until(() => gw.sessions.stats.busy === 1));
+      sB.emit('frame', 33);
+      await until(() => inboxB.of('frame').length >= 2);
+      check(
+        '★ 한쪽을 닫아도 다른 연결의 이벤트는 계속 흐른다',
+        inboxB.of('frame').length === 2 && inboxB.of('frame')[1]?.['frame'] === 33,
+        JSON.stringify(inboxB.of('frame')),
+      );
+
+      b.close();
+      check('B 종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+    }, { sessions: { createPool: () => fake, heartbeatIntervalMs: 0 } });
   }
 
   // ── 7-7. 좀비 최종 확인 ───────────────────────────────

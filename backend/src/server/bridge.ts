@@ -23,7 +23,8 @@
  * ② **역방향도 막는다.** 워커의 load 응답은 `{ loaded, path }`라 서버 절대경로가
  *    결과에 섞여 나온다(protocol.cpp:503). 응답을 그대로 중계하면 #5가 세운
  *    "경로는 밖으로 안 나간다"가 여기서 무너진다. mapResult가 그 자리를 막고,
- *    에러 문자열은 redact()가 한 번 더 훑는다.
+ *    에러 문자열은 redact()가 한 번 더 훑는다. 워커가 스스로 밀어 보내는
+ *    이벤트(#8)도 같은 그물을 지난다 — engineMessageEvent 주석 참고.
  *
  * ── 화이트리스트가 테이블인 이유 ────────────────────────────
  * `Record<Op, OpRule>`이라 protocol.ts에 op이 하나 늘면 **컴파일이 깨진다.**
@@ -31,7 +32,7 @@
  * default 통과로 열린다. 여기서는 결정을 내리지 않고서는 빌드가 안 된다.
  */
 
-import type { Op } from '../sdk/protocol.ts';
+import type { MeshDataResult, Op } from '../sdk/protocol.ts';
 import type { SceneStore } from './files.ts';
 
 /**
@@ -49,6 +50,36 @@ export interface RelayTarget {
 export type ClientReply =
   | { id?: number; ok: true; result: unknown }
   | { id?: number; ok: false; error: string };
+
+/**
+ * 클라이언트에게 나가는 **이벤트** (#8). 워커가 스스로 밀어 보내는 것들이다.
+ *
+ * ── 왜 워커 프로토콜과 같은 모양인가 ────────────────────────
+ * 감싸지 않는다(`{type:'event', payload:…}` 같은 봉투를 씌우지 않는다).
+ * 응답이 이미 워커 프로토콜과 같은 모양이고(ClientReply), 이벤트만 다른
+ * 어휘를 쓰면 클라이언트가 **같은 것을 두 이름으로** 알게 된다.
+ * `sdk/protocol.ts`의 `Event`·`isEvent()`를 #11이 그대로 재사용할 수 있다는
+ * 실질적 이득도 여기서 나온다.
+ *
+ * ── 구분은 `id`의 유무가 아니라 `event` 필드다 ──────────────
+ * "id가 없으면 이벤트"는 **틀린 규칙**이다. 응답에도 id가 없는 경우가 있다:
+ * JSON 파싱 실패, `op` 필드 누락, 바이너리 프레임 거부는 전부
+ * `{ ok:false, error }`로 나간다(#fail의 id===undefined 갈래).
+ * 그래서 판별은 **`'event' in msg`** 하나뿐이다 — 없는 것이 아니라 있는 것으로
+ * 판별한다. 응답에 `event` 필드가 붙는 경로는 존재하지 않는다.
+ *
+ * `ready`는 여기 없다. 워커가 기동 직후 한 번 보내는데, 그때는 소켓이 아직
+ * 없고(세션은 업그레이드 **전에** 확보된다) SDK의 `Session.create`가 이미
+ * 소비한 뒤다. `Session`은 그걸 다시 emit하지도 않는다 — 중계할 것 자체가
+ * 없다. 클라이언트에게 "준비됐다"는 **소켓이 열렸다는 사실**이 곧 그것이다
+ * (sessions.ts 머리말 ①의 불변식).
+ */
+export type ClientEvent =
+  | { event: 'frame'; frame: number; mesh?: MeshDataResult }
+  | { event: 'engineMessage'; message: string };
+
+/** 소켓으로 나가는 모든 것 */
+export type ClientOutbound = ClientReply | ClientEvent;
 
 /** build()가 던지는 "클라이언트 잘못". 메시지가 그대로 클라이언트에게 간다 */
 class RejectError extends Error {}
@@ -241,9 +272,9 @@ const OPS: Record<Op, OpRule> = {
   // 흘리는 경로는 이쪽이 아니라 subscribe(#8)다.
   meshData: { allow: true, build: buildMeshData },
 
-  // frame 이벤트에 메시를 실으라고 워커에 켜는 스위치. 그 이벤트를 클라이언트로
-  // 넘기는 건 #8이므로 지금 켜면 받는 사람이 없지만, 워커 쪽 상태를 미리
-  // 만들어 두는 것 자체는 무해하다(status.subscribed로 확인된다).
+  // frame 이벤트에 메시를 실으라고 워커에 켜는 스위치. **이벤트 중계의 유일한
+  // 스위치가 이것이다** — 게이트웨이 쪽에 두 번째 스위치는 없다(frameEvent 주석).
+  // 켜면 프레임당 ~48KB가 붙는다: 실측 40fps × 47.7KB = 세션당 약 1.9MB/s.
   subscribe: { allow: true },
   unsubscribe: { allow: true },
 
@@ -527,6 +558,52 @@ export class SessionBridge {
       //  닿는지는 경합이다. 닿지 않아도 클라이언트는 close code로 안다.)
       (err: unknown) => settle({ id, ok: false, error: this.#errorText(err) }),
     );
+  }
+
+  // ── 역방향: 워커 이벤트 → 클라이언트 (#8) ─────────────────
+  //
+  // 여기 두 함수가 하는 일은 **모양을 정하는 것과 내보낼지 정하는 것**뿐이다.
+  // 소켓에 쓰는 건 sessions.ts다 — 요청 방향과 같은 분업이다.
+  //
+  // ⚠️ **게이트웨이에는 이벤트 스위치가 없다.** 켜고 끄는 건 워커 쪽
+  // subscribe/unsubscribe 하나뿐이고, 여기는 온 것을 그대로 흘린다.
+  // 게이트웨이에도 스위치를 두면 클라이언트가 "구독했는데 왜 안 오지"를
+  // 두 곳에서 확인해야 한다 — 상태가 둘이면 반드시 어긋난다.
+  // 참고: `subscribed`는 워커 수명 내내 유지되므로(load/clear/reset이 안
+  // 건드린다) 세션이 풀로 반납될 때 남을 수 있다. 그 뒤처리는 sessions.ts의
+  // #detach가 한다(연결이 끝나면 unsubscribe를 보낸다).
+  //
+  // 흐름 제어(느린 클라이언트에서 프레임을 버리는 latest-wins)는 **#9**다.
+  // 지금은 아무 제한 없이 흘린다 — 그래야 #9에서 "안 오는 것"과 "버려진 것"이
+  // 구분된다.
+
+  /**
+   * 워커의 frame 이벤트 → 클라이언트 이벤트. null이면 내보내지 않는다.
+   *
+   * mesh는 **구독 중일 때만** 실린다. undefined일 때 키를 아예 안 넣는 이유는
+   * 워커가 보내는 모양과 정확히 같게 하기 위해서다 — `"mesh":null`이 섞이면
+   * 클라이언트가 두 가지 "없음"을 다루게 된다.
+   */
+  frameEvent(frame: number, mesh?: MeshDataResult): ClientEvent | null {
+    // 연결이 끝난 뒤 도착한 이벤트. 리스너는 #detach가 떼지만, 떼기 직전에
+    // 큐에 들어온 것이 있을 수 있다.
+    if (this.#closed) return null;
+    return mesh === undefined ? { event: 'frame', frame } : { event: 'frame', frame, mesh };
+  }
+
+  /**
+   * 워커의 engineMessage → 클라이언트 이벤트.
+   *
+   * **redact를 지나는 이유**: 이건 엔진이 만드는 사람이 읽는 문자열이라
+   * 무엇이 들어올지 우리가 정하지 못한다 — 에러 응답과 정확히 같은 사정이다
+   * (makeRedactor 주석). 실측된 문구는 `"0.4 sec, avatar animation (10/300)"`
+   * 처럼 무해하지만, 파일을 못 열었다는 메시지가 이 채널로 나오면 서버
+   * 절대경로가 그대로 실린다. 그물을 응답에만 치고 이벤트에 안 치면
+   * #5·#7이 세운 "경로는 밖으로 안 나간다"가 여기서 새어 나간다.
+   */
+  engineMessageEvent(message: string): ClientEvent | null {
+    if (this.#closed) return null;
+    return { event: 'engineMessage', message: this.#redact(message) };
   }
 
   #errorText(err: unknown): string {

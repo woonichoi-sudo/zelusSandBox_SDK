@@ -7,8 +7,18 @@
  *
  * op 중계(#7)가 그 위에 얹혀 있지만 **정책은 bridge.ts에 있다.** 이 파일이
  * 하는 건 전송뿐이다 — 프레임을 텍스트로 만들고, JSON으로 파싱하고, 결과를
- * 소켓에 쓴다. 무엇을 통과시킬지는 한 줄도 여기 없다. 반대 방향(워커 이벤트를
- * 클라이언트로)은 아직 없다 — #8이다.
+ * 소켓에 쓴다. 무엇을 통과시킬지는 한 줄도 여기 없다.
+ *
+ * 반대 방향(워커 → 클라이언트, #8)도 같은 분업이다: 리스너를 달고 떼는
+ * **수명**은 여기, 이벤트의 모양과 내보낼지 여부는 bridge.ts다. 이 방향에서
+ * 이 파일이 지키는 것은 하나뿐이고 그게 전부다 —
+ * **리스너는 연결보다 오래 살지 않는다.** 세션은 풀로 반납돼 다음 연결에
+ * 재사용될 수 있으므로(idleTimeout > 0), 리스너가 남으면 이전 클라이언트의
+ * 소켓으로 남의 프레임이 간다. 그래서 #detach가 반드시 뗀다.
+ *
+ * 흐름 제어는 아직 없다. 구독 중이면 세션당 약 1.9MB/s(실측 40fps × 47.7KB)가
+ * 아무 제한 없이 소켓으로 나간다 — 느린 클라이언트에서 프레임을 버리는
+ * latest-wins는 **#9**다. #emit()이 그 자리다.
  *
  * 그 등식을 지키기 위해 정한 것들:
  *
@@ -52,7 +62,8 @@ import type { Duplex } from 'node:stream';
 import { WebSocket, WebSocketServer } from 'ws';
 
 import { PoolExhaustedError, SessionPool, type Op, type PoolOptions } from '../sdk/index.ts';
-import { SessionBridge, type ClientReply } from './bridge.ts';
+import type { MeshDataResult } from '../sdk/protocol.ts';
+import { SessionBridge, type ClientEvent, type ClientOutbound } from './bridge.ts';
 import type { SceneStore } from './files.ts';
 
 /** 게이트웨이 종료 — 표준 going away */
@@ -92,7 +103,31 @@ export function defaultWorkerExe(): string {
 export interface SessionLike {
   readonly alive: boolean;
   once(event: 'exit', listener: (code: number | null) => void): unknown;
+
+  /**
+   * 워커 이벤트 구독 (#8). **옵셔널이다.**
+   *
+   * 필수로 만들면 exe 없이 도는 가짜 세션들이 이 표면을 흉내 내야 하고,
+   * 그 순간 "가짜 풀로 수명만 검증한다"는 경로가 통째로 깨진다. 옵셔널이면
+   * 없는 세션은 그냥 **이벤트를 내지 않는 세션**이 된다 — worker.request가
+   * 없는 세션이 "중계를 지원하지 않는 세션"이 되는 것과 같은 규약이다.
+   *
+   * SDK의 `Session`은 그대로 만족한다(EventEmitter + 선언된 오버로드).
+   */
+  on?(event: 'frame', listener: (frame: number, mesh?: MeshDataResult) => void): unknown;
+  on?(event: 'engineMessage', listener: (message: string) => void): unknown;
+
+  /**
+   * 리스너 제거. **'exit'만이 아니라 세 종류 전부** 여기로 뗀다.
+   *
+   * 필수인 이유가 `on`과 다르다: 리스너를 못 떼면 **세션이 풀로 반납돼
+   * 재사용될 때 이전 클라이언트의 소켓으로 프레임이 계속 간다.** 이건
+   * "기능이 없다"가 아니라 누수라, 조용히 건너뛸 수 있는 옵셔널로 두면
+   * 안 된다. EventEmitter를 상속한 모든 세션(가짜 포함)이 이미 만족한다.
+   */
   off(event: 'exit', listener: (code: number | null) => void): unknown;
+  off(event: 'frame', listener: (frame: number, mesh?: MeshDataResult) => void): unknown;
+  off(event: 'engineMessage', listener: (message: string) => void): unknown;
   /**
    * 로그용 pid와 op 중계 창구. 없으면 없는 대로 둔다.
    *
@@ -196,6 +231,21 @@ interface Conn {
   /** 반납은 반드시 **획득한 그 풀**로 한다. 재기동으로 풀이 갈릴 수 있다 */
   pool: SessionSource;
   onExit: (code: number | null) => void;
+  /**
+   * 워커 이벤트 중계 리스너 (#8). **연결이 닫히면 반드시 뗀다** —
+   * 남으면 재사용된 세션의 프레임이 이전 클라이언트로 간다. null이면
+   * 이 세션이 `on`을 제공하지 않는다는 뜻이다(가짜 세션 등).
+   */
+  onFrame: ((frame: number, mesh?: MeshDataResult) => void) | null;
+  onEngineMessage: ((message: string) => void) | null;
+  /**
+   * 소켓이 OPEN이 아니라 버려진 이벤트 수.
+   *
+   * 지금은 진단용이다. **#9가 흐름 제어(latest-wins)를 넣는 자리가 정확히
+   * 여기**이고, 그때 "안 보낸 것"과 "버린 것"을 같은 카운터로 셀 수 있게
+   * 미리 자리를 잡아 둔다.
+   */
+  droppedEvents: number;
   /** 마지막 ping에 pong이 왔는가 */
   responsive: boolean;
   killTimer: NodeJS.Timeout | null;
@@ -548,6 +598,9 @@ export class SessionManager {
       pool,
       responsive: true,
       killTimer: null,
+      onFrame: null,
+      onEngineMessage: null,
+      droppedEvents: 0,
       bridge: new SessionBridge({
         target: request && worker
           ? { request: (op, payload) => request.call(worker, op, payload) }
@@ -568,6 +621,7 @@ export class SessionManager {
 
     this.#conns.set(ws, conn);
     session.once('exit', conn.onExit);
+    this.#relayEvents(conn);
 
     ws.on('pong', () => {
       conn.responsive = true;
@@ -594,10 +648,47 @@ export class SessionManager {
     });
   }
 
+  /**
+   * 워커 이벤트를 이 연결의 소켓으로 흘린다 (#8).
+   *
+   * `on`이 없는 세션(가짜 풀 등)은 조용히 건너뛴다 — 이벤트를 내지 않는
+   * 세션이라는 뜻일 뿐이고, op 중계는 그대로 돈다.
+   *
+   * 리스너를 conn에 **보관**하는 것이 이 함수의 요점이다. 익명 함수로 달면
+   * #detach가 뗄 수 없고, 세션이 재사용될 때 이전 연결로 프레임이 간다.
+   */
+  #relayEvents(conn: Conn): void {
+    const session = conn.session;
+    if (!session.on) return;
+
+    conn.onFrame = (frame: number, mesh?: MeshDataResult): void => {
+      const ev = conn.bridge.frameEvent(frame, mesh);
+      if (ev) this.#emit(conn, ev);
+    };
+    conn.onEngineMessage = (message: string): void => {
+      const ev = conn.bridge.engineMessageEvent(message);
+      if (ev) this.#emit(conn, ev);
+    };
+
+    session.on('frame', conn.onFrame);
+    session.on('engineMessage', conn.onEngineMessage);
+  }
+
   /** 연결 정리 + 세션 반납. ws의 'close'에서만 불린다 (한 번만 발화한다) */
   async #detach(conn: Conn, code: number, reason: string): Promise<void> {
     this.#conns.delete(conn.ws);
     conn.session.off('exit', conn.onExit);
+    // ★ #8의 누수 방지. 이걸 빠뜨리면 재사용된 세션의 프레임이 이미 닫힌
+    //   소켓의 conn으로 계속 들어온다 (bridge.close() 덕에 밖으로 나가지는
+    //   않지만, 리스너가 세션에 무한정 쌓여 EventEmitter 경고와 함께 샌다).
+    if (conn.onFrame) {
+      conn.session.off('frame', conn.onFrame);
+      conn.onFrame = null;
+    }
+    if (conn.onEngineMessage) {
+      conn.session.off('engineMessage', conn.onEngineMessage);
+      conn.onEngineMessage = null;
+    }
     // 아직 응답을 기다리는 요청이 있어도 여기서 버린다. 소켓이 이미 닫혔으므로
     // 보낼 곳이 없고, 워커는 곧 반납·종료된다.
     conn.bridge.close();
@@ -605,6 +696,21 @@ export class SessionManager {
       clearTimeout(conn.killTimer);
       conn.killTimer = null;
     }
+
+    // 구독은 **워커 쪽 스위치**라 load/clear/reset이 건드리지 않는다 —
+    // 즉 프로세스 수명 내내 켜진 채로 남는다(protocol.cpp의 `subscribed`).
+    // idleTimeout > 0 이면 세션이 풀로 돌아가 다음 연결에 재사용되는데,
+    // 그때 새 클라이언트는 subscribe를 한 적도 없이 start만으로
+    // **1.9MB/s의 메시를 받게 된다.** 구독을 연결 수명 안에 가두는 지점이
+    // 여기뿐이라(SessionPool.release는 pause+clear까지만 한다) 여기서 끈다.
+    //
+    // 기다리지 않는 이유: 워커가 굳어 있으면 request가 requestTimeoutMs
+    // (기본 120초)까지 매달리고, #detach를 기다리는 shutdown()이 통째로
+    // 붙잡힌다. stdin 쓰기는 request() 안에서 동기로 끝나므로 아래 release가
+    // 프로세스를 죽이든 풀에 넣든 이 줄은 이미 파이프에 들어가 있다.
+    void conn.session.worker?.request?.('unsubscribe').catch(() => {
+      // 이미 죽은 워커 / 미지원 세션. 반납 경로를 막을 이유가 없다.
+    });
 
     const lifeMs = Date.now() - conn.info.openedAt;
     try {
@@ -614,7 +720,10 @@ export class SessionManager {
     }
     this.#log(
       `세션 ${conn.info.id} 종료 — code=${code}${reason ? ` (${reason})` : ''}, `
-      + `${lifeMs}ms, 사용 중 ${this.stats.busy}개`,
+      + `${lifeMs}ms, 사용 중 ${this.stats.busy}개`
+      // 닫는 중에 도착한 이벤트다. 몇 건은 정상이지만 수백 건이면 워커가
+      // 아직 시뮬을 돌리고 있다는 뜻이라 반납 경로를 의심할 근거가 된다.
+      + (conn.droppedEvents > 0 ? `, 못 보낸 이벤트 ${conn.droppedEvents}건` : ''),
     );
   }
 
@@ -699,18 +808,40 @@ export class SessionManager {
   }
 
   /**
-   * 응답 한 줄을 소켓에 쓴다. **던지지 않는다.**
+   * 한 줄을 소켓에 쓴다. **던지지 않는다. 소켓 쓰기의 유일한 지점이다.**
    *
-   * 브리지는 워커 응답이 도착했을 때 이걸 비동기로 부른다. 여기서 예외가
-   * 새면 그 자리가 처리되지 않은 Promise 거부가 되어 게이트웨이 프로세스가
-   * 통째로 죽는다 — 세션 하나의 소켓이 방금 닫혔다는 이유로.
+   * 브리지는 워커 응답이 도착했을 때 이걸 비동기로 부르고, 이벤트(#8)도
+   * #emit을 거쳐 여기로 온다. 여기서 예외가 새면 그 자리가 처리되지 않은
+   * Promise 거부가 되어 게이트웨이 프로세스가 통째로 죽는다 — 세션 하나의
+   * 소켓이 방금 닫혔다는 이유로.
    */
-  #send(conn: Conn, reply: ClientReply): void {
+  #send(conn: Conn, msg: ClientOutbound): void {
     if (conn.ws.readyState !== WebSocket.OPEN) return;
     try {
-      conn.ws.send(JSON.stringify(reply));
+      conn.ws.send(JSON.stringify(msg));
     } catch (err: unknown) {
-      this.#log(`[warn] 세션 ${conn.info.id} 응답 전송 실패: ${err instanceof Error ? err.message : String(err)}`);
+      this.#log(`[warn] 세션 ${conn.info.id} 전송 실패: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  /**
+   * 이벤트 한 줄 (#8). **워커 → 클라이언트 방향이 지나는 유일한 지점이다.**
+   *
+   * 응답과 갈라 둔 이유는 둘의 실패 의미가 다르기 때문이다. 응답을 못 보내면
+   * 클라이언트의 요청 하나가 답을 못 받는 사고지만, 이벤트를 못 보내는 건
+   * 정상이다 — 소켓이 닫히는 중인데 워커가 아직 프레임을 밀고 있는 상황은
+   * 매 세션 종료마다 생긴다. 그래서 로그가 아니라 카운터로 센다.
+   *
+   * ★ **#9는 이 함수만 고치면 된다.** `ws.bufferedAmount`를 보고 프레임을
+   *   버리는 latest-wins가 들어갈 자리가 여기다. 지금은 아무 제한이 없다:
+   *   구독 중이면 세션당 약 1.9MB/s가 그대로 `ws.send`로 들어가고, 클라이언트가
+   *   느리면 그만큼 ws 내부 버퍼에 쌓인다.
+   */
+  #emit(conn: Conn, ev: ClientEvent): void {
+    if (conn.ws.readyState !== WebSocket.OPEN) {
+      conn.droppedEvents += 1;
+      return;
+    }
+    this.#send(conn, ev);
   }
 }
