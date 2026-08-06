@@ -45,8 +45,8 @@
       "verify": "auto",
       "files": ["backend/native/src/protocol.cpp", "backend/src/sdk/protocol.ts", "backend/src/sdk/session.ts"],
       "depends": [1],
-      "status": "todo",
-      "commit": null
+      "status": "done",
+      "commit": "b3afa02"
     },
     {
       "id": 3,
