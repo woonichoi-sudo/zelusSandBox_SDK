@@ -58,8 +58,8 @@
       "note": "zsVector3는 SIMD 정렬로 16바이트다. C++에서 float3로 재포장해 보낼 것 (DESIGN.md §5.4)",
       "files": ["backend/native/src/protocol.cpp", "backend/src/sdk/protocol.ts", "backend/src/sdk/session.ts"],
       "depends": [2],
-      "status": "todo",
-      "commit": null
+      "status": "done",
+      "commit": "36e16b7"
     },
     {
       "id": 4,
