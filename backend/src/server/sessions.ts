@@ -4,7 +4,11 @@
  * 이 등식은 취향이 아니라 엔진이 강제한 것이다. ZestManager의 콜백이 전부
  * static이라 한 프로세스에 두 세션을 담을 수 없다(CLAUDE.md). 그래서 여기서
  * 할 일은 "연결의 수명"과 "프로세스의 수명"을 **정확히** 포개는 것뿐이다.
- * op 중계는 #7·#8이 이 위에 얹는다 — 이 파일에는 중계가 없다.
+ *
+ * op 중계(#7)가 그 위에 얹혀 있지만 **정책은 bridge.ts에 있다.** 이 파일이
+ * 하는 건 전송뿐이다 — 프레임을 텍스트로 만들고, JSON으로 파싱하고, 결과를
+ * 소켓에 쓴다. 무엇을 통과시킬지는 한 줄도 여기 없다. 반대 방향(워커 이벤트를
+ * 클라이언트로)은 아직 없다 — #8이다.
  *
  * 그 등식을 지키기 위해 정한 것들:
  *
@@ -47,7 +51,8 @@ import type { Duplex } from 'node:stream';
 
 import { WebSocket, WebSocketServer } from 'ws';
 
-import { PoolExhaustedError, SessionPool, type PoolOptions } from '../sdk/index.ts';
+import { PoolExhaustedError, SessionPool, type Op, type PoolOptions } from '../sdk/index.ts';
+import { SessionBridge, type ClientReply } from './bridge.ts';
 import type { SceneStore } from './files.ts';
 
 /** 게이트웨이 종료 — 표준 going away */
@@ -88,8 +93,23 @@ export interface SessionLike {
   readonly alive: boolean;
   once(event: 'exit', listener: (code: number | null) => void): unknown;
   off(event: 'exit', listener: (code: number | null) => void): unknown;
-  /** 로그용. 없으면 없는 대로 둔다 */
-  readonly worker?: { readonly pid?: number | undefined } | undefined;
+  /**
+   * 로그용 pid와 op 중계 창구. 없으면 없는 대로 둔다.
+   *
+   * 중계를 `worker.request`로 하는 이유는 #7 보고에 적었지만 요약하면:
+   * 클라이언트가 보내는 것은 어차피 `unknown` JSON이라 Session의 타입 있는
+   * 메서드를 거쳐도 타입 안전을 얻지 못하고, op 17개를 메서드로 받으려면
+   * 이 인터페이스가 17개를 요구하게 되어 **가짜 풀로 도는 테스트 경로가
+   * 통째로 깨진다.** `request?`를 옵셔널로 두면 가짜 세션은 그대로 두고
+   * (중계를 지원하지 않는 세션으로 취급된다) 실제 Session은 그냥 만족한다.
+   *
+   * Session이 감싸는 부가 상태(loadedPath·lastActivity)를 건너뛰지만,
+   * 둘 다 지금 아무도 읽지 않는다 — 풀의 회수는 ageMs만 본다.
+   */
+  readonly worker?: {
+    readonly pid?: number | undefined;
+    request?(op: Op, payload?: Record<string, unknown>): Promise<unknown>;
+  } | undefined;
 }
 
 export interface PoolStats {
@@ -139,6 +159,8 @@ export interface SessionsOptions {
   maxPayload?: number;
   /** ping 주기(ms). 0이면 끈다. 기본 30000 */
   heartbeatIntervalMs?: number;
+  /** 연결 하나가 동시에 띄울 수 있는 op 요청 수 (#7). 기본 32 */
+  maxInflightRequests?: number;
 
   /**
    * 풀을 직접 만든다. 지정하면 위 워커 옵션은 전부 무시된다.
@@ -177,6 +199,8 @@ interface Conn {
   /** 마지막 ping에 pong이 왔는가 */
   responsive: boolean;
   killTimer: NodeJS.Timeout | null;
+  /** op 중계 정책 (#7). 연결 하나에 하나 */
+  bridge: SessionBridge;
 }
 
 const STATUS_TEXT: Record<number, string> = {
@@ -217,10 +241,6 @@ function refuse(
   ].join('\r\n');
 
   socket.end(Buffer.concat([Buffer.from(head, 'latin1'), body]));
-}
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null;
 }
 
 /**
@@ -517,6 +537,10 @@ export class SessionManager {
       openedAt: Date.now(),
       remote: `${req.socket.remoteAddress ?? '?'}:${req.socket.remotePort ?? 0}`,
     };
+    // 워커에 닿는 창구. `request`가 없는 세션(가짜 풀 등)은 target=null이
+    // 되어 중계를 거부하고, 그 밖의 검증(화이트리스트·씬 id)은 그대로 돈다.
+    const request = session.worker?.request;
+    const worker = session.worker;
     const conn: Conn = {
       ws,
       info,
@@ -524,6 +548,16 @@ export class SessionManager {
       pool,
       responsive: true,
       killTimer: null,
+      bridge: new SessionBridge({
+        target: request && worker
+          ? { request: (op, payload) => request.call(worker, op, payload) }
+          : null,
+        ...(this.#opts.scenes === undefined ? {} : { scenes: this.#opts.scenes }),
+        sceneId,
+        ...(this.#opts.maxInflightRequests === undefined
+          ? {}
+          : { maxInflight: this.#opts.maxInflightRequests }),
+      }),
       onExit: (code) => {
         // 워커가 스스로 죽었다. 세션 상태는 복구 불가 — 연결을 끊어 클라이언트가
         // 재연결로 새 세션을 받게 한다. 조용히 살려두면 op이 전부 실패한다.
@@ -564,6 +598,9 @@ export class SessionManager {
   async #detach(conn: Conn, code: number, reason: string): Promise<void> {
     this.#conns.delete(conn.ws);
     conn.session.off('exit', conn.onExit);
+    // 아직 응답을 기다리는 요청이 있어도 여기서 버린다. 소켓이 이미 닫혔으므로
+    // 보낼 곳이 없고, 워커는 곧 반납·종료된다.
+    conn.bridge.close();
     if (conn.killTimer) {
       clearTimeout(conn.killTimer);
       conn.killTimer = null;
@@ -622,21 +659,25 @@ export class SessionManager {
   }
 
   /**
-   * 클라이언트가 보낸 메시지.
+   * 클라이언트가 보낸 메시지 → 브리지.
    *
-   * **중계는 #7·#8의 일이다.** 여기서 미리 구현하면 나중에 프레임이 안 올 때
-   * "세션이 없는 건지 중계가 안 되는 건지"를 가를 수 없게 된다.
+   * 여기서 하는 건 전송 계층의 판단뿐이다: 프레임 종류, 텍스트 디코딩, JSON
+   * 파싱. 그 뒤는 전부 bridge.ts가 판단한다 — **어떤 op을 통과시키는지는 이
+   * 파일에 한 줄도 없다.** 그래야 "무엇이 워커에 닿는가"를 한 파일에서 감사할
+   * 수 있다.
    *
-   * 그렇다고 무시하면 클라이언트가 영원히 기다린다 — 그게 더 나쁜 실패다.
-   * 그래서 **워커 프로토콜과 같은 모양의 에러 응답**을 돌려주고 연결은 유지한다:
-   *   { id?, ok: false, error }
-   * id를 그대로 되돌려주므로 클라이언트의 요청 상관(#11)이 지금부터 동작하고,
-   * #7이 켜지면 같은 자리에 성공 응답이 들어올 뿐 형태가 바뀌지 않는다.
-   * 연결을 끊지 않는 이유: 미구현 op 하나가 세션(=워커 프로세스)을 날릴 이유가 없다.
+   * 응답은 어느 경로로 가든 워커 프로토콜과 같은 모양이다:
+   *   { id?, ok: true, result } | { id?, ok: false, error }
+   * 이 형태는 #6이 이미 클라이언트에게 약속한 것이라 바꾸지 않는다.
+   *
+   * 어떤 실패도 연결을 끊지 않는다. 잘못된 요청 하나가 세션(= 워커 프로세스
+   * = 라이선스 인스턴스)을 날릴 이유가 없다.
    */
   #onMessage(conn: Conn, data: Buffer | ArrayBuffer | Buffer[], isBinary: boolean): void {
     if (isBinary) {
-      this.#reply(conn, undefined, '바이너리 프레임은 아직 받지 않습니다');
+      // 지금 클라이언트 → 서버는 op 요청뿐이고 전부 작은 JSON이다. 바이너리를
+      // 받을 자리가 생긴다면 그건 #8 이후의 업로드 계열이지 여기가 아니다.
+      this.#send(conn, { ok: false, error: '바이너리 프레임은 아직 받지 않습니다' });
       return;
     }
 
@@ -650,24 +691,26 @@ export class SessionManager {
     try {
       msg = JSON.parse(text);
     } catch {
-      this.#reply(conn, undefined, 'JSON이 아닙니다');
+      this.#send(conn, { ok: false, error: 'JSON이 아닙니다' });
       return;
     }
 
-    const id = isRecord(msg) && typeof msg['id'] === 'number' ? msg['id'] : undefined;
-    const op = isRecord(msg) && typeof msg['op'] === 'string' ? msg['op'] : null;
-    this.#reply(
-      conn,
-      id,
-      op === null
-        ? 'op 필드가 없습니다'
-        : `op 중계는 아직 구현되지 않았습니다 (op=${op})`,
-    );
+    conn.bridge.dispatch(msg, (reply) => this.#send(conn, reply));
   }
 
-  #reply(conn: Conn, id: number | undefined, error: string): void {
+  /**
+   * 응답 한 줄을 소켓에 쓴다. **던지지 않는다.**
+   *
+   * 브리지는 워커 응답이 도착했을 때 이걸 비동기로 부른다. 여기서 예외가
+   * 새면 그 자리가 처리되지 않은 Promise 거부가 되어 게이트웨이 프로세스가
+   * 통째로 죽는다 — 세션 하나의 소켓이 방금 닫혔다는 이유로.
+   */
+  #send(conn: Conn, reply: ClientReply): void {
     if (conn.ws.readyState !== WebSocket.OPEN) return;
-    const body = id === undefined ? { ok: false, error } : { id, ok: false, error };
-    conn.ws.send(JSON.stringify(body));
+    try {
+      conn.ws.send(JSON.stringify(reply));
+    } catch (err: unknown) {
+      this.#log(`[warn] 세션 ${conn.info.id} 응답 전송 실패: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 }

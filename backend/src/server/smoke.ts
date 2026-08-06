@@ -34,6 +34,8 @@ import { promisify } from 'node:util';
 import { WebSocket } from 'ws';
 
 import { PoolExhaustedError, SessionPool } from '../sdk/index.ts';
+import type { Op } from '../sdk/protocol.ts';
+import { allowedOps } from './bridge.ts';
 import {
   createServer,
   type Gateway,
@@ -426,10 +428,106 @@ async function exeCount(): Promise<number> {
   }
 }
 
+/**
+ * 워커 자리에 앉아 `(op, payload)`를 **기록**하는 중계 창구 (#7).
+ *
+ * 실제 워커로는 응답만 보인다. 그런데 이 단위가 지키려는 주장은 응답이 아니라
+ * **"클라이언트가 보낸 필드가 워커에 닿지 않는다"**이고, 그건 응답만 봐서는
+ * 확인할 수 없다 — 워커가 모르는 필드를 무시했을 뿐일 수도 있다. 여기서는
+ * request()가 실제로 받은 객체를 그대로 붙잡으므로 bridge.ts의 ①(payload는
+ * 항상 새로 조립한다)을 눈으로 확인할 수 있다.
+ *
+ * 응답을 붙잡아 두는 `hold`도 실제 워커로는 못 만든다. 동시 요청 상한과
+ * id 중복은 "응답이 아직 안 온 상태"가 있어야 재현되는데, 실제 워커는
+ * ping에 1ms 안에 답한다 — 시간이 아니라 **순서**로 재현해야 한다.
+ */
+class Relay {
+  readonly calls: Array<{ op: string; payload: Record<string, unknown> | undefined }> = [];
+
+  /** true면 응답을 붙잡아 둔다. releaseAll()로 한꺼번에 푼다 */
+  hold = false;
+
+  /** 워커 응답. 기본은 어떤 op이 왔는지 되돌려주는 표식 */
+  respond: (op: string, payload: Record<string, unknown> | undefined) => unknown =
+    (op) => ({ echoed: op });
+
+  /** null이 아니면 그 오류로 거부한다 (워커가 실패를 돌려주는 경로) */
+  fail: (op: string, payload: Record<string, unknown> | undefined) => Error | null = () => null;
+
+  #held: Array<() => void> = [];
+
+  handle(op: string, payload?: Record<string, unknown>): Promise<unknown> {
+    this.calls.push({ op, payload });
+    const settle = (): Promise<unknown> => {
+      const err = this.fail(op, payload);
+      return err ? Promise.reject(err) : Promise.resolve(this.respond(op, payload));
+    };
+    if (!this.hold) return settle();
+    return new Promise<unknown>((resolve, reject) => {
+      this.#held.push(() => void settle().then(resolve, reject));
+    });
+  }
+
+  /** 붙잡아 둔 응답을 전부 내보낸다 */
+  releaseAll(): void {
+    const held = this.#held;
+    this.#held = [];
+    for (const f of held) f();
+  }
+
+  /** 워커에 닿은 op을 순서대로. 순서 보장 테스트가 읽는 값이다 */
+  get ops(): string[] {
+    return this.calls.map((c) => c.op);
+  }
+
+  last(): { op: string; payload: Record<string, unknown> | undefined } | undefined {
+    return this.calls[this.calls.length - 1];
+  }
+
+  reset(): void {
+    this.calls.length = 0;
+  }
+}
+
+/**
+ * 클라이언트가 받은 텍스트에 **서버 경로**의 흔적이 있는가 (#7 ②).
+ *
+ * 문자열 하나만 비교하지 않는 이유가 셋이다:
+ *   - JSON 안에서는 `\`가 `\\`로 이스케이프된다 — 원문 비교가 그냥 빗나간다.
+ *   - 예외 메시지가 `/`로 되돌려주는 경우가 있다 (bridge.ts의 redact 주석).
+ *   - 씬 디렉토리가 아닌 **다른** 서버 경로가 새는 경우를 그물이 놓친다.
+ *     그래서 드라이브 문자(`C:\`)를 마지막 그물로 둔다 — 이 단위의 응답에
+ *     드라이브 문자가 나올 정당한 이유가 하나도 없다.
+ */
+function leaksPath(text: string, dir: string): boolean {
+  const flat = text.replace(/\\\\/g, '\\').toLowerCase();
+  const d = dir.toLowerCase();
+  return flat.includes(d) || flat.includes(d.replace(/\\/g, '/')) || /[a-z]:[\\/]/.test(flat);
+}
+
 /** 프로세스를 안 띄우는 세션. SessionLike가 요구하는 표면이 이게 전부다 */
 class FakeSession extends EventEmitter implements SessionLike {
   alive = true;
-  readonly worker = { pid: 0 };
+  readonly worker: {
+    readonly pid?: number | undefined;
+    request?(op: Op, payload?: Record<string, unknown>): Promise<unknown>;
+  };
+
+  /**
+   * relay가 없으면 `worker.request`도 없다 — 브리지가 target=null로 보는
+   * "중계를 지원하지 않는 세션"이 된다.
+   *
+   * **기본을 relay 없음으로 둔 이유**: 그 갈래는 bridge.ts에 살아 있는 코드라
+   * (SessionLike.request가 옵셔널인 한 계속 살아 있다) 덮는 테스트가 하나는
+   * 있어야 하고, 그게 §7-5다. relay를 기본으로 켜면 그 갈래가 통째로
+   * 무검증이 된다. 중계 성공 경로는 §7-9~7-11이 relay를 켜서 본다.
+   */
+  constructor(relay?: Relay) {
+    super();
+    this.worker = relay
+      ? { pid: 0, request: (op, payload) => relay.handle(op, payload) }
+      : { pid: 0 };
+  }
 
   /** 워커가 스스로 죽는 상황 (엔진 크래시) */
   die(code: number | null = 1): void {
@@ -447,6 +545,8 @@ interface FakePoolOptions {
   boom?: boolean;
   /** acquire에 들어온 순간 */
   onEnter?: () => void;
+  /** 지정하면 세션이 `worker.request`를 갖는다 (#7 중계 경로) */
+  relay?: Relay;
 }
 
 class FakePool implements SessionSource {
@@ -468,7 +568,7 @@ class FakePool implements SessionSource {
     if (max !== undefined && this.live.size >= max) {
       throw new PoolExhaustedError(`세션 상한 도달 (${max}). 동시 인스턴스 수는 라이선스와 직결됩니다.`);
     }
-    const s = new FakeSession();
+    const s = new FakeSession(this.#o.relay);
     this.live.add(s);
     this.acquired++;
     return s;
@@ -1652,10 +1752,14 @@ async function main(): Promise<void> {
         `status=${String(ok.status)}, error=${String(ok.error)}, `
         + `stats=${JSON.stringify(gw.sessions.stats)}, pid=${String(traced.pids[0])}`,
       );
+      // #7 이전에는 중계가 없어 ok:false(거절)가 왕복의 증거였다. 이제 중계가
+      // 있으므로 **성공 응답**이 더 강한 확인이다 — 소켓이 열렸다는 것뿐 아니라
+      // 요청이 실제로 워커까지 갔다 왔다는 뜻이 된다.
       const reply = ok.ws ? await ask(ok.ws, { id: 1, op: 'ping' }) : null;
       check(
         '그 세션으로 왕복이 된다',
-        reply?.['id'] === 1 && reply?.['ok'] === false,
+        reply?.['id'] === 1 && reply?.['ok'] === true
+        && isRecord(reply['result']) && reply['result']['pong'] === true,
         JSON.stringify(reply),
       );
       ok.ws?.close();
@@ -1977,6 +2081,614 @@ async function main(): Promise<void> {
         `released=${fake.released}, busy=${gw.sessions.stats.busy}`,
       );
     }, { sessions: { createPool: () => fake, heartbeatIntervalMs: 0 } });
+  }
+
+  // ── 7-8. op 중계 (실제 워커) ──────────────────────────
+  // TASKS.json #7의 통과 기준 두 줄이 여기 있다: ping 왕복, quit 거부 + 세션 생존.
+  //
+  // **실제 워커를 쓰는 이유**는 가짜로는 답할 수 없는 질문이 둘이기 때문이다:
+  //   (1) 요청이 정말 워커 프로세스까지 갔다 오는가 (가짜는 자기가 답한다)
+  //   (2) 워커가 `{ loaded, path }`로 되돌려주는 **서버 절대경로**가 실제로
+  //       막히는가. 가짜에게 경로를 돌려주게 시킬 수는 있지만, 그 경로가
+  //       진짜 워커가 만드는 것과 같다는 보장은 사람이 하는 것이다.
+  //
+  // 진짜 .zls는 103MB짜리 하나뿐이라 스모크에 넣을 수 없다(매 실행 103MB
+  // 업로드 + 임시 디스크). 다행히 ZestManager::LoadZls는 **아무 바이트나 받아
+  // true를 돌려준다** — 14바이트짜리 "not a real zls"로도 status.loaded가
+  // true가 된다(직접 확인). 이 섹션이 지키는 것은 시뮬레이션이 아니라
+  // **경로가 밖으로 나가는가**이므로 그걸로 충분하다.
+  //
+  // ⚠ 이 섹션은 그 엔진 동작에 얹혀 있다. 언젠가 워커가 zls 형식을 검증하게
+  //   되면 여기 load 단언들이 "zls 로드 실패"로 깨진다 — 브리지가 회귀한 게
+  //   아니라 전제가 바뀐 것이다. 그때는 작은 진짜 .zls를 픽스처로 넣을 것.
+  section('7-8. op 중계 (실제 워커, 통과 기준)');
+  {
+    const traced = new TracingPool(new SessionPool({
+      exePath: defaultWorkerExe(),
+      idleTimeout: 0,
+      maxTotal: 1,
+      onLog: () => {},
+    }));
+
+    await withScenes(async (gw, addr) => {
+      const up = await upload(addr, 'tiny.zls', new TextEncoder().encode('not a real zls'));
+      const sceneId = String(sceneOf(up)?.['id'] ?? '');
+      check('중계용 씬 업로드', /^[0-9a-f]{32}$/.test(sceneId), sceneId || JSON.stringify(up.body));
+
+      const r = await connect(wsUrlOf(addr));
+      const ws = r.ws;
+      strayPids.push(...traced.pids);
+      if (!ws) {
+        check('연결 성립', false, `status=${String(r.status)}, error=${String(r.error)}`);
+        return;
+      }
+      const pid = traced.pids[0];
+      const dir = gw.scenes.dir;
+
+      // ① 통과 기준 1 — ping 왕복
+      const pong = await ask(ws, { id: 1, op: 'ping' });
+      check(
+        'ping 왕복 → { id, ok:true, result.pong } (통과 기준)',
+        pong?.['id'] === 1 && pong['ok'] === true
+        && isRecord(pong['result']) && pong['result']['pong'] === true,
+        JSON.stringify(pong),
+      );
+
+      // ② 통과 기준 2 — quit 거부 + 세션 생존.
+      //    "살아 있다"를 세 겹으로 본다: 소켓 / 게이트웨이 장부 / OS 프로세스.
+      //    앞의 둘만 보면 워커가 죽고 게이트웨이만 모르는 경우를 놓친다.
+      const q = await ask(ws, { id: 2, op: 'quit' });
+      check(
+        'quit 거부 → { id, ok:false, error } (통과 기준)',
+        q?.['id'] === 2 && q['ok'] === false && String(q['error']).includes('quit'),
+        JSON.stringify(q),
+      );
+      check(
+        'quit 뒤에도 소켓·세션·워커 프로세스가 전부 살아 있다 (통과 기준)',
+        ws.readyState === WebSocket.OPEN
+        && gw.sessions.stats.busy === 1
+        && pid !== undefined && await pidAlive(pid),
+        `readyState=${ws.readyState}, busy=${gw.sessions.stats.busy}, pid=${String(pid)}`,
+      );
+      // 그리고 워커가 **손상되지 않았다**. 프로세스가 살아 있는 것과 아직
+      // 요청을 처리하는 것은 다른 얘기다.
+      const pong2 = await ask(ws, { id: 3, op: 'ping' });
+      check(
+        '거부는 워커에 닿지도 않았다 — 이어서 ping이 그대로 돈다',
+        pong2?.['ok'] === true,
+        JSON.stringify(pong2),
+      );
+
+      // ③ 나머지 차단
+      const ex = await ask(ws, { id: 4, op: 'export', path: 'C:\\Windows\\evil.gltf' });
+      check(
+        'export 차단 (#10 이전) — 임의 위치 파일 쓰기가 막힌다',
+        ex?.['ok'] === false && String(ex['error']).includes('#10'),
+        JSON.stringify(ex),
+      );
+
+      const un = await ask(ws, { id: 5, op: 'rm-rf' });
+      const unMsg = String(un?.['error'] ?? '');
+      check(
+        '알 수 없는 op → 사용 가능 목록을 알려준다',
+        un?.['ok'] === false && unMsg.includes('rm-rf') && unMsg.includes('ping'),
+        unMsg.slice(0, 100),
+      );
+      // 차단된 op은 "모르는 op"이 아니라 "부를 수 없는 op"이라 목록에 없어야
+      // 한다. 목록에 실리면 프론트엔드가 있다고 믿고 호출을 만든다.
+      check(
+        '그 목록에 quit·export이 없다',
+        !unMsg.includes('quit') && !unMsg.includes('export'),
+        unMsg.slice(0, 160),
+      );
+
+      // ④ ★ 경로 노출 — 이 섹션의 진짜 값어치
+      const loaded = await ask(ws, { id: 6, op: 'load', scene: sceneId });
+      const result = isRecord(loaded?.['result']) ? loaded['result'] : null;
+      check(
+        'load(씬 id) 성공',
+        loaded?.['ok'] === true && result?.['loaded'] === true,
+        JSON.stringify(loaded).slice(0, 160),
+      );
+      check(
+        '워커가 실은 path가 응답에서 씬 id로 갈아끼워졌다',
+        result !== null && !('path' in result) && result['scene'] === sceneId,
+        JSON.stringify(result),
+      );
+      check(
+        '응답 어디에도 서버 경로가 없다 (#5의 "경로는 밖으로 안 나간다")',
+        !leaksPath(JSON.stringify(loaded), dir),
+        JSON.stringify(loaded).slice(0, 200),
+      );
+      // 응답이 위조가 아니라는 증거. 워커의 상태가 실제로 바뀌었어야 한다.
+      const st = await ask(ws, { id: 7, op: 'status' });
+      check(
+        '그 load가 실제로 워커에 닿았다 (status.loaded == true)',
+        isRecord(st?.['result']) && st['result']['loaded'] === true,
+        JSON.stringify(st?.['result']),
+      );
+
+      // ⑤ 주입 — 실제 워커로도 한 번은 확인한다 (변종 전수는 §7-10)
+      const inj = await ask(ws, { id: 8, op: 'load', path: 'C:\\Windows\\win.ini' });
+      check(
+        'load{path} 거부 — 조용히 무시하지 않는다',
+        inj?.['ok'] === false && String(inj['error']).includes('path'),
+        JSON.stringify(inj),
+      );
+      const stillMine = await ask(ws, { id: 9, op: 'status' });
+      check(
+        '거부된 load가 워커의 씬을 건드리지 않았다',
+        isRecord(stillMine?.['result']) && stillMine['result']['loaded'] === true,
+        JSON.stringify(stillMine?.['result']),
+      );
+
+      const missing = await ask(ws, { id: 10, op: 'load', scene: '0'.repeat(32) });
+      const missMsg = String(missing?.['error'] ?? '');
+      check(
+        '없는 씬 → "찾을 수 없습니다" (엔진 로드 실패와 구분된다)',
+        missing?.['ok'] === false && missMsg.includes('찾을 수 없습니다'),
+        missMsg,
+      );
+      check('그 오류에도 서버 경로가 없다', !leaksPath(missMsg, dir), missMsg);
+
+      // ⑥ 세션은 끝까지 하나. 거부 6번을 맞고도 워커가 그대로다.
+      check(
+        '거부 연타 뒤에도 세션 1개 그대로',
+        gw.sessions.stats.busy === 1 && ws.readyState === WebSocket.OPEN,
+        `busy=${gw.sessions.stats.busy}, readyState=${ws.readyState}`,
+      );
+      ws.close();
+      check('종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+      check(
+        '워커 프로세스도 사라진다',
+        pid !== undefined && await until(async () => !(await pidAlive(pid))),
+        `pid=${String(pid)}`,
+      );
+    }, { sessions: { createPool: () => traced, heartbeatIntervalMs: 0 } });
+  }
+
+  // ── 7-9. 화이트리스트 전수 ────────────────────────────
+  // OPS 테이블은 **데이터**다. 한 줄이 틀리면 문이 조용히 열리거나 기능이
+  // 조용히 사라지는데, 어느 쪽도 다른 테스트가 잡지 못한다. 그래서 18개를
+  // 전부 통과시켜 본다 — 실제 워커로 하면 18번의 왕복이지만, 가짜 릴레이는
+  // "워커에 닿았는가"까지 함께 볼 수 있어 오히려 판정이 강하다:
+  // 차단된 op은 ok:false인 것으로 부족하고 **워커에 닿지 않아야** 한다.
+  section('7-9. op 화이트리스트 전수 (가짜 릴레이)');
+  {
+    const relay = new Relay();
+    const fake = new FakePool({ relay });
+    await withScenes(async (gw, addr) => {
+      const up = await upload(addr, 'w.zls', new TextEncoder().encode('x'));
+      const sceneId = String(sceneOf(up)?.['id'] ?? '');
+      const r = await connect(wsUrlOf(addr));
+      const ws = r.ws;
+      if (!ws) {
+        check('연결 성립', false, `status=${String(r.status)}`);
+        return;
+      }
+
+      // protocol.ts의 Request 유니온 전부. 여기서 빠진 op이 있으면 아래
+      // 개수 단언이 잡는다.
+      const TABLE: Array<[string, boolean]> = [
+        ['ping', true], ['version', true], ['init', true], ['load', true],
+        ['clear', true], ['start', true], ['pause', true], ['reset', true],
+        ['step', true], ['status', true], ['getParams', true], ['setParams', true],
+        ['meshInfo', true], ['meshData', true], ['subscribe', true], ['unsubscribe', true],
+        ['export', false], ['quit', false],
+      ];
+      const extra: Record<string, Record<string, unknown>> = {
+        load: { scene: sceneId },
+        setParams: { params: { timeStep: 0.01 } },
+      };
+
+      let id = 100;
+      for (const [op, allow] of TABLE) {
+        const before = relay.calls.length;
+        id += 1;
+        const rep = await ask(ws, { id, op, ...(extra[op] ?? {}) });
+        const reached = relay.calls.length > before;
+        check(
+          `${op} — ${allow ? '통과 + 워커 도달' : '차단 + 워커 미도달'}`,
+          rep?.['id'] === id && rep['ok'] === allow && reached === allow,
+          `ok=${String(rep?.['ok'])}, 도달=${reached}${rep?.['error'] ? `, ${String(rep['error']).slice(0, 60)}` : ''}`,
+        );
+      }
+
+      check('표가 프로토콜 op 18개를 전부 덮는다', TABLE.length === 18, `${TABLE.length}개`);
+      check(
+        'allowedOps()가 허용 16개와 정확히 일치 (거부 문구에 실리는 목록)',
+        allowedOps().slice().sort().join(',')
+          === TABLE.filter(([, a]) => a).map(([o]) => o).sort().join(','),
+        allowedOps().join(','),
+      );
+      check(
+        'allowedOps()에 quit·export이 없다',
+        !allowedOps().includes('quit') && !allowedOps().includes('export'),
+        allowedOps().join(','),
+      );
+
+      // ★ build 없는 op은 부가 필드를 통째로 버린다. payload가 undefined여야
+      //   한다 — 빈 객체조차 아니다. 스프레드로 흘려보내는 회귀가 생기면
+      //   여기서 정확히 잡힌다.
+      relay.reset();
+      await ask(ws, {
+        id: 200, op: 'status',
+        path: 'C:\\Windows\\win.ini', format: 'gltf', params: { timeStep: 9 }, evil: 1,
+      });
+      check(
+        'build 없는 op은 클라이언트 부가 필드를 전부 버린다 (payload 없음)',
+        relay.last()?.op === 'status' && relay.last()?.payload === undefined,
+        JSON.stringify(relay.last()),
+      );
+
+      ws.close();
+      check('종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+    }, { sessions: { createPool: () => fake, heartbeatIntervalMs: 0 } });
+  }
+
+  // ── 7-10. 필드 변환 · 주입 · 경로 차단 ────────────────
+  // §7-8이 "진짜 워커로도 막힌다"를 봤다면 여기는 **변종**을 본다. 가짜를
+  // 쓰는 이유는 하나다: 막혔다는 것을 응답이 아니라 `relay.calls`로 —
+  // 즉 "워커에 닿지 않았다"로 — 판정할 수 있다.
+  section('7-10. 필드 변환과 경로 차단 (가짜 릴레이)');
+  {
+    const relay = new Relay();
+    const fake = new FakePool({ relay });
+    await withScenes(async (gw, addr) => {
+      const a = String(sceneOf(await upload(addr, 'a.zls', new TextEncoder().encode('a')))?.['id'] ?? '');
+      const b = String(sceneOf(await upload(addr, 'b.zls', new TextEncoder().encode('bb')))?.['id'] ?? '');
+      const dir = gw.scenes.dir;
+
+      // ?scene= 을 달고 연결한다. 이게 **구속이 아니라 기본값**이라는 결정을
+      // 아래에서 두 방향으로 확인한다.
+      const r = await connect(wsUrlOf(addr, `?scene=${a}`));
+      const ws = r.ws;
+      if (!ws) {
+        check('연결 성립', false, `status=${String(r.status)}`);
+        return;
+      }
+
+      // 워커가 protocol.cpp:503에서 하는 것과 **같은 모양**으로 답한다.
+      // 경로를 지어내지 않고 브리지가 방금 만든 그 경로를 되돌려주므로,
+      // mapResult가 없으면 진짜 서버 경로가 그대로 새어 나간다.
+      relay.respond = (op, payload) =>
+        op === 'load' ? { loaded: true, path: payload?.['path'] } : { echoed: op };
+
+      // ① scene 없는 load → ?scene= 기본값
+      relay.reset();
+      const def = await ask(ws, { id: 1, op: 'load' });
+      const defCall = relay.last();
+      check(
+        'scene 없는 load → ?scene= 이 기본값으로 쓰인다',
+        defCall?.payload?.['path'] === gw.scenes.pathOf(a),
+        JSON.stringify(defCall),
+      );
+      check(
+        '워커에 가는 payload는 path 하나뿐 (scene 필드는 안 간다)',
+        defCall?.payload !== undefined && Object.keys(defCall.payload).join(',') === 'path',
+        JSON.stringify(defCall?.payload && Object.keys(defCall.payload)),
+      );
+      check(
+        '워커가 실어 보낸 path가 응답에서 씬 id로 바뀐다',
+        isRecord(def?.['result']) && def['result']['scene'] === a && !('path' in def['result']),
+        JSON.stringify(def),
+      );
+      check('그 응답에 서버 경로가 없다', !leaksPath(JSON.stringify(def), dir), JSON.stringify(def));
+
+      // ② ?scene= 은 구속이 아니다 — 같은 세션에서 다른 씬
+      relay.reset();
+      const other = await ask(ws, { id: 2, op: 'load', scene: b });
+      check(
+        '같은 세션에서 다른 씬을 열 수 있다 (?scene= 은 기본값일 뿐)',
+        relay.last()?.payload?.['path'] === gw.scenes.pathOf(b)
+        && isRecord(other?.['result']) && other['result']['scene'] === b,
+        JSON.stringify(other),
+      );
+
+      // ③ redact — 워커 오류 문자열에 실린 서버 경로.
+      //    성공 결과는 mapResult가 막지만 에러 문구는 엔진이 만들어서
+      //    무엇이 들어올지 우리가 정하지 못한다. 마지막 그물이 이것뿐이다.
+      relay.fail = (op) => op === 'status'
+        ? new Error(`예외: 파일을 열 수 없습니다: ${gw.scenes.pathOf(a)} (code 2)`)
+        : null;
+      const errRep = await ask(ws, { id: 3, op: 'status' });
+      const eMsg = String(errRep?.['error'] ?? '');
+      check(
+        '워커 오류의 서버 경로가 <씬 저장소>로 지워진다',
+        eMsg.includes('<씬 저장소>') && !leaksPath(eMsg, dir),
+        eMsg,
+      );
+      check(
+        '그래도 엔진 문구 자체는 살아남는다 (뭉개면 운영에서 원인을 못 찾는다)',
+        eMsg.includes('예외') && eMsg.includes('code 2'),
+        eMsg,
+      );
+      // 슬래시로 되돌아온 경우도 같은 그물에 걸려야 한다 (bridge.ts redact 주석)
+      relay.fail = (op) => op === 'status'
+        ? new Error(`open failed: ${gw.scenes.pathOf(a).replace(/\\/g, '/')}`)
+        : null;
+      const slashMsg = String((await ask(ws, { id: 4, op: 'status' }))?.['error'] ?? '');
+      check(
+        '구분자가 / 로 돌아와도 지워진다',
+        slashMsg.includes('<씬 저장소>') && !leaksPath(slashMsg, dir),
+        slashMsg,
+      );
+      relay.fail = () => null;
+
+      // ④ path 주입 변종.
+      //    #5의 traversal 18종만큼 넓히지 않는 이유: 여기 검사는 값이 아니라
+      //    **필드의 존재**다(`'path' in msg`). 값을 아무리 바꿔도 같은 한 줄을
+      //    지난다. 대신 타입 변종과 "scene과 함께 보내기"를 넣는다 — 후자가
+      //    유일하게 다른 코드 경로를 탈 수 있는 모양이다.
+      const injections: Array<[string, unknown]> = [
+        ['절대경로', 'C:\\Windows\\win.ini'],
+        ['UNC 경로', '\\\\attacker\\share\\evil.zls'],
+        ['상대 traversal', '../../../Windows/win.ini'],
+        ['POSIX 절대경로', '/etc/passwd'],
+        ['빈 문자열', ''],
+        ['null', null],
+        ['숫자', 1],
+        ['배열', ['C:\\Windows\\win.ini']],
+        ['객체', { toString: 'x' }],
+      ];
+      let injId = 300;
+      let injBlocked = 0;
+      for (const [label, value] of injections) {
+        relay.reset();
+        injId += 1;
+        const rep = await ask(ws, { id: injId, op: 'load', path: value, scene: a });
+        const blocked = rep?.['ok'] === false
+          && String(rep['error']).includes('path를 받지 않습니다')
+          && relay.calls.length === 0;
+        if (blocked) injBlocked += 1;
+        else check(`load{path=${label}} 거부`, false, JSON.stringify(rep));
+      }
+      check(
+        `path 주입 ${injections.length}종이 전부 거부되고 워커에 닿지 않는다`,
+        injBlocked === injections.length,
+        `${injBlocked}/${injections.length} — scene을 함께 보내도 path가 있으면 거부된다`,
+      );
+
+      // ⑤ 씬 id 형식. 여기는 값이 실제로 `path.join`에 들어가는 자리라
+      //    변종을 넓힐 값어치가 있다 (#5의 pathOf가 유일한 관문이다).
+      const badIds: Array<[string, unknown]> = [
+        ['상대 traversal', '../../../Windows/win.ini'],
+        ['역슬래시 traversal', '..\\..\\..\\Windows\\win.ini'],
+        ['절대경로', 'C:\\Windows\\win.ini'],
+        ['31자', 'a'.repeat(31)],
+        ['33자', 'a'.repeat(33)],
+        ['대문자 hex', 'A'.repeat(32)],
+        ['비 hex', 'g'.repeat(32)],
+        ['빈 문자열', ''],
+        ['확장자 붙임', `${'a'.repeat(32)}.zls`],
+        ['널바이트', `${'a'.repeat(31)}\u0000`],
+        ['숫자 타입', 12345],
+        ['객체 타입', { id: 'a'.repeat(32) }],
+      ];
+      let badId = 400;
+      let badBlocked = 0;
+      for (const [label, value] of badIds) {
+        relay.reset();
+        badId += 1;
+        const rep = await ask(ws, { id: badId, op: 'load', scene: value });
+        const blocked = rep?.['ok'] === false && relay.calls.length === 0;
+        if (blocked) badBlocked += 1;
+        else check(`load{scene=${label}} 거부`, false, JSON.stringify(rep));
+      }
+      check(
+        `씬 id 변종 ${badIds.length}종이 전부 거부되고 워커에 닿지 않는다`,
+        badBlocked === badIds.length,
+        `${badBlocked}/${badIds.length}`,
+      );
+
+      // ⑥ setParams 타입 필터. 문자열 하나가 통과하면 워커가 요청 중간에
+      //    죽고 **앞의 키는 이미 적용된 뒤**다 (bridge.ts 주석).
+      relay.reset();
+      const good = await ask(ws, { id: 500, op: 'setParams', params: { timeStep: 0.01, groundPlane: true, subStep: 5 } });
+      check(
+        'setParams — 숫자·불린은 통과하고 그대로 전달된다',
+        good?.['ok'] === true
+        && JSON.stringify(relay.last()?.payload) === JSON.stringify({ params: { timeStep: 0.01, groundPlane: true, subStep: 5 } }),
+        JSON.stringify(relay.last()?.payload),
+      );
+
+      const badParams: Array<[string, string]> = [
+        ['문자열 값', '{"id":501,"op":"setParams","params":{"timeStep":"0.01"}}'],
+        ['null 값', '{"id":502,"op":"setParams","params":{"timeStep":null}}'],
+        ['Infinity (1e999)', '{"id":503,"op":"setParams","params":{"timeStep":1e999}}'],
+        ['중첩 객체', '{"id":504,"op":"setParams","params":{"a":{"b":1}}}'],
+        ['배열 값', '{"id":505,"op":"setParams","params":{"a":[1]}}'],
+        ['params 누락', '{"id":506,"op":"setParams"}'],
+        ['params가 배열', '{"id":507,"op":"setParams","params":[1,2]}'],
+        ['params가 문자열', '{"id":508,"op":"setParams","params":"x"}'],
+      ];
+      let paramBlocked = 0;
+      for (const [label, raw] of badParams) {
+        relay.reset();
+        const rep = await ask(ws, null, { raw });
+        const blocked = rep?.['ok'] === false && relay.calls.length === 0;
+        if (blocked) paramBlocked += 1;
+        else check(`setParams{${label}} 거부`, false, JSON.stringify(rep));
+      }
+      check(
+        `setParams 잘못된 값 ${badParams.length}종이 워커에 닿기 전에 막힌다`,
+        paramBlocked === badParams.length,
+        `${paramBlocked}/${badParams.length} — 하나라도 새면 시뮬이 부분 적용된 상태가 된다`,
+      );
+
+      // ⑦ meshData topology 강제
+      relay.reset();
+      await ask(ws, { id: 600, op: 'meshData' });
+      check(
+        'meshData — topology 없으면 false로 채워 보낸다',
+        JSON.stringify(relay.last()?.payload) === '{"topology":false}',
+        JSON.stringify(relay.last()?.payload),
+      );
+      relay.reset();
+      await ask(ws, { id: 601, op: 'meshData', topology: true });
+      check(
+        'meshData — topology:true는 그대로',
+        JSON.stringify(relay.last()?.payload) === '{"topology":true}',
+        JSON.stringify(relay.last()?.payload),
+      );
+      relay.reset();
+      const badTopo = await ask(ws, { id: 602, op: 'meshData', topology: 'true' });
+      check(
+        'meshData — topology:"true"(문자열) 거부, 워커 미도달',
+        badTopo?.['ok'] === false && relay.calls.length === 0,
+        JSON.stringify(badTopo),
+      );
+
+      // ⑧ 거부를 그렇게 많이 받고도 세션이 그대로다
+      check(
+        `거부 ${injections.length + badIds.length + badParams.length}건 뒤에도 연결과 세션 유지`,
+        ws.readyState === WebSocket.OPEN && gw.sessions.stats.busy === 1 && fake.released === 0,
+        `readyState=${ws.readyState}, busy=${gw.sessions.stats.busy}`,
+      );
+      const stillOk = await ask(ws, { id: 700, op: 'ping' });
+      check('그리고 정상 op은 여전히 돈다', stillOk?.['ok'] === true, JSON.stringify(stillOk));
+
+      ws.close();
+      check('종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+    }, { sessions: { createPool: () => fake, heartbeatIntervalMs: 0 } });
+  }
+
+  // ── 7-11. 보내는 순서와 동시 요청 ─────────────────────
+  // load→start 뒤집힘은 **조용한 실패**다. 클라이언트는 ok:true 둘을 받고,
+  // 워커는 로드 안 된 씬을 start한다. 아무도 모르는 채로 회귀한다.
+  //
+  // 이 테스트에 이빨이 있는 근거: buildLoad는 `scenes.get()`(fs I/O)을
+  // await한다. 체인이 없으면 뒤따르는 start는 마이크로태스크만 지나 곧장
+  // 워커로 가므로 **반드시** 먼저 도착한다 — 확률이 아니라 구조다.
+  // 그래도 타이밍이 걸린 주장이므로 10회 반복해서 본다.
+  section('7-11. 보내는 순서와 동시 요청 (가짜 릴레이)');
+  {
+    const relay = new Relay();
+    const fake = new FakePool({ relay });
+    await withScenes(async (gw, addr) => {
+      const sceneId = String(sceneOf(await upload(addr, 's.zls', new TextEncoder().encode('s')))?.['id'] ?? '');
+      const r = await connect(wsUrlOf(addr));
+      const ws = r.ws;
+      if (!ws) {
+        check('연결 성립', false, `status=${String(r.status)}`);
+        return;
+      }
+
+      // 응답을 전부 모아 둔다. 붙잡아 둔 요청이 풀린 뒤를 확인해야 해서
+      // ask()의 "한 번에 하나"로는 부족하다.
+      const inbox: Array<Record<string, unknown>> = [];
+      ws.on('message', (d: Buffer) => {
+        try {
+          const v: unknown = JSON.parse(d.toString('utf8'));
+          if (isRecord(v)) inbox.push(v);
+        } catch { /* 무시 */ }
+      });
+      const send = (o: unknown): void => ws.send(JSON.stringify(o));
+
+      // ① 순서 — 10회 반복
+      let ordered = 0;
+      let sawOrder = '';
+      for (let i = 0; i < 10; i += 1) {
+        relay.reset();
+        send({ id: 1000 + i * 3, op: 'load', scene: sceneId });
+        send({ id: 1001 + i * 3, op: 'start' });
+        send({ id: 1002 + i * 3, op: 'status' });
+        await until(() => relay.calls.length === 3);
+        sawOrder = relay.ops.join(',');
+        if (sawOrder === 'load,start,status') ordered += 1;
+      }
+      check(
+        'load→start→status가 보낸 순서 그대로 워커에 닿는다 (10회)',
+        ordered === 10,
+        `${ordered}/10, 마지막 관측=${sawOrder}`,
+      );
+
+      // ①-b 대조군 — 위 단언에 이빨이 있다는 증거.
+      //
+      // "순서가 맞았다"만으로는 체인이 일하는지 알 수 없다. 우연히 맞았을
+      // 수도 있으니까. 체인은 **연결 단위**이므로, 같은 두 요청을 서로 다른
+      // 연결로 보내면 직렬화가 걸리지 않는다 — load가 fs I/O를 지나는 사이
+      // start가 먼저 도착해야 한다. 그게 관측되면 "load는 실제로 느리다 =
+      // 한 연결에서 순서가 맞은 것은 체인 덕분이다"가 된다.
+      //
+      // 소켓 두 개의 도착 순서에는 지터가 있어 판정에 넣지 않는다(note).
+      // 판정은 위의 10/10이 하고, 이건 그 숫자의 의미를 남기는 기록이다.
+      {
+        let reversed = 0;
+        for (let i = 0; i < 10; i += 1) {
+          const other = await connect(wsUrlOf(addr));
+          if (!other.ws) break;
+          relay.reset();
+          send({ id: 5000 + i * 2, op: 'load', scene: sceneId });
+          other.ws.send(JSON.stringify({ id: 5001 + i * 2, op: 'start' }));
+          await until(() => relay.calls.length === 2);
+          if (relay.ops.join(',') === 'start,load') reversed += 1;
+          other.ws.close();
+          await until(() => gw.sessions.stats.busy === 1);
+        }
+        note(
+          '대조군 — 연결이 다르면 순서가 뒤집힌다',
+          `${reversed}/10회. 체인은 연결 단위이고, load가 씬 확인(fs)을 지나는 동안 `
+          + 'start가 먼저 도착한다. 위 10/10은 그래서 우연이 아니다',
+        );
+      }
+
+      // ② 체인은 **쓰기까지만** 붙잡는다. 응답 대기까지 직렬화하면 동시
+      //    요청의 이점이 사라지므로, 4건이 응답 없이 전부 도달해야 한다.
+      relay.hold = true;
+      relay.reset();
+      inbox.length = 0;
+      for (let i = 0; i < 4; i += 1) send({ id: 2000 + i, op: 'ping' });
+      const allSent = await until(() => relay.calls.length === 4);
+      check(
+        '응답을 안 기다리고 4건이 동시에 워커에 도달 (체인은 쓰기까지만)',
+        allSent && inbox.length === 0,
+        `도달=${relay.calls.length}건, 이미 온 응답=${inbox.length}건`,
+      );
+
+      // ③ id 중복 — 처리 중인 id는 거부된다.
+      //    (dispatch에서 중복 검사가 상한 검사보다 앞이라 상한 4에 걸리지 않는다)
+      const dup = await ask(ws, { id: 2000, op: 'ping' });
+      check(
+        '처리 중인 id 재사용 → 거부 (두 응답이 같은 id로 나가면 상관 불가)',
+        dup?.['id'] === 2000 && dup['ok'] === false && String(dup['error']).includes('처리 중'),
+        JSON.stringify(dup),
+      );
+
+      // ④ 동시 요청 상한 (maxInflightRequests: 4)
+      const over = await ask(ws, { id: 2999, op: 'ping' });
+      check(
+        '상한 초과 → 큐에 쌓지 않고 즉시 거부',
+        over?.['id'] === 2999 && over['ok'] === false && String(over['error']).includes('상한 4'),
+        JSON.stringify(over),
+      );
+      check(
+        '거부된 요청은 워커에 닿지 않았다 (여전히 4건)',
+        relay.calls.length === 4,
+        `${relay.calls.length}건`,
+      );
+
+      // ⑤ 붙잡은 응답을 풀면 전부 돌아오고 상한도 풀린다
+      relay.hold = false;
+      relay.releaseAll();
+      const drained = await until(() =>
+        [2000, 2001, 2002, 2003].every((i) => inbox.some((m) => m['id'] === i && m['ok'] === true)));
+      check(
+        '붙잡아 둔 4건이 전부 성공으로 돌아온다',
+        drained,
+        `받은 id=${inbox.map((m) => `${String(m['id'])}:${String(m['ok'])}`).join(' ')}`.slice(0, 160),
+      );
+      check(
+        '거부된 2999는 실패 한 번으로 끝났다 (나중에 다시 오지 않는다)',
+        inbox.filter((m) => m['id'] === 2999).length === 1,
+        `${inbox.filter((m) => m['id'] === 2999).length}건`,
+      );
+      const after = await ask(ws, { id: 3000, op: 'ping' });
+      check('상한이 풀리면 다시 받는다', after?.['ok'] === true, JSON.stringify(after));
+
+      ws.close();
+      check('종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+    }, { sessions: { createPool: () => fake, heartbeatIntervalMs: 0, maxInflightRequests: 4 } });
   }
 
   // ── 7-7. 좀비 최종 확인 ───────────────────────────────
