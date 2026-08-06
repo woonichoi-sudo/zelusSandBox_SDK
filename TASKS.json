@@ -149,10 +149,10 @@
       "id": 11,
       "group": "frontend",
       "title": "Vite 골격 + WS 클라이언트",
-      "detail": "렌더링 전에 순수 로직부터. 프레임 디코딩, id 상관, 재연결. 여기가 프론트에서 자동 테스트가 붙는 유일한 층이다.",
-      "test": "Float32Array 디코딩 길이·정렬 검증, 요청 id 상관, 끊김 후 재연결",
+      "detail": "렌더링 전에 순수 로직부터. 프레임 디코딩, id 상관, 재연결. 여기가 프론트에서 자동 테스트가 붙는 유일한 층이다. 같은 오리진을 전제한다 — 개발은 vite.config.ts에서 /api·/ws를 게이트웨이(3000)로 프록시하고, 배포는 게이트웨이가 dist/를 정적 서빙한다(DESIGN.md §6.2의 GET /*, 새 방향이 아니라 원래 설계다). 브라우저가 항상 한 곳만 보므로 preflight가 발생하지 않고, 따라서 CORS 미들웨어를 도입하지 않는다 (ISSUE-002 결정). 프론트를 CDN이나 별도 도메인에 두면 이 전제가 깨지고 ISSUE-002가 되살아난다.",
+      "test": "Float32Array 디코딩 길이·정렬 검증, 요청 id 상관, 끊김 후 재연결. 추가로 개발서버 경유 GET /api/health 200 — 프록시 설정이 깨지면 여기서만 실패하므로 원인이 한 곳을 가리킨다",
       "verify": "auto",
-      "files": ["frontend/vite.config.ts", "frontend/src/protocol/"],
+      "files": ["frontend/vite.config.ts", "frontend/src/protocol/", "backend/src/server/index.ts"],
       "depends": [8],
       "status": "todo",
       "commit": null
