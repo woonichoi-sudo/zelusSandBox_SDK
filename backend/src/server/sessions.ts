@@ -16,9 +16,15 @@
  * 재사용될 수 있으므로(idleTimeout > 0), 리스너가 남으면 이전 클라이언트의
  * 소켓으로 남의 프레임이 간다. 그래서 #detach가 반드시 뗀다.
  *
- * 흐름 제어는 아직 없다. 구독 중이면 세션당 약 1.9MB/s(실측 40fps × 47.7KB)가
- * 아무 제한 없이 소켓으로 나간다 — 느린 클라이언트에서 프레임을 버리는
- * latest-wins는 **#9**다. #emit()이 그 자리다.
+ * 흐름 제어(#9)는 그 분업의 **예외**다 — 정책이 bridge.ts가 아니라 여기 있다.
+ * 이유는 하나뿐이고 그게 충분하다: 무엇을 버릴지의 판단 근거가 전송 계층의
+ * 값(`ws.bufferedAmount`)이라, bridge.ts로 옮기면 정책이 소켓을 알아야 한다.
+ * 그러면 "브리지는 소켓을 모른다"는 #7의 전제가 무너지고, 소켓 없이 도는
+ * 브리지 테스트가 통째로 깨진다. 그래서 이 한 가지만 전송 쪽에 둔다.
+ *
+ * 구독 중이면 세션당 약 1.9MB/s(실측 40fps × 47.7KB)가 소켓으로 나간다.
+ * 클라이언트가 그걸 못 받아내면 중간 프레임을 버리고 최신 것만 보낸다
+ * (latest-wins). 자리는 #emit() 하나다 — 아래 그 함수 주석 참고.
  *
  * 그 등식을 지키기 위해 정한 것들:
  *
@@ -79,6 +85,29 @@ const DEFAULT_MAX_PAYLOAD = 1024 * 1024;
 
 /** 죽은 연결이 워커를 붙잡고 있지 않게 하는 ping 주기 */
 const DEFAULT_HEARTBEAT_MS = 30_000;
+
+/**
+ * 프레임 이벤트를 보류시키기 시작하는 `ws.bufferedAmount` 임계값(바이트). 256KiB.
+ *
+ * 값의 근거는 두 방향에서 조인다.
+ *
+ * **아래로**: 프레임 하나가 실측 47.8KB다. 임계값이 한두 프레임 수준이면
+ * 건강한 클라이언트에서도 "직전 프레임이 아직 커널로 안 넘어간" 정상적인
+ * 순간마다 드롭이 난다 — 안 버려도 되는 걸 버리는 건 화질 손해일 뿐이다.
+ * 256KiB는 약 5프레임이라 그런 지터에 반응하지 않는다.
+ *
+ * **위로**: 이 값이 곧 세션당 버퍼 상한이다. 최악은
+ * `임계값 + 넘긴 그 프레임 + 보류 1건` ≈ 256KiB + 48KB + 48KB ≈ 350KB.
+ * 실측된 사고(느린 소비자 30초에 RSS +121MB, 동시 4세션이면 1GB대)가
+ * 여기서 1.4MB로 눌린다. 1.9MB/s 기준 135ms 분량이라 클라이언트가 보는
+ * 화면의 지연도 그만큼으로 묶인다 — 파라미터를 돌리며 보는 용도에서
+ * 체감되지 않는 선이다.
+ *
+ * 초 단위(1.9MB)로 잡지 않은 이유가 그 마지막 줄이다. 메모리는 견디지만
+ * 0.5~1초 뒤처진 화면을 보게 되는데, 인터랙티브 모드에서 그건 프레임을
+ * 버려서 얻는 이득을 통째로 없앤다.
+ */
+const DEFAULT_FRAME_HIGH_WATER = 256 * 1024;
 
 /**
  * 기본 워커 exe = `<backend>/native/build/Release/zelusSandBoxd-demo.exe`.
@@ -198,6 +227,20 @@ export interface SessionsOptions {
   maxInflightRequests?: number;
 
   /**
+   * 프레임 이벤트를 보류하기 시작하는 `ws.bufferedAmount` 임계값(바이트) (#9).
+   * 기본 262144(256KiB) — 값의 근거는 DEFAULT_FRAME_HIGH_WATER 주석.
+   *
+   * **0을 허용한다.** 0이면 "직전에 쓴 것이 소켓을 빠져나가기 전에는 다음
+   * 프레임을 안 쓴다"가 되어, 파이프라인 깊이 1의 가장 공격적인 latest-wins가
+   * 된다. 운영값은 아니지만 드롭을 결정적으로 재현해야 하는 테스트에서
+   * 필요하다 — 실제 1.9MB/s를 흘려 커널 버퍼를 메우는 것 말고는 재현 수단이
+   * 없으면, 이 단위의 통과 기준이 타이밍에 걸린 확률 시험이 된다.
+   *
+   * 음수·NaN은 기본값으로 되돌린다(조용히 흐름 제어가 꺼지는 것보다 낫다).
+   */
+  frameHighWaterMark?: number;
+
+  /**
    * 풀을 직접 만든다. 지정하면 위 워커 옵션은 전부 무시된다.
    *
    * **팩토리**인 이유는 재기동이다 — `SessionPool.close()`는 되돌릴 수 없어서
@@ -224,6 +267,45 @@ export interface SessionInfo {
   remote: string;
 }
 
+/**
+ * `connections` 게터가 돌려주는 것 = 신원(SessionInfo) + **흐름 제어 관측치** (#9).
+ *
+ * 신원과 갈라 둔 이유: SessionInfo는 연결이 열릴 때 정해져 끝까지 안 변하는
+ * 값이고(그래서 `conn.info`에 한 번 만들어 둔다), 아래 넷은 매 프레임 변하는
+ * 값이라 읽는 순간의 스냅샷이다. 같은 객체에 담으면 "이 값이 언제 것인가"가
+ * 흐려진다.
+ *
+ * **이 게터가 #9의 유일한 관측 지점이다.** 흐름 제어는 소켓 버퍼가 차야
+ * 발화하는데, 그건 밖에서 보이지 않는다 — 카운터를 안 내놓으면 "버려졌다"를
+ * 증명할 방법이 도착한 프레임의 번호가 건너뛰었다는 간접 증거뿐이고,
+ * 그건 워커가 프레임을 건너뛴 경우와 구분되지 않는다.
+ */
+export interface ConnectionInfo extends SessionInfo {
+  /**
+   * latest-wins로 **버린** 프레임 수. 보류 중인 프레임이 더 새 것에 밀려날
+   * 때마다 1 증가한다. 이 값이 0보다 크면 흐름 제어가 실제로 발화했다는 뜻이다.
+   */
+  droppedFrames: number;
+  /**
+   * 소켓이 OPEN이 아니라 **안 보낸** 이벤트 수 (frame·engineMessage 합).
+   *
+   * droppedFrames와 **다른 카운터로 둔다.** 뜻이 다르기 때문이다 —
+   * 이쪽은 연결이 닫히는 중인데 워커가 아직 프레임을 밀고 있는, 매 세션
+   * 종료마다 생기는 정상 상황이고, 저쪽은 클라이언트가 느리다는 신호다.
+   * 하나로 뭉치면 둘 다 못 쓰게 된다: 종료 로그의 "몇 건이면 반납 경로를
+   * 의심한다"는 판단이 느린 클라이언트의 드롭에 묻히고, 반대로 "드롭이
+   * 났는가"라는 단언은 소켓이 닫혔다는 이유만으로 참이 될 수 있다.
+   */
+  unsentEvents: number;
+  /** 지금 보류 중인 프레임이 있는가 */
+  pendingFrame: boolean;
+  /** 읽는 순간의 `ws.bufferedAmount`. 임계값과 비교해 보라고 같이 내놓는다 */
+  bufferedBytes: number;
+}
+
+/** ClientEvent 중 frame 갈래. 보류(latest-wins) 대상은 이것뿐이다 */
+type FrameEvent = Extract<ClientEvent, { event: 'frame' }>;
+
 interface Conn {
   ws: WebSocket;
   info: SessionInfo;
@@ -239,13 +321,28 @@ interface Conn {
   onFrame: ((frame: number, mesh?: MeshDataResult) => void) | null;
   onEngineMessage: ((message: string) => void) | null;
   /**
-   * 소켓이 OPEN이 아니라 버려진 이벤트 수.
+   * 소켓이 OPEN이 아니라 **안 보낸** 이벤트 수.
    *
-   * 지금은 진단용이다. **#9가 흐름 제어(latest-wins)를 넣는 자리가 정확히
-   * 여기**이고, 그때 "안 보낸 것"과 "버린 것"을 같은 카운터로 셀 수 있게
-   * 미리 자리를 잡아 둔다.
+   * #8이 남긴 자리다. 그때 주석은 #9의 "버린 것"을 같은 카운터로 셀 수 있게
+   * 해 뒀다고 적었지만, 막상 넣어 보니 **갈라야 했다** — 이유는
+   * ConnectionInfo.unsentEvents 주석에.
    */
-  droppedEvents: number;
+  unsentEvents: number;
+  /**
+   * 백프레셔로 붙잡아 둔 **가장 최신** frame 이벤트 (#9). latest-wins의 저장소다.
+   *
+   * 큐가 아니라 칸 하나인 것이 이 설계의 전부다. 큐면 밀린 것이 결국 다
+   * 나가므로 메모리도 지연도 안 줄어든다 — 실측 사고(재개하면 밀린 1133건이
+   * 한꺼번에 온다)가 정확히 그 모양이다. 칸 하나면 늦은 프레임은 도착하지
+   * 않고 **최신 것만** 도착한다.
+   *
+   * **연결보다 오래 살면 안 된다.** #detach가 반드시 비운다 — 리스너를 떼기
+   * 직전에 큐에 들어온 이벤트가 여기 얹힐 수 있고, 그러면 닫힌 소켓의 conn에
+   * 48KB짜리 메시가 매달린 채 남는다.
+   */
+  pendingFrame: FrameEvent | null;
+  /** latest-wins로 **버린** 프레임 수. 보류 프레임이 더 새 것에 밀려날 때마다 증가 */
+  droppedFrames: number;
   /** 마지막 ping에 pong이 왔는가 */
   responsive: boolean;
   killTimer: NodeJS.Timeout | null;
@@ -304,6 +401,8 @@ function refuse(
 export class SessionManager {
   #opts: SessionManagerOptions;
   #path: string;
+  /** 프레임 보류 임계값 (#9). 생성 시 한 번 정규화해 둔다 */
+  #frameHighWater: number;
   #attached: Server | null = null;
 
   /** open() ~ shutdown() 사이에만 존재한다. null이면 업그레이드를 받지 않는다 */
@@ -318,6 +417,16 @@ export class SessionManager {
   constructor(opts: SessionManagerOptions = {}) {
     this.#opts = opts;
     this.#path = opts.path ?? '/ws';
+    // 0은 유효한 값이라 `??`로는 못 거른다. 음수·NaN만 기본값으로 되돌린다.
+    const hw = opts.frameHighWaterMark;
+    this.#frameHighWater = typeof hw === 'number' && Number.isFinite(hw) && hw >= 0
+      ? hw
+      : DEFAULT_FRAME_HIGH_WATER;
+  }
+
+  /** 프레임 보류가 시작되는 `ws.bufferedAmount` 임계값(바이트) (#9) */
+  get frameHighWaterMark(): number {
+    return this.#frameHighWater;
   }
 
   /** WS 엔드포인트 경로 */
@@ -335,9 +444,21 @@ export class SessionManager {
     return this.#pool?.stats ?? { idle: 0, busy: 0, total: 0 };
   }
 
-  /** 현재 붙어 있는 연결들. `stats.busy`와 어긋나면 어딘가 새고 있다는 뜻이다 */
-  get connections(): SessionInfo[] {
-    return [...this.#conns.values()].map((c) => ({ ...c.info }));
+  /**
+   * 현재 붙어 있는 연결들. `stats.busy`와 어긋나면 어딘가 새고 있다는 뜻이다.
+   *
+   * 흐름 제어 카운터(#9)도 여기 실린다 — 새 엔드포인트를 늘리지 않은 이유는
+   * 읽는 쪽이 이미 여기를 보고 있어서다(ConnectionInfo 주석). **연결이 살아
+   * 있는 동안만** 읽을 수 있다. 닫힌 뒤의 최종값은 #detach의 종료 로그에 남는다.
+   */
+  get connections(): ConnectionInfo[] {
+    return [...this.#conns.values()].map((c) => ({
+      ...c.info,
+      droppedFrames: c.droppedFrames,
+      unsentEvents: c.unsentEvents,
+      pendingFrame: c.pendingFrame !== null,
+      bufferedBytes: c.ws.bufferedAmount,
+    }));
   }
 
   #log(line: string): void {
@@ -600,7 +721,9 @@ export class SessionManager {
       killTimer: null,
       onFrame: null,
       onEngineMessage: null,
-      droppedEvents: 0,
+      unsentEvents: 0,
+      pendingFrame: null,
+      droppedFrames: 0,
       bridge: new SessionBridge({
         target: request && worker
           ? { request: (op, payload) => request.call(worker, op, payload) }
@@ -689,6 +812,12 @@ export class SessionManager {
       conn.session.off('engineMessage', conn.onEngineMessage);
       conn.onEngineMessage = null;
     }
+    // ★ #9의 짝. 리스너를 떼기 **직전에** 큐에 들어온 프레임이 방금 위에서
+    //   보류 칸에 얹혔을 수 있다. 안 비우면 닫힌 소켓의 conn에 48KB짜리 메시가
+    //   매달린 채 남고, 뒤늦게 도착하는 ws.send 콜백이 그걸 다시 보내려 든다
+    //   (#send가 readyState로 막지만, 막힌다는 사실에 기대는 것과 애초에
+    //   보낼 것이 없는 것은 다르다).
+    conn.pendingFrame = null;
     // 아직 응답을 기다리는 요청이 있어도 여기서 버린다. 소켓이 이미 닫혔으므로
     // 보낼 곳이 없고, 워커는 곧 반납·종료된다.
     conn.bridge.close();
@@ -723,7 +852,11 @@ export class SessionManager {
       + `${lifeMs}ms, 사용 중 ${this.stats.busy}개`
       // 닫는 중에 도착한 이벤트다. 몇 건은 정상이지만 수백 건이면 워커가
       // 아직 시뮬을 돌리고 있다는 뜻이라 반납 경로를 의심할 근거가 된다.
-      + (conn.droppedEvents > 0 ? `, 못 보낸 이벤트 ${conn.droppedEvents}건` : ''),
+      + (conn.unsentEvents > 0 ? `, 못 보낸 이벤트 ${conn.unsentEvents}건` : '')
+      // 이쪽은 뜻이 다르다 — 클라이언트가 1.9MB/s를 못 받아냈다는 신호다.
+      // 연결이 닫힌 뒤 이 값을 읽을 수 있는 곳은 여기뿐이다(connections는
+      // 이미 이 conn을 지웠다).
+      + (conn.droppedFrames > 0 ? `, 백프레셔로 버린 프레임 ${conn.droppedFrames}건` : ''),
     );
   }
 
@@ -814,11 +947,32 @@ export class SessionManager {
    * #emit을 거쳐 여기로 온다. 여기서 예외가 새면 그 자리가 처리되지 않은
    * Promise 거부가 되어 게이트웨이 프로세스가 통째로 죽는다 — 세션 하나의
    * 소켓이 방금 닫혔다는 이유로.
+   *
+   * 콜백을 다는 이유 (#9): `ws.send(data, cb)`의 cb는 **그 바이트가 소켓을
+   * 빠져나갔을 때** 불린다. 즉 이게 우리가 가질 수 있는 유일한 drain 신호다.
+   * `ws`의 WebSocket은 'drain' 이벤트를 내지 않고, 내부 `_socket`을 들여다보는
+   * 것은 사설 API다. 타이머로 폴링하는 방법도 있지만 연결마다 상시 도는
+   * 인터벌이 생기고, 드레인이 실제로 가능해진 시점보다 항상 늦다.
+   *
+   * **응답에도 똑같이 단다.** 프레임에만 달면 구멍이 생긴다 — 버퍼가
+   * meshData 응답(~48KB) 때문에 임계값을 넘은 순간에는 미완료 프레임 전송이
+   * 하나도 없을 수 있고, 그러면 보류된 프레임을 깨울 콜백이 영영 안 온다.
+   * 소켓에 쓰는 지점이 여기 하나뿐이므로, 여기에 달면 그 구멍이 닫힌다.
    */
   #send(conn: Conn, msg: ClientOutbound): void {
     if (conn.ws.readyState !== WebSocket.OPEN) return;
     try {
-      conn.ws.send(JSON.stringify(msg));
+      conn.ws.send(JSON.stringify(msg), (err?: Error) => {
+        // 이 콜백은 ws 내부(소켓 write 완료 경로)에서 불린다. 여기서 예외가
+        // 새면 잡아 줄 프레임이 없어 프로세스가 죽는다 — 이 함수가 "던지지
+        // 않는다"고 약속한 범위 안이다.
+        try {
+          // 에러면 소켓이 닫히는 중이다. 보류 프레임은 #detach가 비운다.
+          if (!err) this.#drainFrame(conn);
+        } catch {
+          // 무시. 드레인 실패는 프레임 한 장을 못 보내는 것뿐이다.
+        }
+      });
     } catch (err: unknown) {
       this.#log(`[warn] 세션 ${conn.info.id} 전송 실패: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -832,16 +986,78 @@ export class SessionManager {
    * 정상이다 — 소켓이 닫히는 중인데 워커가 아직 프레임을 밀고 있는 상황은
    * 매 세션 종료마다 생긴다. 그래서 로그가 아니라 카운터로 센다.
    *
-   * ★ **#9는 이 함수만 고치면 된다.** `ws.bufferedAmount`를 보고 프레임을
-   *   버리는 latest-wins가 들어갈 자리가 여기다. 지금은 아무 제한이 없다:
-   *   구독 중이면 세션당 약 1.9MB/s가 그대로 `ws.send`로 들어가고, 클라이언트가
-   *   느리면 그만큼 ws 내부 버퍼에 쌓인다.
+   * ── 흐름 제어 (#9) ─────────────────────────────────────────
+   *
+   * `ws.bufferedAmount`가 임계값을 넘으면 프레임을 **보류 칸 하나**에 얹고
+   * 돌아간다. 다음 프레임이 오면 보류된 것을 버리고 그것으로 덮어쓴다
+   * (latest-wins). 버퍼가 빠지면 그 순간의 최신 것 하나가 나간다.
+   *
+   * **frame과 engineMessage를 가른다.** 둘 다 40/s로 오지만 크기가
+   * 1600배 다르다 — 프레임 47.8KB(구독 중), 엔진 메시지 ~30B. 실측 사고의
+   * 121MB는 전부 프레임이고, 엔진 메시지는 같은 30초에 36KB다. 하트비트가
+   * 최대 60초 안에 죽은 연결을 걷어가므로 이쪽의 최악은 72KB로 묶인다.
+   * 즉 **버려서 아끼는 것이 없고, 버리면 진단이 통째로 사라진다** — 엔진
+   * 메시지는 시뮬이 어디까지 갔는지 말해 주는 유일한 채널이고, 하필 문제가
+   * 생긴 느린 세션에서 그게 비어 있으면 사후에 볼 것이 없다. 그래서 통과시킨다.
+   *
+   * 프레임 쪽은 반대다. 브라우저는 **최신 한 장**만 그리면 되므로(#13의
+   * rAF 갱신), 중간 프레임은 도착해도 그리지 않고 버려진다. 그걸 소켓까지
+   * 실어 보내는 건 지연과 메모리만 늘린다.
    */
   #emit(conn: Conn, ev: ClientEvent): void {
     if (conn.ws.readyState !== WebSocket.OPEN) {
-      conn.droppedEvents += 1;
+      conn.unsentEvents += 1;
       return;
     }
+
+    // 엔진 메시지는 흐름 제어를 지나지 않는다 (위 주석).
+    if (ev.event !== 'frame') {
+      this.#send(conn, ev);
+      return;
+    }
+
+    if (conn.ws.bufferedAmount > this.#frameHighWater) {
+      // 밀려나는 프레임은 클라이언트가 영영 못 보는 프레임이다. 그래서 센다.
+      if (conn.pendingFrame !== null) conn.droppedFrames += 1;
+      conn.pendingFrame = ev;
+      return;
+    }
+
+    // 여유가 생겼는데 보류 중인 것이 있다면, 그건 **지금 온 이것보다 낡았다.**
+    // 낡은 것을 먼저 흘려보내면 latest-wins가 아니라 그냥 1프레임 지연 큐가 된다.
+    if (conn.pendingFrame !== null) {
+      conn.pendingFrame = null;
+      conn.droppedFrames += 1;
+    }
     this.#send(conn, ev);
+  }
+
+  /**
+   * 보류된 프레임을 내보낸다 (#9). `#send`의 완료 콜백에서만 불린다.
+   *
+   * **이 경로가 없으면 통과 기준이 안 선다.** 임계값을 넘겨 보류만 하고
+   * 끝내면 "느려진 뒤 마지막 프레임"이 영영 안 간다 — 시뮬이 멈추거나
+   * 클라이언트가 잠깐 느렸다 회복한 경우, 화면이 옛 프레임에서 굳는다.
+   * 버려도 되는 것은 중간 프레임이지 **최신 프레임이 아니다.**
+   *
+   * 버퍼가 아직 임계값 위면 아무것도 하지 않는다. 지금 이 콜백을 낸 전송
+   * 뒤에 다른 전송이 더 쌓여 있다는 뜻이고, 그것들의 콜백이 이어서 온다 —
+   * 그중 하나가 임계값 아래에서 깨어난다. 타이머가 필요 없는 이유가 이것이다.
+   */
+  #drainFrame(conn: Conn): void {
+    const pending = conn.pendingFrame;
+    if (pending === null) return;
+    if (conn.ws.readyState !== WebSocket.OPEN) {
+      // 닫히는 중. #detach가 곧 비우지만, 여기서도 붙잡고 있을 이유가 없다.
+      conn.pendingFrame = null;
+      conn.unsentEvents += 1;
+      return;
+    }
+    if (conn.ws.bufferedAmount > this.#frameHighWater) return;
+
+    // ★ 보내기 **전에** 칸을 비운다. #send가 다시 콜백을 걸고, 그 콜백이
+    //   여기로 돌아오기 때문이다 — 비우지 않으면 같은 프레임을 두 번 보낸다.
+    conn.pendingFrame = null;
+    this.#send(conn, pending);
   }
 }

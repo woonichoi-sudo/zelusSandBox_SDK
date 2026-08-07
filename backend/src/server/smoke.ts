@@ -850,6 +850,31 @@ class TracingPool implements SessionSource {
   }
 }
 
+/**
+ * 실측 크기(약 48KB)의 가짜 프레임 메시 (#9).
+ *
+ * 크기가 이 테스트의 **재현 장치**다. `{event:"frame",frame:1}` 같은 30바이트
+ * 프레임을 아무리 몰아쳐도 소켓 쓰기가 동기로 끝나 `ws.bufferedAmount`가
+ * 0에서 안 올라간다 — 임계값을 0으로 낮춰도 흐름 제어가 발화하지 않는다.
+ * 구독 중 실제 프레임이 47.8KB라는 실측치를 그대로 흉내 내면, 버스트 하나가
+ * Node의 쓰기 큐에 남아 버퍼가 실제로 찬다.
+ *
+ * 내용은 게이트웨이가 들여다보지 않으므로(중계는 mesh를 손대지 않는다,
+ * §7-12) 채우는 문자가 무엇인지는 상관없다. 길이만 맞춘다.
+ */
+function bulkyMesh(bytes = 48 * 1024): MeshDataResult {
+  const positions = 'A'.repeat(Math.max(4, Math.floor(bytes / 4) * 4));
+  return {
+    patterns: [{ uuid: 'bulk', vertices: 0, triangles: 0, positionStride: 12, positions }],
+    topology: false,
+  };
+}
+
+/** 도착한 frame 이벤트의 번호만, 도착 순서대로 */
+function frameNos(inbox: Inbox): number[] {
+  return inbox.of('frame').map((e) => Number(e['frame']));
+}
+
 async function main(): Promise<void> {
   console.log('\n=== 게이트웨이 서버 스모크 테스트 ===');
 
@@ -3491,6 +3516,306 @@ async function main(): Promise<void> {
       b.close();
       check('B 종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
     }, { sessions: { createPool: () => fake, heartbeatIntervalMs: 0 } });
+  }
+
+  // ── §9. 백프레셔 latest-wins ──────────────────────────
+  // 통과 기준은 단언 **둘**이고, 둘이 함께 서야만 의미가 있다:
+  //   ① 중간 프레임이 드롭된다  — 전부 도착하면 흐름 제어가 발화하지 않은 것
+  //   ② 최신 프레임이 도착한다  — 드롭만 하면 그냥 막은 것이지 latest-wins가 아니다
+  // 하나씩 떼어 놓으면 각각을 자명하게 통과시키는 잘못된 구현이 있다
+  // (아무것도 안 보내기 / 전부 보내기). 그래서 아래 세 섹션 전부 짝으로 단언한다.
+  //
+  // 재현을 **가짜 세션(9-1·9-2)과 실제 워커(9-3)로 둘 다** 한다. 이유가 갈린다:
+  //   - 가짜: `frameHighWaterMark: 0`으로 파이프라인 깊이를 1로 만들면 드롭이
+  //     확정적으로 난다. 보낸 수·도착 수·버린 수가 정수로 맞아떨어져 회계까지
+  //     단언할 수 있다 — 실제 워커로는 프레임 수가 매번 달라 불가능하다.
+  //   - 실제: 가짜만 쓰면 "우리가 세운 임계값 앞에서 우리가 만든 이벤트가
+  //     멈춘다"만 확인한 것이다. 이 단위가 막으려던 사고는 **실제 1.9MB/s가
+  //     안 읽는 소켓에 쌓이는 것**이었으므로, 그 흐름 자체로 한 번 봐야 한다.
+  section('9-1. 느린 소비자 → 중간 드롭 + 최신 도착 (가짜 세션, 통과 기준)');
+  {
+    const pool = new ReusingPool();
+    const N = 40;
+
+    await withScenes(async (gw, addr) => {
+      const r = await connect(wsUrlOf(addr));
+      const ws = r.ws;
+      if (!ws) {
+        check('연결 성립', false, `status=${String(r.status)}`);
+        return;
+      }
+      const inbox = new Inbox(ws);
+      const session = pool.session;
+
+      check(
+        '임계값 0으로 열렸다 (보낸 것이 소켓을 빠져나가기 전엔 다음을 안 쓴다)',
+        gw.sessions.frameHighWaterMark === 0,
+        `frameHighWaterMark=${gw.sessions.frameHighWaterMark}`,
+      );
+
+      // 프레임 N건을 **동기 루프**로 몰아넣는다. 소비자는 그 사이 한 바이트도
+      // 읽지 못한다(이벤트 루프가 이 루프에 잡혀 있다) — 이것이 "느린 소비자"다.
+      // engineMessage를 사이사이 끼우는 건 정책이 갈렸는지 같이 보기 위해서다.
+      const mesh = bulkyMesh();
+      for (let i = 1; i <= N; i++) {
+        session.emit('frame', i, mesh);
+        session.emit('engineMessage', `m${i}`);
+      }
+
+      // 버스트 직후 = 드레인이 한 번도 안 돈 순간. 여기서 이미 버려져 있어야 한다.
+      const mid = gw.sessions.connections[0];
+      check(
+        '버스트 직후 이미 드롭이 났고 보류 칸이 차 있다',
+        (mid?.droppedFrames ?? 0) > 0 && mid?.pendingFrame === true,
+        `droppedFrames=${String(mid?.droppedFrames)}, pendingFrame=${String(mid?.pendingFrame)}, bufferedBytes=${String(mid?.bufferedBytes)}`,
+      );
+
+      const arrived = await until(() => frameNos(inbox).includes(N), 8_000);
+      // 최신 프레임 뒤에 뒤늦게 오는 것이 있으면 회계가 틀어진다. 확인차 더 기다린다.
+      await new Promise((res) => setTimeout(res, 200));
+
+      const got = frameNos(inbox);
+      const conn = gw.sessions.connections[0];
+      const dropped = conn?.droppedFrames ?? -1;
+
+      check(
+        `★ ① 중간 프레임이 드롭된다 (${N}건을 밀었는데 전부 도착하지 않는다)`,
+        dropped > 0 && got.length < N,
+        `도착 ${got.length}/${N}건, droppedFrames=${dropped}, 도착 번호=[${got.join(',')}]`,
+      );
+      check(
+        '★ ② 최신 프레임이 도착한다 (마지막에 밀어 넣은 것이 마지막으로 온다)',
+        arrived && got[got.length - 1] === N,
+        `마지막 도착=${String(got[got.length - 1])}, 기대=${N}`,
+      );
+      // ★ 이 회계가 ①·②를 한꺼번에 조인다. 도착도 아니고 드롭도 아닌 프레임이
+      //   있으면(= 조용히 사라졌으면) 여기서만 드러난다. 소켓이 열려 있으므로
+      //   unsentEvents로 새는 경로도 없어야 한다.
+      check(
+        '★ 회계가 맞는다: 도착 + 버림 = 보낸 수, 그리고 안 보낸 것은 없다',
+        got.length + dropped === N && conn?.unsentEvents === 0,
+        `${got.length} + ${dropped} = ${got.length + dropped} (기대 ${N}), unsentEvents=${String(conn?.unsentEvents)}`,
+      );
+      check(
+        '보류 칸은 큐가 아니다 — 도착한 프레임 번호가 역행하지 않는다',
+        got.every((v, i) => i === 0 || v > (got[i - 1] as number)),
+        `[${got.join(',')}]`,
+      );
+      check(
+        '★ engineMessage는 드롭 대상이 아니다 (같은 버스트에서 전부 도착)',
+        inbox.of('engineMessage').length === N,
+        `${inbox.of('engineMessage').length}/${N}건`,
+      );
+      check(
+        '드레인이 끝나면 보류 칸이 빈다 (48KB짜리가 매달려 남지 않는다)',
+        conn?.pendingFrame === false,
+        `pendingFrame=${String(conn?.pendingFrame)}`,
+      );
+
+      // 흐름이 멎었다가 회복되면 다시 정상으로 흐른다 — 한 번 드롭이 났다고
+      // 그 연결이 영영 절름발이가 되면 안 된다.
+      const afterBurst = frameNos(inbox).length;
+      const droppedBefore = dropped;
+      session.emit('frame', 999, mesh);
+      await until(() => frameNos(inbox).length > afterBurst, 4_000);
+      check(
+        '회복 후의 프레임은 그냥 통과한다 (드롭이 눌러앉지 않는다)',
+        frameNos(inbox).at(-1) === 999
+        && (gw.sessions.connections[0]?.droppedFrames ?? -1) === droppedBefore,
+        `마지막=${String(frameNos(inbox).at(-1))}, droppedFrames=${String(gw.sessions.connections[0]?.droppedFrames)} (버스트 직후 ${droppedBefore})`,
+      );
+
+      ws.close();
+      check('종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+    }, { sessions: { createPool: () => pool, frameHighWaterMark: 0, heartbeatIntervalMs: 0 } });
+  }
+
+  // ── §9-2. 대조군 ──────────────────────────────────────
+  // 9-1의 ①은 "드롭이 났다"인데, 드롭이 **언제나** 나는 구현이면 그 단언은
+  // 아무것도 안 지킨다. 그래서 반대쪽을 두 방향으로 고정한다:
+  //   A. 소비자가 제때 읽으면 (운영 기본 임계값) 한 건도 안 버린다
+  //   B. 같은 버스트라도 임계값이 충분히 크면 한 건도 안 버린다
+  // B가 특히 중요하다 — 9-1에서 프레임이 사라진 원인이 "버스트"나 "가짜
+  // 세션"이 아니라 **임계값을 넘긴 것**임을 이것만이 가른다.
+  section('9-2. 대조군 — 안 버려야 할 때는 안 버린다');
+  {
+    const pool = new ReusingPool();
+    const M = 10;
+    await withScenes(async (gw, addr) => {
+      const r = await connect(wsUrlOf(addr));
+      const ws = r.ws;
+      if (!ws) {
+        check('연결 성립', false, `status=${String(r.status)}`);
+        return;
+      }
+      const inbox = new Inbox(ws);
+      const mesh = bulkyMesh();
+
+      check(
+        '운영 기본값으로 열렸다 (임계값 > 0)',
+        gw.sessions.frameHighWaterMark > 0,
+        `frameHighWaterMark=${gw.sessions.frameHighWaterMark}`,
+      );
+
+      // 한 건씩, 도착을 확인하고 다음을 보낸다 = 밀리지 않는 클라이언트.
+      for (let i = 1; i <= M; i++) {
+        pool.session.emit('frame', i, mesh);
+        await until(() => frameNos(inbox).length >= i, 4_000);
+      }
+      const conn = gw.sessions.connections[0];
+      check(
+        '★ A. 제때 읽는 클라이언트에서는 한 건도 버려지지 않는다',
+        conn?.droppedFrames === 0 && frameNos(inbox).length === M,
+        `도착 ${frameNos(inbox).length}/${M}건, droppedFrames=${String(conn?.droppedFrames)}`,
+      );
+      check(
+        '건강한 흐름에서 보류 칸이 비어 있다 (정상 지터에 반응하지 않는다)',
+        conn?.pendingFrame === false,
+        `pendingFrame=${String(conn?.pendingFrame)}, bufferedBytes=${String(conn?.bufferedBytes)}`,
+      );
+
+      ws.close();
+      check('종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+    }, { sessions: { createPool: () => pool, heartbeatIntervalMs: 0 } });
+  }
+  {
+    const pool = new ReusingPool();
+    const N = 40;
+    await withScenes(async (gw, addr) => {
+      const r = await connect(wsUrlOf(addr));
+      const ws = r.ws;
+      if (!ws) {
+        check('연결 성립', false, `status=${String(r.status)}`);
+        return;
+      }
+      const inbox = new Inbox(ws);
+      const mesh = bulkyMesh();
+      for (let i = 1; i <= N; i++) pool.session.emit('frame', i, mesh);
+
+      const all = await until(() => frameNos(inbox).length >= N, 8_000);
+      check(
+        '★ B. 임계값이 충분히 크면 같은 버스트가 한 건도 안 버려진다',
+        all && (gw.sessions.connections[0]?.droppedFrames ?? -1) === 0,
+        `도착 ${frameNos(inbox).length}/${N}건, droppedFrames=${String(gw.sessions.connections[0]?.droppedFrames)}`,
+      );
+      check(
+        '순서도 그대로다 (1..N)',
+        frameNos(inbox).every((v, i) => v === i + 1),
+        `첫 5건=[${frameNos(inbox).slice(0, 5).join(',')}], 마지막=${String(frameNos(inbox).at(-1))}`,
+      );
+
+      ws.close();
+      check('종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+    }, { sessions: { createPool: () => pool, frameHighWaterMark: 64 * 1024 * 1024, heartbeatIntervalMs: 0 } });
+  }
+
+  // ── §9-3. 진짜 느린 소비자 ────────────────────────────
+  // 여기서만 확인되는 것: **실제 1.9MB/s**가 실제로 막히는가. 클라이언트
+  // 소켓을 pause()하면 TCP 수신 창이 닫히고, 커널 버퍼가 찬 뒤부터
+  // `ws.bufferedAmount`가 오른다 — 실측 사고(30초에 RSS +121MB)와 같은 모양의
+  // 상황을 재현한 것이다. 이 섹션이 운영 기본 임계값을 쓰는 이유가 그것이다.
+  //
+  // 대신 여기서는 회계를 못 단언한다(워커가 몇 프레임을 냈는지 모른다).
+  // 그 몫은 9-1이 진다. 여기서 세우는 건 방향뿐이다: 드롭이 나는가, 재개하면
+  // 최신이 오는가, engineMessage는 살아남는가.
+  section('9-3. 진짜 느린 소비자 (실제 워커, 소켓 읽기를 멈춘다)');
+  {
+    const traced = new TracingPool(new SessionPool({
+      exePath: defaultWorkerExe(),
+      idleTimeout: 0,
+      maxTotal: 1,
+      onLog: () => {},
+    }));
+
+    await withScenes(async (gw, addr) => {
+      if (!existsSync(SAMPLE_ZLS)) {
+        check('sample.zls 존재 — 실제 흐름 재현에는 진짜 씬이 필요하다', false, SAMPLE_ZLS);
+        return;
+      }
+      const sceneId = await plantScene(gw.scenes);
+
+      const r = await connect(wsUrlOf(addr));
+      const ws = r.ws;
+      strayPids.push(...traced.pids);
+      if (!ws) {
+        check('연결 성립', false, `status=${String(r.status)}, error=${String(r.error)}`);
+        return;
+      }
+      const pid = traced.pids[0];
+      const inbox = new Inbox(ws);
+
+      const loaded = await inbox.send({ op: 'load', scene: sceneId });
+      check('load(sample.zls) 성공', loaded?.['ok'] === true, JSON.stringify(loaded).slice(0, 120));
+      check('start 성공', (await inbox.send({ op: 'start' }))?.['ok'] === true);
+      check(
+        'subscribe 성공 (프레임당 약 48KB가 흐르기 시작한다)',
+        (await inbox.send({ op: 'subscribe' }))?.['ok'] === true,
+      );
+
+      const flowing = await until(
+        () => inbox.events.filter((e) => e['event'] === 'frame' && 'mesh' in e).length >= 3,
+        8_000,
+      );
+      check('메시가 실린 프레임이 흐른다 (재현의 전제)', flowing, `${inbox.of('frame').length}건`);
+
+      // ── 소비자가 읽기를 멈춘다 ──────────────────────────
+      const maxBefore = Math.max(0, ...frameNos(inbox));
+      const framesBefore = frameNos(inbox).length;
+      ws.pause();
+
+      const fired = await until(
+        () => (gw.sessions.connections[0]?.droppedFrames ?? 0) > 0,
+        8_000,
+      );
+      check(
+        '★ ① 실제 흐름에서도 소켓을 안 읽으면 프레임이 버려진다',
+        fired,
+        `droppedFrames=${String(gw.sessions.connections[0]?.droppedFrames)}`,
+      );
+
+      // 버려지기 시작한 뒤에도 계속 안 읽는다. 큐라면 여기서 무한히 자란다.
+      await new Promise((res) => setTimeout(res, 800));
+      const paused = gw.sessions.connections[0];
+      const bufKB = Math.round((paused?.bufferedBytes ?? 0) / 1024);
+      check(
+        '★ 안 읽는 동안 소켓 버퍼가 무한히 자라지 않는다 (칸 하나, 큐가 아니다)',
+        (paused?.bufferedBytes ?? Number.POSITIVE_INFINITY) < 1024 * 1024,
+        `bufferedAmount=${bufKB}KB — 흐름을 그대로 쌓았다면 초당 1.9MB였다`,
+      );
+      note(
+        '일시정지 구간 요약',
+        `droppedFrames=${String(paused?.droppedFrames)}, pendingFrame=${String(paused?.pendingFrame)}, unsentEvents=${String(paused?.unsentEvents)}`,
+      );
+
+      // ── 다시 읽기 시작한다 ──────────────────────────────
+      ws.resume();
+      const advanced = await until(() => Math.max(0, ...frameNos(inbox)) > maxBefore, 8_000);
+      const got = frameNos(inbox);
+      check(
+        '★ ② 재개하면 최신 프레임이 도착한다 (옛 화면에서 굳지 않는다)',
+        advanced,
+        `멈추기 전 최대 ${maxBefore} → 재개 후 최대 ${Math.max(0, ...got)}`,
+      );
+      // 밀린 것을 전부 토해내면 latest-wins가 아니라 그냥 지연 큐다.
+      // 워커가 낸 프레임 수는 모르지만, engineMessage가 그 대용이다 —
+      // 같은 주기로 나오는데 버리지 않기 때문이다.
+      const engineMsgs = inbox.of('engineMessage').length;
+      check(
+        '★ ③ 프레임은 버려졌는데 engineMessage는 살아남았다 (진단이 사라지지 않는다)',
+        engineMsgs > got.length,
+        `engineMessage ${engineMsgs}건 vs frame ${got.length}건 (멈추기 전 frame ${framesBefore}건)`,
+      );
+      const gaps = got.filter((v, i) => i > 0 && v - (got[i - 1] as number) > 1).length;
+      note('도착한 프레임 번호의 구멍', `${gaps}곳 — 마지막 8건=[${got.slice(-8).join(',')}]`);
+
+      ws.close();
+      check('구독 중 종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+      check(
+        '워커 프로세스도 사라진다 (백프레셔가 걸린 채 닫았어도)',
+        pid !== undefined && await until(async () => !(await pidAlive(pid))),
+        `pid=${String(pid)}`,
+      );
+    }, { sessions: { createPool: () => traced, heartbeatIntervalMs: 0 } });
   }
 
   // ── 7-7. 좀비 최종 확인 ───────────────────────────────
