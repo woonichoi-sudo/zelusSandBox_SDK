@@ -61,9 +61,11 @@
   </head>
   <body>
     <!--
-      #12 = 3D 뷰. 옷이 **정지 상태로** 보이는 데까지다.
-      프레임 스트리밍은 #13, 재생 컨트롤은 #14, 2D 펼침은 #15, 파라미터는 #16.
-      여기에 그것들을 미리 넣지 말 것 — 각 단위가 자기 화면으로 판정된다.
+      #13 = 프레임 스트리밍. 옷이 **움직이는** 데까지다.
+      여기 있는 재생 버튼은 시뮬을 켜기 위한 **최소 트리거**일 뿐이다 —
+      제대로 된 재생 컨트롤(타임라인·프레임 스크럽)은 #14, 2D 펼침은 #15,
+      파라미터는 #16. 여기에 그것들을 미리 넣지 말 것 — 각 단위가 자기 화면으로
+      판정되는데, 버튼이 늘수록 무엇 때문에 실패했는지가 흐려진다.
     -->
     <canvas id="view"></canvas>
 
@@ -73,7 +75,10 @@
       <button id="load" disabled>로드</button>
       <input id="file" type="file" accept=".zls" />
       <button id="upload" disabled>업로드</button>
+      <!-- #13 의 최소 트리거. subscribe + start / pause 토글 하나뿐이다. -->
+      <button id="play" disabled>▶ 재생</button>
       <span class="spacer"></span>
+      <span id="frames" class="stat">-</span>
       <span id="stat" class="stat">-</span>
       <span id="status">시작하는 중…</span>
     </div>

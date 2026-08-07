@@ -46,6 +46,18 @@ export class Viewer3D {
   /** 렌더 루프가 실제로 몇 번 돌았는지. "화면이 멈춘 건가" 를 구분한다 */
   #renders = 0;
 
+  /**
+   * 렌더 직전에 부를 콜백들 (#13 의 프레임 드레인이 여기 붙는다).
+   *
+   * 이 훅이 있는 이유는 **이 파일이 프로토콜을 모르게 두기 위해서다.** 프레임
+   * 갱신을 여기서 직접 하려면 `FrameStream` → `decodePatterns` → `protocol/`
+   * 을 끌어와야 하고, 그러면 머리말의 "렌더링과 통신을 갈라 둔다"가 깨진다.
+   * 뷰어가 제공하는 것은 **rAF 박자 하나**이고, 그 박자에 무엇을 얹을지는
+   * 배선하는 쪽(`main.ts`)이 정한다.
+   */
+  readonly #beforeRender = new Set<() => void>();
+  #lastTickError: Error | null = null;
+
   constructor(opts: Viewer3DOptions) {
     this.#canvas = opts.canvas;
 
@@ -104,6 +116,25 @@ export class Viewer3D {
 
   get camera(): THREE.PerspectiveCamera {
     return this.#camera;
+  }
+
+  /**
+   * rAF 박자에 콜백을 얹는다. 돌려주는 함수를 부르면 뗀다.
+   *
+   * 콜백이 던져도 렌더는 계속된다 — 프레임 갱신 하나가 실패했다고 조작까지
+   * 멎으면 원인을 화면에서 확인할 수조차 없다. 대신 삼키지 않고
+   * `lastTickError` 에 남긴다.
+   */
+  onBeforeRender(fn: () => void): () => void {
+    this.#beforeRender.add(fn);
+    return (): void => {
+      this.#beforeRender.delete(fn);
+    };
+  }
+
+  /** 마지막으로 rAF 콜백이 던진 예외. 정상이면 null */
+  get lastTickError(): Error | null {
+    return this.#lastTickError;
   }
 
   get controls(): OrbitControls {
@@ -185,7 +216,16 @@ export class Viewer3D {
     this.#running = true;
     const tick = (): void => {
       if (!this.#running) return;
+      // 다음 프레임을 **먼저** 예약한다. 아래에서 무엇이 던지든 루프가 끊기지
+      // 않는다 — 화면이 통째로 멎는 것이 가장 진단하기 어려운 실패다.
       this.#raf = requestAnimationFrame(tick);
+      for (const fn of this.#beforeRender) {
+        try {
+          fn();
+        } catch (err: unknown) {
+          this.#lastTickError = err instanceof Error ? err : new Error(String(err));
+        }
+      }
       // damping 이 켜져 있으면 update() 를 매 프레임 불러야 관성이 돈다.
       this.#controls.update();
       this.#renderer.render(this.#scene, this.#camera);

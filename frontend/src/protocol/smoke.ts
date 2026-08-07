@@ -14,6 +14,7 @@
  *   - 개발 프록시 — 뚫리면 #12 이후 전부가 원인 모를 1006/파싱오류가 된다 (§5)
  *   - SPA 폴백   — 뚫리면 fetch가 JSON 대신 HTML을 받아 진짜 원인이 묻힌다 (§6)
  *   - 3D 지오메트리 — 뚫리면 증상이 전부 "화면이 비었다" 하나로 수렴한다 (§8)
+ *   - 프레임 스트리밍 — 뚫리면 "시뮬은 도는데 옷이 안 움직인다" (§8-5~§8-7)
  *
  * 프로토콜 계층은 DOM을 쓰지 않으므로(`WebSocket`/`JSON`/`setTimeout`뿐) Node에서
  * 그대로 돈다. `main.ts`는 DOM을 쓰므로 **여기서 import하지 않는다.**
@@ -57,6 +58,12 @@ import {
   type GatewayOptions,
 } from '../../../backend/src/server/index.ts';
 import { ClothObject } from '../viewer3d/cloth.ts';
+import {
+  FrameStream,
+  type DrainOutcome,
+  type PositionSink,
+  type TopologyMismatch,
+} from '../viewer3d/frameStream.ts';
 import { showScene } from '../viewer3d/loader.ts';
 import type { Viewer3D } from '../viewer3d/viewer.ts';
 
@@ -1746,6 +1753,418 @@ function sectionClothFrames(): void {
   cloth.clear();
 }
 
+// ─────────────────────────────────────────────────────────────
+// §8-5 ~ §8-7. 프레임 스트리밍 (#13)
+//
+// #13의 통과 기준은 "옷이 움직인다" 하나이고 verify는 manual이다. 사람이
+// 화면에서 볼 수 있는 것은 **움직인다/안 움직인다** 둘뿐인데, "안 움직인다"에
+// 도달하는 경로는 최소 여섯이고 화면에서는 전부 똑같이 보인다:
+//
+//   ① 구독이 안 켜졌다      → frame은 오는데 mesh가 없다 (번호만 오른다)
+//   ② 칸이 큐가 됐다        → 화면이 3초 전 옷을 그린다 (움직이긴 한다)
+//   ③ 최신이 아니라 옛것을 푼다 → 위와 같은 증상, 원인이 다르다
+//   ④ drain이 던졌다        → rAF가 통째로 멎어 조작까지 죽는다
+//   ⑤ updatePositions가 false → 화면이 얼어붙는데 프레임 번호는 계속 오른다
+//   ⑥ version이 안 오른다   → 좌표는 바뀌었는데 GPU에 안 올라간다
+//
+// 아래 셋이 이 여섯을 전부 화면 없이 가른다. 사람에게 남기는 판정은
+// **"three가 그린 픽셀이 실제로 바뀌는가"** 하나뿐이다 — WebGL 컨텍스트가
+// 있어야만 확인되는, 여기서 원리적으로 못 덮는 마지막 한 칸이다.
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * frame 이벤트의 mesh 를 만든다.
+ *
+ * ⚠️ **positions만 싣는다.** 실제 워커의 frame 이벤트가 그렇다 — indices·uvs는
+ *    프레임 간 고정이라 서버가 보내지 않는다. 여기서 실어 버리면 테스트가
+ *    실제와 다른 모양을 검증하게 되고, "frame만으로는 토폴로지를 복구할 수
+ *    없다"는 #13의 전제 자체가 무너진다.
+ */
+function frameMeshOf(patterns: readonly DecodedPattern[]): FrameMesh {
+  return {
+    topology: false,
+    patterns: patterns.map((p) => ({
+      uuid: p.uuid,
+      vertices: p.vertices,
+      triangles: p.triangles,
+      positions: bytesToBase64(
+        new Uint8Array(p.positions.buffer, p.positions.byteOffset, p.positions.byteLength),
+      ),
+    })),
+  };
+}
+
+/** seed 하나로 프레임 mesh 하나. positions[0] === seed × 1000 이라 눈으로 구분된다 */
+function frameAt(seed: number): FrameMesh {
+  return frameMeshOf([synthPattern('p0', 6, 4, seed), synthPattern('p1', 5, 3, seed)]);
+}
+
+/**
+ * three 없이 `PositionSink` 를 만족하는 대역.
+ *
+ * 진짜 `ClothObject` 로는 못 보는 것이 둘 있어서 필요하다: (a) `updatePositions`
+ * 가 **몇 번, 무엇으로** 불렸는지, (b) `false` 를 **원할 때** 돌려주는 것.
+ * 진짜 옷으로 (b)를 만들려면 토폴로지를 어긋내야 하는데, 그러면 "불일치를
+ * 만드는 방법"이 단언에 섞여 들어와 검증하려는 것이 흐려진다.
+ */
+function recordingSink(patternCount = 2): {
+  sink: PositionSink;
+  calls: DecodedPattern[][];
+  reject: () => void;
+  allow: () => void;
+} {
+  const calls: DecodedPattern[][] = [];
+  let accept = true;
+  const sink: PositionSink = {
+    updatePositions(patterns: readonly DecodedPattern[]): boolean {
+      calls.push([...patterns]);
+      return accept;
+    },
+    get patternCount(): number {
+      return patternCount;
+    },
+  };
+  return { sink, calls, reject: () => { accept = false; }, allow: () => { accept = true; } };
+}
+
+/** 주입 가능한 시계. fps를 결정적으로 잰다 */
+function fakeClock(): { now: () => number; advance: (ms: number) => void } {
+  let t = 0;
+  return { now: () => t, advance: (msec: number) => { t += msec; } };
+}
+
+/** 배열 앞 n개를 읽기 좋게 */
+function head3(a: Float32Array): string {
+  return `[${Array.from(a.slice(0, 3)).map((v) => v.toFixed(3)).join(', ')}]`;
+}
+
+function sectionFrameStreamQueue(): void {
+  section('§8-5. 프레임 스트림 — 최신-only 큐 (frameStream.ts, three 없이)');
+
+  // ── 구독 전: mesh 키 자체가 없는 frame 이벤트 ────────────────
+  {
+    const stream = new FrameStream();
+    const rec = recordingSink();
+    stream.push({ frame: 1 });
+    stream.push({ frame: 2 });
+    const out = stream.drain(rec.sink);
+    check(
+      'mesh 없는 frame 이벤트는 칸에 얹히지 않는다 (구독 전에는 번호만 온다)',
+      out.status === 'idle' && rec.calls.length === 0 && !stream.hasPending,
+      `${out.status}, sink ${rec.calls.length}회`,
+    );
+    check(
+      '★ received는 오르는데 withMesh가 0 = "구독이 안 켜졌다"의 유일한 신호',
+      stream.stats.received === 2 && stream.stats.withMesh === 0,
+      `received ${stream.stats.received}, withMesh ${stream.stats.withMesh}`,
+    );
+  }
+
+  // ── 최신-only. 이 단위에서 가장 중요한 한 가지 ───────────────
+  {
+    const stream = new FrameStream();
+    const rec = recordingSink();
+    for (const f of [10, 11, 12]) stream.push({ frame: f, mesh: frameAt(f) });
+
+    check(
+      '세 프레임이 몰려도 칸에는 하나뿐이다 (큐를 두면 지연이 무한히 쌓인다)',
+      stream.hasPending && stream.stats.dropped === 2,
+      `dropped ${stream.stats.dropped}`,
+    );
+
+    const out = stream.drain(rec.sink);
+    const got = rec.calls[0]?.[0]?.positions[0];
+    check(
+      '★ 드레인이 푸는 것은 가장 최신 프레임이다 (옛것을 풀면 화면이 뒤처진다)',
+      out.status === 'applied' && out.frame === 12 && got === 12_000,
+      `frame ${out.frame}, positions[0]=${got} (10→10000 / 12→12000)`,
+    );
+    check(
+      '드레인 한 번은 sink를 한 번만 부른다 (칸이 큐가 아니다)',
+      rec.calls.length === 1, `${rec.calls.length}회`,
+    );
+    check(
+      '★ 대조군 — 드레인 뒤에 또 드레인하면 아무 일도 없다',
+      stream.drain(rec.sink).status === 'idle' && rec.calls.length === 1,
+      `sink ${rec.calls.length}회`,
+    );
+  }
+
+  // ── 번호는 건너뛴다. 역행하지는 않는다 ───────────────────────
+  {
+    const stream = new FrameStream();
+    const rec = recordingSink();
+    // 게이트웨이(#9)의 칸도 하나라 37 다음이 41일 수 있다. 이건 정상이다.
+    stream.push({ frame: 37, mesh: frameAt(37) });
+    check('건너뛴 번호는 정상이다 (게이트웨이가 이미 버렸다)',
+      stream.drain(rec.sink).status === 'applied');
+    stream.push({ frame: 41, mesh: frameAt(41) });
+    check('번호가 건너뛰어도 그대로 적용된다',
+      stream.drain(rec.sink).frame === 41 && stream.stats.outOfOrder === 0);
+
+    // 반대로 역행은 프로토콜이 깨졌다는 신호다.
+    stream.push({ frame: 50, mesh: frameAt(50) });
+    stream.push({ frame: 49, mesh: frameAt(49) });
+    const out = stream.drain(rec.sink);
+    const got = rec.calls[2]?.[0]?.positions[0];
+    check(
+      '★ 역행하는 번호는 최신을 밀어내지 않고 버려진다',
+      out.frame === 50 && got === 50_000 && stream.stats.outOfOrder === 1,
+      `frame ${out.frame}, positions[0]=${got}, outOfOrder ${stream.stats.outOfOrder}`,
+    );
+  }
+
+  // ── 깨진 프레임 하나가 흐름을 죽이지 않는다 ──────────────────
+  {
+    const stream = new FrameStream();
+    const rec = recordingSink();
+    // vertices 6인데 positions는 3개 float — decodePattern이 던진다.
+    const broken: FrameMesh = {
+      topology: false,
+      patterns: [{ uuid: 'p0', vertices: 6, triangles: 4, positions: f32Base64([1, 2, 3]) }],
+    };
+    stream.push({ frame: 1, mesh: broken });
+
+    let threw = false;
+    let out: DrainOutcome = { status: 'idle', frame: null };
+    try {
+      out = stream.drain(rec.sink);
+    } catch {
+      threw = true;
+    }
+    check(
+      '★ drain은 절대 던지지 않는다 (rAF 안에서 던지면 화면 갱신이 통째로 멎는다)',
+      !threw, threw ? '던졌다' : '-',
+    );
+    check('깨진 프레임은 error로 나오고 sink에 닿지 않는다',
+      out.status === 'error' && rec.calls.length === 0 && stream.lastError !== null,
+      `${out.status}, lastError=${stream.lastError?.message ?? 'null'}`);
+    check(
+      '★ 깨진 프레임이 칸에 눌러앉지 않는다 (남으면 같은 실패가 영원히 반복된다)',
+      !stream.hasPending,
+    );
+
+    stream.push({ frame: 2, mesh: frameAt(2) });
+    check('깨진 프레임 뒤에도 다음 프레임은 적용된다 (한 프레임만 버린다)',
+      stream.drain(rec.sink).status === 'applied' && rec.calls.length === 1);
+    check('디코딩 실패로는 멈추지 않는다 (토폴로지 불일치와 다른 사건이다)',
+      !stream.stalled && stream.stats.failed === 1, `failed ${stream.stats.failed}`);
+  }
+
+  // ── 토폴로지 불일치 → 정지 → 복구 ───────────────────────────
+  {
+    const seen: TopologyMismatch[] = [];
+    const stream = new FrameStream({ onMismatch: (i) => seen.push(i) });
+    // 화면에는 5패턴이 서 있는데 프레임은 2패턴짜리다.
+    const rec = recordingSink(5);
+    rec.reject();
+
+    stream.push({ frame: 1, mesh: frameAt(1) });
+    const out = stream.drain(rec.sink);
+    check(
+      '★ updatePositions가 false면 멈춘다 (삼키면 "시뮬은 도는데 옷이 안 움직인다"가 된다)',
+      out.status === 'mismatch' && stream.stalled,
+      `${out.status}, stalled=${stream.stalled}`,
+    );
+    check('무엇과 무엇이 어긋났는지 위로 알린다 (main.ts가 이걸 받아 재로드한다)',
+      seen[0]?.frame === 1 && seen[0]?.incoming === 2 && seen[0]?.current === 5,
+      JSON.stringify(seen[0] ?? null));
+
+    stream.push({ frame: 2, mesh: frameAt(2) });
+    stream.push({ frame: 3, mesh: frameAt(3) });
+    const out2 = stream.drain(rec.sink);
+    check('정지 중에는 디코딩도 하지 않고 버린다',
+      out2.status === 'stalled' && rec.calls.length === 1, `${out2.status}, sink ${rec.calls.length}회`);
+    check(
+      '★ onMismatch는 정지당 한 번뿐이다 (매 프레임 부르면 103MB 재로드가 40/s로 쏟아진다)',
+      seen.length === 1, `${seen.length}회`,
+    );
+
+    rec.allow();
+    stream.push({ frame: 4, mesh: frameAt(4) });
+    stream.resume();
+    check(
+      '★ resume()이 정지를 풀고 칸도 비운다 (옛 토폴로지 프레임이 남으면 복구하자마자 또 멈춘다)',
+      !stream.stalled && !stream.hasPending,
+      `stalled=${stream.stalled}, pending=${stream.hasPending}`,
+    );
+    stream.push({ frame: 5, mesh: frameAt(5) });
+    check('복구 뒤 프레임이 다시 흐른다', stream.drain(rec.sink).status === 'applied');
+
+    rec.reject();
+    stream.push({ frame: 6, mesh: frameAt(6) });
+    stream.drain(rec.sink);
+    check('정지가 풀린 뒤 다시 어긋나면 다시 한 번 알린다 (한 번뿐 ≠ 영영 한 번)',
+      seen.length === 2, `${seen.length}회`);
+  }
+
+  // ── 콜백이 던져도 rAF는 산다 ────────────────────────────────
+  {
+    const stream = new FrameStream({
+      onMismatch: () => { throw new Error('콜백 폭발'); },
+    });
+    const rec = recordingSink(9);
+    rec.reject();
+    stream.push({ frame: 1, mesh: frameAt(1) });
+    let threw = false;
+    try {
+      stream.drain(rec.sink);
+    } catch {
+      threw = true;
+    }
+    check(
+      '★ onMismatch가 던져도 drain은 던지지 않는다 (rAF가 멎지 않는다)',
+      !threw && stream.lastError?.message === '콜백 폭발',
+      threw ? '던졌다' : `lastError=${stream.lastError?.message ?? 'null'}`,
+    );
+  }
+
+  // ── fps: 주입한 시계로 결정적으로 ───────────────────────────
+  {
+    const clock = fakeClock();
+    const stream = new FrameStream({ now: clock.now, fpsWindow: 30 });
+    const rec = recordingSink();
+    check('★ 대조군 — 프레임이 없으면 fps는 0이다', stream.stats.fps === 0, String(stream.stats.fps));
+
+    // 25ms 간격 11회 적용 → 10구간 / 250ms = 40fps
+    for (let i = 0; i < 11; i++) {
+      stream.push({ frame: i, mesh: frameAt(i) });
+      stream.drain(rec.sink);
+      clock.advance(25);
+    }
+    check(
+      '★ fps는 받은 수가 아니라 적용된 수로 잰다 (25ms 간격 11회 → 40fps)',
+      Math.abs(stream.stats.fps - 40) < 0.01, stream.stats.fps.toFixed(2),
+    );
+    clock.advance(1_500);
+    check(
+      '★ 멈추면 fps가 0으로 내려간다 (옛 값이 남으면 "도는 중"으로 오독한다)',
+      stream.stats.fps === 0, stream.stats.fps.toFixed(2),
+    );
+
+    stream.reset();
+    const s = stream.stats;
+    check('reset()이 누적 카운터를 0으로 되돌린다',
+      s.received === 0 && s.applied === 0 && s.dropped === 0 && s.lastApplied === null,
+      JSON.stringify(s));
+  }
+}
+
+// ── §8-6. 스트림 → 진짜 three 버퍼 ────────────────────────────
+//
+// §8-5가 흐름 제어를 봤다면 여기는 **그 흐름이 GPU로 가는 마지막 한 칸**이다.
+// 가짜 sink로는 볼 수 없는 셋이 여기서만 나온다: 좌표가 실제로 바뀌는가,
+// `version` 이 오르는가(= GPU 업로드가 예약되는가), 그리고 **지오메트리가 다시
+// 만들어지지 않는가.** 셋째가 특히 중요하다 — 매 프레임 `setTopology()` 를
+// 부르는 구현도 화면상으로는 똑같이 "움직이는 옷"이라 눈으로는 절대 못 잡는다.
+
+function sectionFrameStreamCloth(): void {
+  section('§8-6. 프레임 스트림 → 진짜 three 버퍼 (frameStream + cloth)');
+
+  const cloth = new ClothObject();
+  cloth.setTopology([synthPattern('p0', 6, 4, 1), synthPattern('p1', 5, 3, 1)]);
+  const p0 = cloth.patterns[0];
+  const p1 = cloth.patterns[1];
+  if (!p0 || !p1) {
+    check('패턴 둘이 섰다', false);
+    return;
+  }
+
+  // 프레임이 흐르기 전의 기준선. 아래 단언이 전부 이것과 비교된다.
+  const attr0 = p0.position;
+  const geo0 = p0.geometry;
+  const v0 = attr0.version;
+  const x0 = (attr0.array as Float32Array)[0];
+  const children0 = cloth.group.children.length;
+
+  const stream = new FrameStream();
+
+  // ── 대조군 둘. 이게 없으면 아래 단언들은 "우연히 통과"와 구분되지 않는다 ──
+  const idle = stream.drain(cloth);
+  check(
+    '★ 대조군 ① — 프레임이 없으면 드레인해도 좌표도 version도 그대로다',
+    idle.status === 'idle' && attr0.version === v0 && (attr0.array as Float32Array)[0] === x0,
+    `${idle.status}, version ${attr0.version}, x ${(attr0.array as Float32Array)[0]}`,
+  );
+
+  const next = [synthPattern('p0', 6, 4, 7), synthPattern('p1', 5, 3, 7)];
+  stream.push({ frame: 100, mesh: frameMeshOf(next) });
+  check(
+    '★ 대조군 ② — push만 하고 드레인하지 않으면 화면은 그대로다 (디코딩은 drain에서만)',
+    stream.hasPending && attr0.version === v0 && (attr0.array as Float32Array)[0] === x0,
+    `version ${attr0.version}, x ${(attr0.array as Float32Array)[0]}`,
+  );
+
+  // ── 정상 경로 ───────────────────────────────────────────────
+  const out = stream.drain(cloth);
+  check('드레인이 프레임을 적용했다', out.status === 'applied' && out.frame === 100,
+    `${out.status}, frame ${out.frame}`);
+  check(
+    '★ 정점 좌표가 실제로 바뀐다 (= "옷이 움직인다"에서 자동화할 수 있는 전부)',
+    (attr0.array as Float32Array)[0] === next[0]?.positions[0]
+      && (attr0.array as Float32Array)[0] !== x0,
+    `${x0} → ${(attr0.array as Float32Array)[0]}`,
+  );
+  check(
+    '★ GPU 업로드가 예약됐다 (needsUpdate는 setter 전용 — version 증가로 본다)',
+    attr0.version > v0, `${v0} → ${attr0.version}`,
+  );
+  check(
+    '★ 지오메트리를 다시 만들지 않는다 (매 프레임 setTopology면 GPU 버퍼를 매번 새로 판다)',
+    cloth.patterns[0]?.position === attr0 && cloth.patterns[0]?.geometry === geo0
+      && cloth.group.children.length === children0,
+    `attr 동일=${cloth.patterns[0]?.position === attr0}, geo 동일=${cloth.patterns[0]?.geometry === geo0}, children ${cloth.group.children.length}`,
+  );
+  check(
+    '두 번째 패턴도 같이 갱신된다 (절반만 움직이는 옷이 되면 안 된다)',
+    (p1.position.array as Float32Array)[0] === next[1]?.positions[0],
+    `${(p1.position.array as Float32Array)[0]}`,
+  );
+
+  // ── 몰아친 프레임: 화면에는 마지막 하나만, 업로드도 한 번만 ──
+  const vBefore = attr0.version;
+  for (const seed of [8, 9, 10]) {
+    stream.push({ frame: 100 + seed, mesh: frameAt(seed) });
+  }
+  stream.drain(cloth);
+  check(
+    '★ 세 프레임이 몰려도 화면에는 마지막 것만 서고 업로드도 한 번뿐이다',
+    (attr0.array as Float32Array)[0] === 10_000 && attr0.version === vBefore + 1,
+    `x ${(attr0.array as Float32Array)[0]}, version ${vBefore} → ${attr0.version}`,
+  );
+
+  // ── 토폴로지 불일치 → main.ts의 복구 경로 그대로 ────────────
+  const seen: TopologyMismatch[] = [];
+  const stream2 = new FrameStream({ onMismatch: (i) => seen.push(i) });
+  const xNow = (attr0.array as Float32Array)[0];
+  const vNow = attr0.version;
+  // 패턴 1개짜리 프레임 — 다른 씬이 열렸거나 재연결로 워커가 바뀐 상황이다.
+  stream2.push({ frame: 200, mesh: frameMeshOf([synthPattern('p0', 6, 4, 11)]) });
+  const bad = stream2.drain(cloth);
+  check(
+    '★ 어긋난 프레임은 화면을 건드리지 않는다 (절반만 갱신된 옷은 원인을 눈으로 못 찾는다)',
+    bad.status === 'mismatch' && (attr0.array as Float32Array)[0] === xNow
+      && attr0.version === vNow,
+    `${bad.status}, x ${(attr0.array as Float32Array)[0]}, version ${attr0.version}`,
+  );
+  check('불일치 내용이 진짜 옷의 패턴 수로 보고된다',
+    seen[0]?.incoming === 1 && seen[0]?.current === 2, JSON.stringify(seen[0] ?? null));
+
+  // main.ts가 하는 일 그대로: 토폴로지를 다시 세우고 resume().
+  cloth.setTopology([synthPattern('p0', 6, 4, 12)]);
+  stream2.resume();
+  stream2.push({ frame: 201, mesh: frameMeshOf([synthPattern('p0', 6, 4, 13)]) });
+  const fixed = stream2.drain(cloth);
+  check(
+    '★ 토폴로지를 다시 세우고 resume()하면 프레임이 다시 흐른다 (main.ts의 복구 경로)',
+    fixed.status === 'applied' && !stream2.stalled
+      && (cloth.patterns[0]?.position.array as Float32Array | undefined)?.[0] === 13_000,
+    `${fixed.status}, x ${(cloth.patterns[0]?.position.array as Float32Array | undefined)?.[0]}`,
+  );
+
+  cloth.clear();
+}
+
 // ── §8-3. 실제 워커 바이트 → 화면에 설 지오메트리 ──────────────
 //
 // §7이 "바이트가 디코딩된다"까지 봤다면 여기는 그 다음 한 칸이다:
@@ -1908,6 +2327,131 @@ async function sectionReconnectReload(): Promise<void> {
   }
 }
 
+// ── §8-7. 실제 워커 프레임 → 옷이 실제로 움직인다 ──────────────
+//
+// §8-5·§8-6은 합성 좌표를 넣고 그 좌표가 나오는지 봤다. 그것만으로는
+// **자기충족**이다 — "내가 넣은 값이 나온다"는 시뮬레이션이 실제로 옷을
+// 움직인다는 것도, 워커의 프레임 mesh가 우리가 만든 모양과 같다는 것도
+// 증명하지 않는다. 여기서는 진짜 워커를 띄우고, 진짜 물리 프레임을
+// main.ts와 **똑같은 배선**(핸들러는 push만 / rAF 대역이 drain)으로 흘린다.
+// 사람이 브라우저에서 보게 될 것과 다른 점은 WebGL 컨텍스트 하나뿐이다.
+
+async function sectionRealFrames(): Promise<void> {
+  section('§8-7. 프레임 스트리밍 종단 — 실제 워커 프레임으로 옷이 움직인다');
+
+  if (!existsSync(EXE) || !existsSync(ZLS)) {
+    note('생략', `exe=${existsSync(EXE)}, zls=${existsSync(ZLS)}`);
+    return;
+  }
+
+  await withGateway(async (_gw, addr) => {
+    const scene = await findOrUploadScene(addr.url);
+    if (!scene) {
+      check('씬 준비', false, 'sample.zls를 준비하지 못했다');
+      return;
+    }
+
+    const client = new GatewayClient({ url: addr.url, requestTimeoutMs: 60_000 });
+    const { viewer, cloth } = stubViewer();
+    const stream = new FrameStream();
+    // ★ main.ts의 배선 그대로 — 핸들러는 얹기만 한다.
+    client.on('frame', (ev) => stream.push(ev));
+
+    try {
+      await client.connect();
+      await showScene(client, viewer, scene.id);
+
+      const p0 = cloth.patterns[0];
+      if (!p0) {
+        check('실제 씬이 섰다', false);
+        return;
+      }
+      const attr0 = p0.position;
+      const geo0 = p0.geometry;
+      const v0 = attr0.version;
+      const children0 = cloth.group.children.length;
+      // 로드 직후의 정지 드레이프. 시뮬이 돌면 여기서 벗어나야 한다.
+      const atLoad = (attr0.array as Float32Array).slice(0, 3);
+
+      // subscribe를 start보다 **먼저**. 반대면 그 사이 프레임이 mesh 없이 지나간다.
+      await client.subscribe();
+      await client.start();
+
+      // rAF 대역. 브라우저처럼 **주기적으로 한 번씩만** 드레인한다 —
+      // 도착할 때마다 푸는 구현이면 아래 dropped가 0이 되어 최신-only의
+      // 의미가 사라진다.
+      let applied = 0;
+      let firstApplied: Float32Array | null = null;
+      const t0 = Date.now();
+      while (applied < 10 && Date.now() - t0 < 30_000) {
+        if (stream.drain(cloth).status === 'applied') {
+          applied += 1;
+          if (!firstApplied) firstApplied = (attr0.array as Float32Array).slice(0, 3);
+        }
+        await sleep(16);
+      }
+      await client.pause();
+      await client.unsubscribe();
+
+      const s = stream.stats;
+      const now3 = (attr0.array as Float32Array).slice(0, 3);
+      const moved = (a: Float32Array, b: Float32Array): boolean =>
+        Array.from(a).some((v, i) => Math.abs(v - (b[i] ?? 0)) > 1e-4);
+
+      check('★ 실제 워커 프레임이 옷에 붙는다', applied >= 10,
+        `적용 ${applied} / 수신 ${s.received}`);
+      check(
+        '★ 구독이 켜져 있었다 (received와 withMesh가 갈라지면 구독이 안 켜진 것이다)',
+        s.withMesh === s.received && s.withMesh > 0, `${s.withMesh}/${s.received}`,
+      );
+      check(
+        '★ 실제 정점이 실제로 움직였다 (합성 데이터의 자기충족이 아니다)',
+        moved(now3, atLoad), `${head3(atLoad)} → ${head3(now3)}`,
+      );
+      check(
+        '★ 프레임 사이에도 계속 움직인다 (한 번 튀고 멎는 것이 아니다)',
+        firstApplied !== null && moved(now3, firstApplied),
+        firstApplied === null ? '적용된 프레임이 없다' : `${head3(firstApplied)} → ${head3(now3)}`,
+      );
+      check(
+        '★ version이 적용 횟수만큼 올랐다 (GPU 업로드가 프레임마다 예약된다)',
+        attr0.version === v0 + s.applied, `${v0} → ${attr0.version} (적용 ${s.applied})`,
+      );
+      check(
+        '★ 지오메트리를 한 번도 다시 만들지 않았다 (같은 BufferAttribute를 끝까지 쓴다)',
+        cloth.patterns[0]?.position === attr0 && cloth.patterns[0]?.geometry === geo0
+          && cloth.group.children.length === children0,
+        `attr 동일=${cloth.patterns[0]?.position === attr0}, children ${cloth.group.children.length}`,
+      );
+      check(
+        '실제 좌표가 갱신 뒤에도 전부 유한하다 (NaN 하나면 경계상자가 통째로 깨진다)',
+        cloth.patterns.every((p) =>
+          Array.from(p.position.array as Float32Array).every((v) => Number.isFinite(v))),
+      );
+      check(
+        '종단에서 디코딩 실패도 역행도 정지도 없었다',
+        s.failed === 0 && s.outOfOrder === 0 && s.mismatched === 0 && !s.stalled,
+        `failed ${s.failed}, outOfOrder ${s.outOfOrder}, mismatched ${s.mismatched}, stalled ${s.stalled}`,
+      );
+      note('실측', `수신 ${s.received} / 적용 ${s.applied} / 버림 ${s.dropped}, ${s.fps.toFixed(1)}fps, 마지막 프레임 ${s.lastApplied}`);
+
+      // 정지 뒤에는 흐르는 것이 없어야 한다 — 워커는 maxFrame이 바뀔 때만 낸다.
+      const afterPause = s.received;
+      await sleep(300);
+      check(
+        '정지하면 프레임이 더 오지 않는다 (구독을 켜 둔 채 정지해도 0바이트다)',
+        stream.stats.received === afterPause,
+        `${afterPause} → ${stream.stats.received}`,
+      );
+    } catch (err: unknown) {
+      check('프레임 스트리밍 종단', false, messageOf(err));
+    } finally {
+      cloth.clear();
+      await client.close().catch(() => {});
+    }
+  }, { sessions: { idleTimeout: 0, requestTimeoutMs: 60_000 } });
+}
+
 // ─────────────────────────────────────────────────────────────
 // §9. 좀비 프로세스
 // ─────────────────────────────────────────────────────────────
@@ -1963,8 +2507,11 @@ async function main(): Promise<void> {
   await sectionRealWorker();
   sectionClothTopology();
   sectionClothFrames();
+  sectionFrameStreamQueue();
+  sectionFrameStreamCloth();
   await sectionViewerRealScene();
   await sectionReconnectReload();
+  await sectionRealFrames();
   await sectionZombies();
 
   clearInterval(keepAlive);
