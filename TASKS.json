@@ -166,14 +166,14 @@
       "verify": "manual",
       "files": ["frontend/src/viewer3d/"],
       "depends": [11],
-      "status": "todo",
-      "commit": null
+      "status": "done",
+      "commit": "3543c27"
     },
     {
       "id": 13,
       "group": "frontend",
       "title": "프레임 스트리밍",
-      "detail": "구독한 프레임을 positionAttr에 덮어쓴다. 3,022정점 × 12B = 36KB/프레임, 25fps면 약 900KB/s.",
+      "detail": "구독한 프레임을 positionAttr에 덮어쓴다. 3,022정점 × 12B = 36KB/프레임, 25fps면 약 900KB/s. 12번이 3D 뷰를 세웠으므로 여기서 아는 사실: 얹힐 자리는 viewer.cloth.updatePositions(patterns) 하나다 — 지오메트리를 다시 만들지 말 것. setTopology()를 매 프레임 부르면 GPU 버퍼를 매번 새로 할당한다. position은 이미 DynamicDrawUsage이고 updatePositions()가 법선과 boundingSphere를 다시 계산한다. decodePatterns()를 frame 이벤트 핸들러 안에서 부르면 안 된다 — 40/s × 47.8KB다. 최신 mesh만 들고 있다가 rAF에서 푸는 구조여야 하고, main.ts에 세기만 하는 자리가 비어 있다. 검증할 때 needsUpdate로 단언하지 말 것 — three에서 setter 전용이라 읽으면 undefined다. 실제 신호는 BufferAttribute.version 증가다. cloth.ts와 loader.ts는 DOM을 안 써서 Node 스모크에서 그대로 돈다 — 갱신 로직을 cloth.ts에 두는 한 자동 테스트가 붙고, viewer.ts나 main.ts로 새어 나가는 순간 수동 확인만 남는다. 백프레셔는 아직 없다(9번) — 구독 중 1.82MB/s가 그대로 흐른다.",
       "test": "옷이 움직인다",
       "verify": "manual",
       "files": ["frontend/src/viewer3d/"],
