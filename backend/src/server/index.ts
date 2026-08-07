@@ -25,7 +25,7 @@ import path from 'node:path';
 
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
 
-import { createSceneRoutes, SceneStore } from './files.ts';
+import { createExportRoutes, createSceneRoutes, ExportStore, SceneStore } from './files.ts';
 import { SessionManager, type SessionsOptions } from './sessions.ts';
 
 /**
@@ -90,6 +90,19 @@ export interface GatewayOptions {
   /** 업로드 1건의 상한(바이트). 기본 DEFAULT_MAX_SCENE_BYTES (512MiB) */
   maxSceneBytes?: number;
   /**
+   * 익스포트 산출물을 둘 디렉토리 (#10). 기본은 `backend/data/exports`.
+   * 씬과 마찬가지로 회사 저장소 밖이어야 한다.
+   *
+   * **씬과 같은 디렉토리를 쓰지 않는다.** 두 저장소의 정리 정책이 정반대이기
+   * 때문이다 — 씬은 지우지 않고, 익스포트는 TTL로 지운다. 섞으면 익스포트
+   * 청소가 남의 씬을 밟는다.
+   */
+  exportDir?: string;
+  /** 산출물 수명(ms). 기본 DEFAULT_EXPORT_TTL_MS (30분) */
+  exportTtlMs?: number;
+  /** 연결 하나가 보유할 수 있는 산출물 수. 기본 DEFAULT_MAX_EXPORTS_PER_SESSION (4) */
+  maxExportsPerSession?: number;
+  /**
    * 프론트엔드 빌드 산출물(`frontend/dist`)을 서빙할 디렉토리 (#11).
    *
    * **기본값은 "끔"이다.** 켜져 있으면 404 catch-all이 SPA 폴백에 가려서,
@@ -122,6 +135,11 @@ export interface GatewayOptions {
  */
 export function defaultSceneDir(): string {
   return path.resolve(import.meta.dirname, '..', '..', 'data', 'scenes');
+}
+
+/** 기본 익스포트 디렉토리 = `<backend>/data/exports` (#10). 근거는 위와 같다 */
+export function defaultExportDir(): string {
+  return path.resolve(import.meta.dirname, '..', '..', 'data', 'exports');
 }
 
 /**
@@ -184,6 +202,7 @@ export class Gateway {
   /** 등록된 라우트 모듈이 돌려준 수명 훅. start()가 소비한다 */
   #routeHooks: RouteHooks[] = [];
   #scenes: SceneStore;
+  #exports: ExportStore;
   #sessions: SessionManager;
 
   constructor(opts: GatewayOptions = {}) {
@@ -191,6 +210,13 @@ export class Gateway {
     this.#scenes = new SceneStore({
       dir: opts.sceneDir ?? defaultSceneDir(),
       ...(opts.maxSceneBytes === undefined ? {} : { maxBytes: opts.maxSceneBytes }),
+    });
+    this.#exports = new ExportStore({
+      dir: opts.exportDir ?? defaultExportDir(),
+      ...(opts.exportTtlMs === undefined ? {} : { ttlMs: opts.exportTtlMs }),
+      ...(opts.maxExportsPerSession === undefined
+        ? {}
+        : { maxPerSession: opts.maxExportsPerSession }),
     });
     this.#app = express();
     this.#configure(this.#app);
@@ -203,6 +229,7 @@ export class Gateway {
     this.#sessions = new SessionManager({
       ...(opts.sessions ?? {}),
       scenes: this.#scenes,
+      exports: this.#exports,
       log: (line) => this.#log(line),
     });
     this.#sessions.attach(this.#http);
@@ -241,6 +268,16 @@ export class Gateway {
    */
   get scenes(): SceneStore {
     return this.#scenes;
+  }
+
+  /**
+   * 익스포트 산출물 저장소 (#10).
+   *
+   * 씬 저장소와 대칭이다 — 세션이 만든 파일의 경로를 아는 곳이 여기 하나뿐이고,
+   * 클라이언트는 id와 `/api/exports/<id>`만 본다.
+   */
+  get exports(): ExportStore {
+    return this.#exports;
   }
 
   /**
@@ -312,6 +349,7 @@ export class Gateway {
     //     await가 필요한 준비는 팩토리가 RouteHooks.prepare로 돌려주면
     //     start()가 리스닝 직전에 처리한다 — 생성자에서 await할 필요가 없다.
     use(createSceneRoutes(this.#scenes)); // #5 POST/GET /api/scenes
+    use(createExportRoutes(this.#exports)); // #10 GET /api/exports/:id
 
     // (b) 바깥에서 주입한 라우트. 내장 뒤, catch-all 앞.
     for (const register of this.#opts.routes ?? []) use(register);
@@ -487,6 +525,8 @@ export function createServer(opts: GatewayOptions = {}): Gateway {
 async function main(): Promise<void> {
   const port = Number(process.env['PORT'] ?? 3000);
   const maxSceneBytes = Number(process.env['MAX_SCENE_BYTES'] ?? Number.NaN);
+  const exportTtlMs = Number(process.env['EXPORT_TTL_MS'] ?? Number.NaN);
+  const maxExportsPerSession = Number(process.env['MAX_EXPORTS_PER_SESSION'] ?? Number.NaN);
   const maxSessions = Number(process.env['MAX_SESSIONS'] ?? Number.NaN);
   const idleTimeout = Number(process.env['SESSION_IDLE_TIMEOUT'] ?? Number.NaN);
   // 배포에서는 게이트웨이가 프론트 번들도 서빙한다 — 브라우저가 한 오리진만
@@ -505,6 +545,9 @@ async function main(): Promise<void> {
     staticDir,
     ...(process.env['SCENE_DIR'] ? { sceneDir: process.env['SCENE_DIR'] } : {}),
     ...(Number.isFinite(maxSceneBytes) ? { maxSceneBytes } : {}),
+    ...(process.env['EXPORT_DIR'] ? { exportDir: process.env['EXPORT_DIR'] } : {}),
+    ...(Number.isFinite(exportTtlMs) ? { exportTtlMs } : {}),
+    ...(Number.isFinite(maxExportsPerSession) ? { maxExportsPerSession } : {}),
     sessions: {
       // MAX_SESSIONS는 라이선스 인스턴스 수와 직결된다. 안 주면 무제한이므로
       // 운영에서는 반드시 지정할 것.
@@ -530,6 +573,10 @@ async function main(): Promise<void> {
   const { url } = await gateway.start();
   console.log(`health: ${url}/api/health`);
   console.log(`씬 디렉토리: ${gateway.scenes.dir} (상한 ${gateway.scenes.maxBytes} 바이트)`);
+  console.log(
+    `익스포트 디렉토리: ${gateway.exports.dir} `
+    + `(수명 ${Math.round(gateway.exports.ttlMs / 1000)}초, 세션당 ${gateway.exports.maxPerSession}개)`,
+  );
   console.log(
     staticDir
       ? `정적 루트: ${staticDir}${existsSync(staticDir) ? '' : ' (아직 없음 — frontend에서 npm run build)'}`

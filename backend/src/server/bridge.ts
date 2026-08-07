@@ -33,7 +33,7 @@
  */
 
 import type { MeshDataResult, Op } from '../sdk/protocol.ts';
-import type { SceneStore } from './files.ts';
+import { isExportFormat, type ExportFormat, type ExportStore, type SceneStore } from './files.ts';
 
 /**
  * 브리지가 워커에게 요구하는 표면 전부. SDK Worker가 그대로 만족한다.
@@ -95,8 +95,21 @@ interface Prepared {
   /**
    * 워커 결과 → 클라이언트 결과. 서버 경로처럼 되돌려주면 안 되는 것이
    * 결과에 섞이는 op에서 쓴다. 없으면 결과를 그대로 보낸다.
+   *
+   * **비동기를 허용한다** (#10). export는 워커가 "썼다"고 답한 뒤에 그 파일을
+   * 실제로 stat 해서 확인해야 하는데(protocol.cpp가 ExportGltf의 실패를
+   * 확인하지 않는다), 그게 디스크 I/O라 동기로는 할 수 없다. 여기서 `reject()`를
+   * 던지면 그 문구가 그대로 클라이언트에게 간다 — 그 밖의 예외는 뭉개진다.
    */
-  mapResult?: (result: unknown) => unknown;
+  mapResult?: (result: unknown) => unknown | Promise<unknown>;
+  /**
+   * 워커가 **실패**로 답했을 때 부른다 (#10). 부작용을 되돌리는 자리다.
+   *
+   * export만 쓴다. 실패한 익스포트는 반쯤 쓰인 수십 MB짜리 파일을 남길 수
+   * 있고, TTL 청소가 30분 뒤에 걷긴 하지만 실패를 아는 순간 지우는 편이 싸다.
+   * 던지면 안 된다 — 응답 경로 한가운데다.
+   */
+  onFailure?: () => void;
 }
 
 export interface BuildContext {
@@ -104,6 +117,30 @@ export interface BuildContext {
   scenes?: SceneStore | undefined;
   /** 연결 시 `?scene=`으로 지정된 씬. load의 **기본값**이다 (아래 buildLoad 주석) */
   sceneId: string | null;
+  /**
+   * 익스포트 산출물 저장소 (#10). 없으면 export를 받지 않는다.
+   * 씬 저장소와 같은 역할이다 — id ↔ 경로 변환의 유일한 소유자.
+   */
+  exports?: ExportStore | undefined;
+  /** 이 연결의 id. 산출물 사이드카에 남는다(진단용) */
+  sessionId?: string | undefined;
+
+  // ── 아래 둘은 **연결이 살아 있는 동안 변한다** ──────────────
+  // BuildContext는 원래 생성 시점의 스냅샷이었지만, #10에서 두 가지가
+  // "이 연결이 지금까지 무엇을 했는가"를 알아야 해졌다. 브리지가 인스턴스마다
+  // 하나씩 만들어 들고 있으므로 수명은 연결과 정확히 같다 — OPS 테이블을
+  // 모듈 수준에 두면서도 연결별 상태를 갖는 유일한 방법이다.
+
+  /**
+   * 마지막으로 **성공한** load의 씬 id. 익스포트 파일명을 여기서 짓는다.
+   * 초기값은 `?scene=`(sceneId)이며, 클라이언트가 다른 씬을 열면 따라간다.
+   */
+  loadedScene?: string | null;
+  /**
+   * 이 연결이 만든 익스포트 id들, 오래된 것부터. **세션당 상한을 여기서 센다.**
+   * 상한을 넘기면 앞에서부터 지운다 — 자기 것만 지우므로 다른 세션에 닿지 않는다.
+   */
+  ownExports?: string[];
 }
 
 type Build = (msg: Record<string, unknown>, ctx: BuildContext) => Prepared | Promise<Prepared>;
@@ -175,10 +212,14 @@ const buildLoad: Build = async (msg, ctx) => {
     payload: { path },
     // 워커는 `{ loaded, path }`를 돌려준다. path를 그대로 내보내면 서버
     // 절대경로가 클라이언트에 노출된다 — id로 바꿔 끼운다.
-    mapResult: (r) => ({
-      loaded: isRecord(r) ? r['loaded'] === true : true,
-      scene,
-    }),
+    mapResult: (r) => {
+      const loaded = isRecord(r) ? r['loaded'] === true : true;
+      // #10이 익스포트 파일명을 짓는 데 쓴다. **성공했을 때만** 갱신한다 —
+      // 실패한 load는 워커 안의 씬을 바꾸지 않으므로, 여기서 따라가면
+      // 다음 익스포트가 열리지도 않은 씬의 이름을 달게 된다.
+      if (loaded) ctx.loadedScene = scene;
+      return { loaded, scene };
+    },
   };
 };
 
@@ -216,6 +257,105 @@ const buildSetParams: Build = (msg) => {
     out[k] = v;
   }
   return { payload: { params: out } };
+};
+
+/**
+ * export: 클라이언트는 **형식만** 준다. 산출물 위치는 서버가 정한다 (#10).
+ *
+ *   { id, op: 'export' }                    → gltf
+ *   { id, op: 'export', format: 'zbin' }
+ *
+ * ── 왜 경로를 안 받는가 ─────────────────────────────────────
+ * load는 서버의 파일을 **읽고**, export는 **쓴다.** 경로를 받으면 임의 위치에
+ * 수십 MB를 쓰게 되고, 확장자를 바꿔 실행 파일이나 설정을 덮는 것까지 한 걸음이다.
+ * #5가 업로드에서, #7이 load에서 세운 결정("클라이언트 문자열은 경로가 되지
+ * 않는다")이 여기서 가장 중요해진다. 그래서 `path`가 오면 **조용히 무시하지 않고
+ * 거부한다** — 무시하면 클라이언트는 자기가 지정한 곳에 파일이 생겼다고 믿는다.
+ *
+ * ── 응답 ────────────────────────────────────────────────────
+ * 워커는 `{ path, format }`을 돌려준다(protocol.cpp:602,607). 그 path가 곧
+ * 서버 절대경로다. mapResult가 id와 다운로드 URL로 바꿔 끼우므로 밖으로
+ * 나가지 않는다 — load의 `{ loaded, path }`와 정확히 같은 처리다.
+ *
+ * 실패 문자열 쪽은 mapResult가 못 막는다(엔진이 만든다). 그건 redact가
+ * 훑는데, #10에서 익스포트 디렉토리를 그 그물에 **추가**했다 — 안 그러면
+ * 씬 경로만 지우고 방금 우리가 워커에 넘긴 산출물 경로는 그대로 나간다.
+ */
+const buildExport: Build = async (msg, ctx) => {
+  if ('path' in msg) {
+    reject('export는 path를 받지 않습니다. 산출물 위치는 서버가 정하고, 응답의 url로 내려받습니다');
+  }
+
+  const rawFormat = msg['format'];
+  if (rawFormat !== undefined && typeof rawFormat !== 'string') {
+    reject('format은 문자열이어야 합니다');
+  }
+  const format: unknown = rawFormat ?? 'gltf';
+  if (!isExportFormat(format)) {
+    reject(`알 수 없는 익스포트 형식: ${describe(format)} (gltf, zbin)`);
+  }
+
+  const store = ctx.exports;
+  if (!store) reject('익스포트 저장소가 없어 export를 받을 수 없습니다');
+
+  // 파일명은 열려 있는 씬에서 따온다. 없으면 저장소가 `export.gltf`로 떨어뜨린다.
+  // 이름을 **못 구하는 것이 실패가 아니다** — 헤더 값일 뿐이라 익스포트 자체를
+  // 막을 이유가 없다.
+  const sceneId = ctx.loadedScene ?? ctx.sceneId;
+  const sceneName = sceneId && ctx.scenes
+    ? (await ctx.scenes.get(sceneId).catch(() => null))?.name
+    : undefined;
+
+  const reserved = await store.allocate(format);
+  const own = (ctx.ownExports ??= []);
+  const sessionId = ctx.sessionId ?? '(알 수 없음)';
+
+  return {
+    // ★ 클라이언트가 준 것 중 여기 실리는 건 format 하나이고, 그것도
+    //   'gltf'|'zbin' 둘 중 하나로 좁혀진 뒤다. path는 서버가 만든 것이다.
+    payload: { path: reserved.path, format },
+
+    mapResult: async () => {
+      let record;
+      try {
+        // 워커가 ok라고 해도 파일이 없을 수 있다 — ExportStore.commit 주석 참고.
+        record = await store.commit(reserved.id, {
+          format,
+          sessionId,
+          sceneName,
+        });
+      } catch (err: unknown) {
+        await store.discard(reserved.id).catch(() => {});
+        // commit의 문구는 경로를 담지 않도록 쓰여 있으므로 그대로 전달한다.
+        reject(err instanceof Error ? err.message : '익스포트 결과를 확인하지 못했습니다');
+      }
+
+      // 세션당 상한. 넘치면 **자기 것 중 가장 오래된 것**을 지운다.
+      // commit 뒤에 세는 이유: 실패한 시도까지 세면 상한이 실제 보유량보다
+      // 빨리 차서, 멀쩡한 산출물이 실패 때문에 밀려난다.
+      own.push(record.id);
+      while (own.length > store.maxPerSession) {
+        const oldest = own.shift();
+        if (oldest) await store.discard(oldest).catch(() => {});
+      }
+
+      return {
+        id: record.id,
+        format: record.format,
+        bytes: record.bytes,
+        name: record.name,
+        createdAt: record.createdAt,
+        /** 상대 URL이다. 오리진은 클라이언트가 이미 알고 있고(ISSUE-002의
+         *  같은 오리진 구조), 서버가 자기 주소를 지어내면 프록시 뒤에서 틀린다. */
+        url: `/api/exports/${record.id}`,
+      };
+    },
+
+    // 워커가 실패로 답했다. 반쯤 쓰인 파일이 남았을 수 있다.
+    onFailure: () => {
+      void store.discard(reserved.id).catch(() => {});
+    },
+  };
 };
 
 const buildMeshData: Build = (msg) => {
@@ -278,18 +418,18 @@ const OPS: Record<Op, OpRule> = {
   subscribe: { allow: true },
   unsubscribe: { allow: true },
 
-  // ⛔ **서버 파일 쓰기.** load보다 위험하다 — 임의 위치에 파일을 만든다.
+  // ★ **서버 파일 쓰기.** 이 테이블에서 유일하게 디스크를 바꾸는 op이다.
   //
-  // 지금 여는 방법이 없어서가 아니라, 여는 데 필요한 결정이 전부 #10에
-  // 있어서 닫아 둔다: 산출물을 어디에 두는가, 어떻게 내려받는가, 언제
-  // 지우는가, 세션당 몇 개까지인가. 그 답 없이 "서버가 경로를 정하고
-  // 형식만 받는다"로 열면, 아무도 지우지 않고 아무도 못 받는 파일이
-  // 디스크에 쌓인다 — 기능은 0이고 디스크 고갈 경로만 생긴다.
-  // #10은 이 줄을 build 있는 줄로 바꾸기만 하면 된다.
-  export: {
-    allow: false,
-    reason: 'export는 아직 열려 있지 않습니다 (#10에서 다운로드와 함께 열립니다)',
-  },
+  // #7이 닫아 뒀던 이유는 "여는 방법이 없어서"가 아니라 여는 데 필요한 결정
+  // 네 가지가 전부 #10에 있어서였다. 그 답이 이제 붙어 있다:
+  //   - 산출물 위치 → 서버가 정한다. `ExportStore.allocate()`가 만든
+  //     `<익스포트 디렉토리>/<32자리 hex>.<ext>` 하나뿐이고, 클라이언트가 준
+  //     `path`는 **거부**된다(buildExport 첫 줄).
+  //   - 다운로드   → `GET /api/exports/:id` (files.ts). 응답의 url이 그 주소다.
+  //   - 정리       → 세션당 상한 + TTL 청소 + 실패 즉시 폐기. 근거는 files.ts 머리말.
+  //   - 세션당 개수 → `ExportStore.maxPerSession`(기본 4). 넘치면 **이 연결이 만든
+  //     것 중** 가장 오래된 것부터 지운다(ctx.ownExports).
+  export: { allow: true, build: buildExport },
 
   // ⛔ 세션 = 워커 프로세스 1개다. 클라이언트가 이걸 부르면 자기 세션을
   //    죽인다. 종료는 소켓을 닫는 것으로 충분하고, 그 경로는 게이트웨이가
@@ -336,19 +476,32 @@ function escapeRe(s: string): string {
  * 들어올지 우리가 정하지 못한다(예외 메시지에 파일 경로가 붙는 건 흔한 일이다).
  * 그래서 마지막에 한 번 훑는다 — 방어를 한 겹 더 두는 쪽이 싸다.
  *
+ * **#10에서 익스포트 디렉토리가 두 번째 대상으로 붙었다.** export는 우리가
+ * 만든 절대경로를 워커에 **넘기는** op이라, 실패 문구에 그 경로가 실릴 확률이
+ * load보다 높다. 씬 경로만 지우면 그물이 반쪽이 된다.
+ *
  * 구분자를 `[\\/]+`로 받는 이유: 우리는 `\`로 넘겼는데 예외 메시지가 `/`로
  * 되돌려주거나 이중 이스케이프되는 경우가 있다.
  */
-function makeRedactor(dir: string | undefined): (text: string) => string {
-  if (!dir) return (t) => t;
-  const body = dir.split(/[\\/]+/).filter(Boolean).map(escapeRe).join('[\\\\/]+');
-  const re = new RegExp(`${body}[\\\\/]*[^\\s"',)]*`, 'gi');
-  return (t) => t.replace(re, '<씬 저장소>');
+function makeRedactor(dirs: Array<[string | undefined, string]>): (text: string) => string {
+  const rules = dirs
+    .filter((d): d is [string, string] => typeof d[0] === 'string' && d[0].length > 0)
+    .map(([dir, label]) => {
+      const body = dir.split(/[\\/]+/).filter(Boolean).map(escapeRe).join('[\\\\/]+');
+      return [new RegExp(`${body}[\\\\/]*[^\\s"',)]*`, 'gi'), label] as const;
+    });
+  if (rules.length === 0) return (t) => t;
+  return (t) => rules.reduce((acc, [re, label]) => acc.replace(re, label), t);
 }
 
 // ── 브리지 ──────────────────────────────────────────────────
 
-export interface BridgeOptions extends BuildContext {
+/**
+ * `loadedScene`·`ownExports`를 빼는 이유: 그 둘은 **연결이 살아가며 브리지가
+ * 쌓는 상태**이지 밖에서 주는 설정이 아니다. 받을 수 있게 두면 "미리 채워
+ * 넣으면 되는 값"으로 읽힌다.
+ */
+export interface BridgeOptions extends Omit<BuildContext, 'loadedScene' | 'ownExports'> {
   /** 워커. null이면 중계를 지원하지 않는 세션(테스트용 가짜 등)이다 */
   target: RelayTarget | null;
   /**
@@ -396,9 +549,21 @@ export class SessionBridge {
 
   constructor(opts: BridgeOptions) {
     this.#target = opts.target;
-    this.#ctx = { scenes: opts.scenes, sceneId: opts.sceneId };
+    // ctx는 이 인스턴스가 소유한다 = 수명이 연결과 같다. loadedScene·ownExports가
+    // 여기 사는 이유다 (BuildContext 주석 참고).
+    this.#ctx = {
+      scenes: opts.scenes,
+      sceneId: opts.sceneId,
+      exports: opts.exports,
+      sessionId: opts.sessionId,
+      loadedScene: opts.sceneId,
+      ownExports: [],
+    };
     this.#max = opts.maxInflight ?? DEFAULT_MAX_INFLIGHT;
-    this.#redact = makeRedactor(opts.scenes?.dir);
+    this.#redact = makeRedactor([
+      [opts.scenes?.dir, '<씬 저장소>'],
+      [opts.exports?.dir, '<익스포트 저장소>'],
+    ]);
   }
 
   /** 응답을 기다리는 요청 수 */
@@ -539,12 +704,23 @@ export class SessionBridge {
     }
 
     void pending.then(
-      (result) => {
+      // async인 이유는 #10이다 — export의 mapResult가 산출물을 stat 하고
+      // 사이드카를 쓴다. 이 함수는 **던지지 않는다**(전부 try 안이다):
+      // 여기서 새면 잡아 줄 프레임이 없어 처리되지 않은 거부가 된다.
+      async (result) => {
         let mapped: unknown = result;
         try {
-          if (prepared.mapResult) mapped = prepared.mapResult(result);
-        } catch {
-          settle({ id, ok: false, error: `${op} 응답을 해석하지 못했습니다` });
+          if (prepared.mapResult) mapped = await prepared.mapResult(result);
+        } catch (err: unknown) {
+          // build()와 같은 규약이다: RejectError는 우리가 쓴 문구라 그대로,
+          // 그 밖의 예외는 내부 사정이라 뭉갠다.
+          settle({
+            id,
+            ok: false,
+            error: err instanceof RejectError
+              ? err.message
+              : `${op} 응답을 해석하지 못했습니다`,
+          });
           return;
         }
         settle({ id, ok: true, result: mapped });
@@ -556,7 +732,16 @@ export class SessionBridge {
       // `워커가 종료됨 (code=…)`으로 거부하므로 매달리지 않는다.
       // (그 직후 sessions.ts가 연결을 4001로 닫으므로, 이 응답이 소켓에
       //  닿는지는 경합이다. 닿지 않아도 클라이언트는 close code로 안다.)
-      (err: unknown) => settle({ id, ok: false, error: this.#errorText(err) }),
+      (err: unknown) => {
+        // 부작용 되돌리기 (#10). 던지면 이 거부 핸들러가 통째로 깨져
+        // 클라이언트가 응답을 못 받으므로 반드시 삼킨다.
+        try {
+          prepared.onFailure?.();
+        } catch {
+          // 정리 실패는 TTL 청소가 받아낸다. 응답을 막을 이유가 없다.
+        }
+        settle({ id, ok: false, error: this.#errorText(err) });
+      },
     );
   }
 

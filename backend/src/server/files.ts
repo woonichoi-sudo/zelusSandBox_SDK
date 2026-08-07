@@ -1,5 +1,12 @@
 /**
- * 씬 파일 저장소와 업로드/목록 라우트.
+ * 씬 파일 저장소(업로드/목록)와 익스포트 산출물 저장소(다운로드).
+ *
+ * 두 저장소가 한 파일에 있는 이유는 **같은 규칙 위에 서 있기 때문**이다:
+ * 클라이언트가 준 문자열은 경로가 되지 않고, 경로는 서버가 만든 128비트 id로만
+ * 조립되며, 사이드카 JSON이 "완결됐다"의 유일한 표시다. 방향만 반대다 —
+ * 씬은 들어오고(업로드) 익스포트는 나간다(다운로드).
+ *
+ * ── 씬 저장소 ─────────────────────────────────────────────
  *
  * 설계의 뿌리는 두 가지 사실이다:
  *
@@ -23,6 +30,42 @@
  * 끝난 뒤에 쓴다. 그래서 "목록에 보인다 ⇒ 본체가 완결돼 있다"가 성립한다 —
  * 반쯤 쓰인 .part는 어떤 경로로도 목록에 오르지 못한다. #6이 목록을 보고
  * load를 부르므로 이 불변식이 곧 다음 단계의 안정성이다.
+ *
+ * ── 익스포트 저장소 (#10) ─────────────────────────────────
+ *
+ * 아래 `ExportStore`. 씬과 결정적으로 다른 점이 하나 있고, 정리 정책이 전부
+ * 거기서 나온다: **파일을 쓰는 것이 우리가 아니라 워커 프로세스다.** 그래서
+ * `.part` → rename 트릭을 쓸 수 없다(워커는 우리가 준 경로에 그대로 쓴다).
+ * 대신 **사이드카를 완결 표시로 쓰는 규칙은 그대로 유지한다** —
+ * `commit()`이 파일을 stat 해서 실재를 확인한 뒤에야 `<id>.json`을 쓰고,
+ * 다운로드·조회는 사이드카만 본다. 워커가 실패했거나 중간에 죽어 남은
+ * 반쪽짜리 파일은 사이드카가 없으므로 **아무도 내려받을 수 없고**, TTL 청소가
+ * 회수한다.
+ *
+ * 왜 정리 정책이 이 단위의 일부인가: `export`는 게이트웨이가 **디스크를 쓰는
+ * 유일한 op**이고 산출물이 크다(실측 9.7MB~36.5MB, 1.6~4.3초). 지우는 규칙
+ * 없이 열면 기능이 아니라 디스크 고갈 경로가 하나 생긴다. 그래서 세 겹이다:
+ *
+ *   ① 세션당 개수 상한  — 한 연결이 만든 것이 상한을 넘으면 **가장 오래된 것**을
+ *                          즉시 지운다. 상한 자리는 bridge.ts(연결이 자기 것을
+ *                          아는 유일한 곳)이고, 여기는 `maxPerSession` 값과
+ *                          `discard()`만 제공한다.
+ *   ② TTL 청소          — mtime이 `ttlMs`를 넘긴 파일은 전부 지운다. 세션이
+ *                          끝나면 ①을 발동시킬 주체가 사라지므로, **연결 수명을
+ *                          넘겨 살아남은 파일을 회수하는 것은 이쪽뿐이다.**
+ *   ③ 실패 즉시 폐기     — 워커가 export에 실패하면 bridge가 `discard()`를 부른다.
+ *                          ②가 있어도 30분짜리 지연 회수라, 실패를 아는 순간
+ *                          지우는 편이 싸다.
+ *
+ * **연결이 닫힐 때 그 세션의 산출물을 지우지 않는다.** 다운로드는 WS가 아니라
+ * 별개의 HTTP 요청이고 수명이 다르다 — 탭을 닫는 순간 WS가 먼저 끊기므로,
+ * 연결 수명에 묶으면 진행 중인 다운로드가 그때마다 죽는다. 그 대가로 남는
+ * "주인 없는 파일"을 ②가 받아낸다.
+ *
+ * **청소에 타이머를 쓰지 않는다.** `RouteHooks`에는 `prepare`만 있고 종료 훅이
+ * 없어서(index.ts), 인터벌을 두면 `Gateway.close()`가 정리해야 할 수명이 하나
+ * 는다. 대신 기동 시 한 번과 **새 익스포트를 만들기 직전**에 쓸어낸다(60초
+ * 스로틀). 디스크가 느는 계기가 export 하나뿐이므로 그 자리에서 쓸면 충분하다.
  */
 
 import { randomBytes } from 'node:crypto';
@@ -32,7 +75,7 @@ import path from 'node:path';
 import type { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
-import type { Express, Request, Response } from 'express';
+import type { Express, NextFunction, Request, Response } from 'express';
 
 import type { RouteRegistrar } from './index.ts';
 
@@ -425,6 +468,405 @@ export function createSceneRoutes(store: SceneStore): RouteRegistrar {
     app.get('/api/scenes', async (_req: Request, res: Response) => {
       const scenes = await store.list();
       res.json({ scenes, count: scenes.length });
+    });
+
+    return { prepare: () => store.prepare() };
+  };
+}
+
+// ══ 익스포트 산출물 (#10) ═══════════════════════════════════════
+
+/**
+ * 워커가 만들 수 있는 산출물 형식. `protocol.cpp`의 export op이 아는 값과 같다.
+ *
+ * `.zbin`은 **쓰기 전용**이다 — 엔진에 역직렬화 경로가 없어 우리도 남도 다시
+ * 못 읽는다(CLAUDE.md). 그래도 막지 않는 이유는 데스크톱 앱이 제공하는 기능을
+ * 게이트웨이가 임의로 줄일 근거가 없어서다. 사용처를 아는 쪽은 사용자다.
+ */
+export type ExportFormat = 'gltf' | 'zbin';
+
+/**
+ * 형식 → 확장자. **경로에 확장자가 들어오는 유일한 통로가 이 표다.**
+ * 클라이언트 문자열이 여기 없는 값이면 `pathOf`가 던지므로, 확장자를 통한
+ * 경로 조작(`../x`, `.gltf:evil`)이 성립할 자리가 없다.
+ */
+const EXPORT_EXT: Record<ExportFormat, string> = {
+  gltf: '.gltf',
+  zbin: '.zbin',
+};
+
+/**
+ * 형식 → 다운로드 content-type. **명시적으로 정한다.**
+ *
+ * express가 확장자로 추측하게 두지 않는 이유는 ISSUE-003의 교훈이다 —
+ * content-type을 프레임워크의 기본값에 맡기면, 그게 바뀌었을 때 아무도
+ * 모르고 증상은 엉뚱한 곳(브라우저의 파서)에서 나온다.
+ * `model/gltf+json`은 IANA 등록 타입이고 three.js의 `GLTFLoader`가 받는다.
+ */
+const EXPORT_CONTENT_TYPE: Record<ExportFormat, string> = {
+  gltf: 'model/gltf+json; charset=utf-8',
+  zbin: 'application/octet-stream',
+};
+
+export function isExportFormat(v: unknown): v is ExportFormat {
+  return v === 'gltf' || v === 'zbin';
+}
+
+/** 익스포트 한 건. 씬과 마찬가지로 **서버 경로는 의도적으로 없다** */
+export interface ExportRecord {
+  /** 32자리 hex. 다운로드 URL이 되는 유일한 이름 */
+  id: string;
+  /** 다운로드 시 브라우저에 제안할 파일명. **경로가 아니라 헤더 값이다** */
+  name: string;
+  format: ExportFormat;
+  bytes: number;
+  /** ISO 8601 */
+  createdAt: string;
+  /** 만든 연결(세션)의 id. 진단용이며 접근 제어에 쓰이지 않는다 */
+  sessionId: string;
+}
+
+export interface ExportStoreOptions {
+  /** 저장 디렉토리. 절대경로 권장 */
+  dir: string;
+  /** 산출물의 수명(ms). 기본 30분 */
+  ttlMs?: number;
+  /** 한 연결이 동시에 보유할 수 있는 산출물 수. 기본 4 */
+  maxPerSession?: number;
+}
+
+/**
+ * 산출물 수명 기본값 30분.
+ *
+ * 위로: 다운로드는 익스포트 **직후 몇 초 안에** 일어난다(브라우저가 URL을 받자
+ * 마자 받는다). 30분이면 "탭을 열어 둔 채 자리를 비웠다 돌아온" 경우까지 덮는다.
+ * 아래로: 36.5MB짜리가 세션당 4개씩 쌓이므로, 수명이 시간 단위가 되면 하루
+ * 몇십 세션만으로 수 GB가 된다. 다운로드 성공률과 디스크가 만나는 지점이 이쯤이다.
+ */
+export const DEFAULT_EXPORT_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * 연결 하나가 보유할 수 있는 산출물 수 기본값 4.
+ *
+ * 근거는 크기다 — 실측 9.7MB(sample.zls) ~ 36.5MB(사용자 씬 24패턴)이므로
+ * 4개면 최악 **세션당 약 146MB**다. 세션 수는 라이선스 인스턴스가 이미
+ * 상한을 걸고 있어(`maxTotal`) 곱한 값이 예측 가능한 범위에 머문다.
+ *
+ * 왜 1이 아닌가: 같은 씬을 프레임을 달리해 뽑거나 형식을 바꿔 비교하는 것이
+ * 익스포트의 정상적인 쓰임이고, 1이면 방금 받은 링크가 다음 클릭에 죽는다.
+ * 왜 더 크지 않은가: 5개째가 필요한 시나리오가 떠오르지 않고, 상한이 하는
+ * 일은 "사용자가 실수로 연타했을 때 디스크를 지키는 것"이라 낮을수록 낫다.
+ */
+export const DEFAULT_MAX_EXPORTS_PER_SESSION = 4;
+
+/**
+ * 청소를 다시 돌기까지의 최소 간격. 익스포트를 연타해도 readdir+stat이
+ * 익스포트 자체(1.6초 이상)보다 자주 돌 이유가 없다.
+ */
+const SWEEP_MIN_INTERVAL_MS = 60 * 1000;
+
+/** 다운로드 파일명의 최대 길이 (확장자 제외) */
+const MAX_DOWNLOAD_BASE_LENGTH = 96;
+
+function isExportRecord(v: unknown): v is ExportRecord {
+  if (typeof v !== 'object' || v === null) return false;
+  const r = v as Record<string, unknown>;
+  return (
+    typeof r['id'] === 'string' && ID_RE.test(r['id'])
+    && typeof r['name'] === 'string'
+    && isExportFormat(r['format'])
+    && typeof r['bytes'] === 'number'
+    && typeof r['createdAt'] === 'string'
+    && typeof r['sessionId'] === 'string'
+  );
+}
+
+/**
+ * 다운로드 시 제안할 파일명을 만든다. 통과 못 하면 `export<ext>`로 떨어진다.
+ *
+ * **이 값은 경로 조립에 쓰이지 않는다.** 디스크 위의 이름은 언제나 `<id><ext>`고,
+ * 이건 `Content-Disposition` 헤더에만 들어간다 — `validateSceneName`이 씬
+ * 이름에 대해 갖는 관계와 정확히 같다(그쪽 주석 참고). 그래도 검사하는 이유는
+ * (a) 제어문자·따옴표가 헤더 인젝션이 되고 (b) 경로 구분자가 섞이면 브라우저마다
+ * 다르게 잘라내며 (c) Windows 예약 장치명은 저장 자체가 실패하기 때문이다.
+ *
+ * 씬 이름은 이미 `validateSceneName`을 통과한 값이라 대부분 그대로 나가지만,
+ * 여기서 다시 보는 것은 **출처를 믿지 않기 위해서다** — 사이드카는 디스크에
+ * 있고 그 사이 무엇이든 될 수 있다.
+ */
+export function exportDownloadName(base: string | undefined, format: ExportFormat): string {
+  const ext = EXPORT_EXT[format];
+  const fallback = `export${ext}`;
+  if (typeof base !== 'string') return fallback;
+
+  // 원본 확장자(.zls 등)를 떼고 우리 확장자를 붙인다.
+  const stem = base.normalize('NFC').trim().replace(/\.[^.\\/]*$/, '').trim();
+  if (stem.length === 0 || stem === '.' || stem === '..') return fallback;
+  if (FORBIDDEN_NAME_CHARS.test(stem)) return fallback;
+  if (RESERVED_BASENAMES.has(stem.toLowerCase())) return fallback;
+
+  // Windows가 끝의 점을 조용히 잘라내면 확장자가 붙는 자리가 흐트러진다.
+  const clipped = stem.slice(0, MAX_DOWNLOAD_BASE_LENGTH).replace(/[. ]+$/, '');
+  return clipped.length === 0 ? fallback : `${clipped}${ext}`;
+}
+
+/**
+ * 디스크 위의 익스포트 산출물 저장소.
+ *
+ * 씬 저장소와 마찬가지로 라우트와 분리돼 있다. 이유도 같다 — 워커의 export op은
+ * **파일 절대경로**를 받고, 그 경로를 아는 것은 여기뿐이다. 브리지는
+ * `allocate()`로 경로를 얻어 워커에 넘기고, 클라이언트는 id만 본다.
+ *
+ * 씬과 달리 쓰는 주체가 워커라 흐름이 세 걸음이다:
+ *
+ *   allocate() → (워커가 그 경로에 쓴다) → commit() → 다운로드 가능
+ *                                        ↘ 실패하면 discard()
+ */
+export class ExportStore {
+  readonly dir: string;
+  readonly ttlMs: number;
+  readonly maxPerSession: number;
+
+  /** 마지막 청소 시각. 스로틀 판정에만 쓴다 */
+  #lastSweep = 0;
+
+  constructor(opts: ExportStoreOptions) {
+    this.dir = path.resolve(opts.dir);
+    this.ttlMs = opts.ttlMs ?? DEFAULT_EXPORT_TTL_MS;
+    this.maxPerSession = opts.maxPerSession ?? DEFAULT_MAX_EXPORTS_PER_SESSION;
+    if (!Number.isFinite(this.ttlMs) || this.ttlMs <= 0) {
+      throw new Error(`익스포트 ttlMs가 올바르지 않습니다: ${String(opts.ttlMs)}`);
+    }
+    if (!Number.isInteger(this.maxPerSession) || this.maxPerSession <= 0) {
+      throw new Error(`익스포트 maxPerSession이 올바르지 않습니다: ${String(opts.maxPerSession)}`);
+    }
+  }
+
+  /**
+   * start()가 리스닝 직전에 부른다 (멱등).
+   *
+   * 여기서 청소를 **강제로** 한 번 돌린다. 재기동은 산출물이 회수되는 유일한
+   * 다른 계기다 — 프로세스가 죽으면 세션당 상한을 발동시킬 주체가 통째로
+   * 사라지므로, 지난 실행이 남긴 것을 여기서 걷지 않으면 영영 남는다.
+   */
+  async prepare(): Promise<void> {
+    await mkdir(this.dir, { recursive: true });
+    await this.sweep(true);
+  }
+
+  /**
+   * id + 형식 → 산출물 절대경로. 워커에 넘길 값이다.
+   *
+   * 형태 검사 두 개가 곧 traversal 방어다. id는 서버가 만든 것뿐이지만 이
+   * 함수는 **요청 파라미터(`/api/exports/:id`)를 직접 받는다** — 씬 쪽
+   * `pathOf`가 "언젠가 그렇게 된다"고 적어 둔 상황이 여기서는 이미 현실이다.
+   */
+  pathOf(id: string, format: ExportFormat): string {
+    if (!ID_RE.test(id)) throw httpError(400, `익스포트 id 형식이 올바르지 않습니다: ${id}`);
+    if (!isExportFormat(format)) {
+      throw httpError(400, `알 수 없는 익스포트 형식입니다: ${String(format)}`);
+    }
+    return path.join(this.dir, `${id}${EXPORT_EXT[format]}`);
+  }
+
+  #metaPath(id: string): string {
+    if (!ID_RE.test(id)) throw httpError(400, `익스포트 id 형식이 올바르지 않습니다: ${id}`);
+    return path.join(this.dir, `${id}.json`);
+  }
+
+  /**
+   * 새 산출물 자리를 잡는다. **파일은 아직 없다** — 워커가 쓴다.
+   *
+   * 사이드카를 여기서 쓰지 않는 것이 요점이다. 사이드카가 곧 "완결됐다"이므로,
+   * 워커가 실패하거나 도중에 죽으면 남는 것은 아무도 못 찾는 파일 하나뿐이고
+   * TTL 청소가 회수한다.
+   */
+  async allocate(format: ExportFormat): Promise<{ id: string; path: string }> {
+    // 디스크가 느는 유일한 계기가 여기다. 새로 쌓기 전에 만료된 것을 걷는다.
+    await this.sweep();
+    const id = randomBytes(16).toString('hex');
+    return { id, path: this.pathOf(id, format) };
+  }
+
+  /**
+   * 워커가 썼다고 한 파일을 확인하고 사이드카를 남긴다. 이 뒤로 다운로드가 된다.
+   *
+   * **stat이 형식적인 절차가 아니다.** `protocol.cpp:606`의 `ExportGltf`는
+   * 반환값을 확인하지 않아 실패해도 `ok:true`가 나간다. 여기서 실재를 확인하지
+   * 않으면 게이트웨이가 "받아 가라"고 URL을 주고 클라이언트는 404를 만난다 —
+   * 실패가 한 단계 뒤로 밀려 원인을 지목하지 못한다.
+   */
+  async commit(
+    id: string,
+    opts: { format: ExportFormat; sessionId: string; sceneName?: string | undefined },
+  ): Promise<ExportRecord> {
+    const file = this.pathOf(id, opts.format);
+
+    let bytes: number;
+    try {
+      const st = await stat(file);
+      if (!st.isFile()) throw new Error('not a file');
+      bytes = st.size;
+    } catch {
+      // 메시지에 경로를 넣지 않는다 — 이 문자열은 클라이언트에게 그대로 간다.
+      throw new Error('익스포트 파일이 만들어지지 않았습니다');
+    }
+    if (bytes === 0) {
+      await rm(file, { force: true }).catch(() => {});
+      throw new Error('익스포트 파일이 비어 있습니다');
+    }
+
+    const record: ExportRecord = {
+      id,
+      name: exportDownloadName(opts.sceneName, opts.format),
+      format: opts.format,
+      bytes,
+      createdAt: new Date().toISOString(),
+      sessionId: opts.sessionId,
+    };
+    try {
+      await writeFile(this.#metaPath(id), `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+    } catch (err) {
+      await rm(file, { force: true }).catch(() => {});
+      throw err;
+    }
+    return record;
+  }
+
+  /** 한 건 조회. 없거나 본체가 사라졌으면 null (씬 저장소와 같은 규약) */
+  async get(id: string): Promise<ExportRecord | null> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await readFile(this.#metaPath(id), 'utf8'));
+    } catch {
+      return null;
+    }
+    if (!isExportRecord(parsed) || parsed.id !== id) return null;
+    try {
+      await stat(this.pathOf(id, parsed.format));
+    } catch {
+      return null; // 사이드카만 남고 본체가 없다 — 없는 것으로 취급한다
+    }
+    return parsed;
+  }
+
+  /**
+   * 한 건을 지운다. 세션당 상한(밀려난 것)과 실패 폐기가 부른다.
+   *
+   * 사이드카를 **먼저** 지운다. 그래야 중간에 실패하더라도 "내려받을 수 있는데
+   * 본체가 없는" 상태가 생기지 않고, 남은 본체는 TTL이 걷어 간다.
+   * 형식을 모르므로 확장자를 모두 시도한다 — 실패 폐기 경로에서는 애초에
+   * 사이드카가 없어 형식을 물어볼 곳이 없기 때문이다.
+   */
+  async discard(id: string): Promise<void> {
+    if (!ID_RE.test(id)) return;
+    await rm(this.#metaPath(id), { force: true }).catch(() => {});
+    for (const ext of Object.values(EXPORT_EXT)) {
+      await rm(path.join(this.dir, `${id}${ext}`), { force: true }).catch(() => {});
+    }
+  }
+
+  /**
+   * mtime이 TTL을 넘긴 파일을 전부 지운다. 지운 개수를 돌려준다.
+   *
+   * 사이드카와 본체를 구분하지 않는 이유: 둘은 거의 같은 시각에 생기고, 남은
+   * 한쪽만 있는 상태는 `get()`이 이미 "없음"으로 취급한다. 구분해서 짝을 맞추면
+   * 코드만 늘고 결과가 같다. **사이드카 없는 고아 파일**(워커가 실패했거나
+   * 게이트웨이가 죽어 commit에 못 간 것)도 같은 규칙으로 걷힌다는 것이
+   * 이 단순함의 값어치다.
+   *
+   * `force`가 아니면 60초 스로틀에 걸려 아무것도 하지 않는다.
+   */
+  async sweep(force = false): Promise<number> {
+    const now = Date.now();
+    if (!force && now - this.#lastSweep < SWEEP_MIN_INTERVAL_MS) return 0;
+    this.#lastSweep = now;
+
+    let entries: string[];
+    try {
+      entries = await readdir(this.dir);
+    } catch {
+      return 0; // prepare 전이거나 디렉토리가 지워졌다
+    }
+
+    let removed = 0;
+    for (const entry of entries) {
+      // readdir이 돌려주는 것은 basename뿐이라 경로가 밖으로 나갈 수 없다.
+      const full = path.join(this.dir, entry);
+      let mtimeMs: number;
+      try {
+        const st = await stat(full);
+        if (!st.isFile()) continue;
+        mtimeMs = st.mtimeMs;
+      } catch {
+        continue; // 그 사이 누가 지웠다
+      }
+      if (now - mtimeMs < this.ttlMs) continue;
+      await rm(full, { force: true }).catch(() => {});
+      removed += 1;
+    }
+    return removed;
+  }
+}
+
+/**
+ * 익스포트 다운로드 라우트. index.ts의 "라우트 등록 지점"에서 부른다.
+ *
+ * **다운로드만 있다. 목록(`GET /api/exports`)은 두지 않는다.**
+ * 씬 목록과 대칭이라 넣고 싶어지지만, 씬은 모두가 공유하는 입력이고 익스포트는
+ * **한 세션이 방금 만든 산출물**이다. 목록을 열면 다른 세션의 id가 그대로
+ * 보이고, 이 게이트웨이에는 아직 인증이 없으므로 그 id가 곧 다운로드 권한이
+ * 된다. 자기가 만든 것의 id는 export 응답으로 이미 받았으니 목록이 없어도
+ * 아쉬울 것이 없다 — 늘려서 얻는 것 없이 노출만 넓히는 쪽을 택하지 않는다.
+ */
+export function createExportRoutes(store: ExportStore): RouteRegistrar {
+  return (app: Express, ctx) => {
+    app.get('/api/exports/:id', async (req: Request, res: Response, next: NextFunction) => {
+      // express 5의 params는 `string | string[]`이다(반복 파라미터 때문).
+      // 배열이면 우리 라우트에서는 있을 수 없는 모양이므로 그대로 떨어뜨린다.
+      const raw = req.params['id'];
+      const id = typeof raw === 'string' ? raw : '';
+      // ★ 클라이언트 문자열이 경로에 닿기 전의 관문. 32자리 hex가 아니면
+      //   pathOf를 부르지도 않는다.
+      if (!ID_RE.test(id)) {
+        throw httpError(400, `익스포트 id 형식이 올바르지 않습니다: ${id}`);
+      }
+
+      const record = await store.get(id);
+      if (!record) {
+        // 만료·상한·실패를 구분해 주지 않는다. 셋 다 "지금은 없다"이고,
+        // 구분하려면 지운 이력을 남겨야 하는데 그건 정리 정책과 반대다.
+        throw httpError(
+          404,
+          `익스포트를 찾을 수 없습니다: ${id} (수명이 지났거나 세션당 상한에 밀려 지워졌을 수 있습니다)`,
+        );
+      }
+
+      // content-type을 **먼저** 정한다. express의 send는 이미 잡힌 Content-Type을
+      // 덮지 않으므로, 확장자 추측이 아니라 위의 표가 정본이 된다.
+      res.type(EXPORT_CONTENT_TYPE[record.format]);
+      // 수명이 짧고 언제든 사라지는 자원이다. 중간 캐시가 들고 있다가
+      // 지워진 뒤에 내주면 "지웠는데 받아진다"가 된다.
+      res.setHeader('Cache-Control', 'private, no-store');
+
+      const file = store.pathOf(record.id, record.format);
+      // res.download이 Content-Disposition을 만든다 — 비ASCII 파일명의
+      // `filename*` 인코딩까지 express가 처리한다. 직접 문자열을 조립하면
+      // 그 인코딩을 우리가 틀리게 된다.
+      res.download(file, record.name, { dotfiles: 'deny' }, (err?: Error) => {
+        if (!err) {
+          ctx.log(`익스포트 다운로드 ${record.id} "${record.name}" ${record.bytes} 바이트`);
+          return;
+        }
+        // 전송 도중 끊겼으면 헤더가 이미 나갔다. 여기서 next()로 넘기면
+        // 에러 JSON이 파일 바이트 뒤에 덧붙어 응답이 깨진다 (index.ts의
+        // 정적 서빙이 같은 이유로 같은 처리를 한다).
+        if (res.headersSent) {
+          res.end();
+          return;
+        }
+        next(err);
+      });
     });
 
     return { prepare: () => store.prepare() };

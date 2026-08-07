@@ -70,7 +70,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { PoolExhaustedError, SessionPool, type Op, type PoolOptions } from '../sdk/index.ts';
 import type { MeshDataResult } from '../sdk/protocol.ts';
 import { SessionBridge, type ClientEvent, type ClientOutbound } from './bridge.ts';
-import type { SceneStore } from './files.ts';
+import type { ExportStore, SceneStore } from './files.ts';
 
 /** 게이트웨이 종료 — 표준 going away */
 export const CLOSE_SHUTDOWN = 1001;
@@ -254,6 +254,13 @@ export interface SessionsOptions {
 export interface SessionManagerOptions extends SessionsOptions {
   /** scene id 검증용. 없으면 `?scene=`을 받지 않는다 */
   scenes?: SceneStore;
+  /**
+   * 익스포트 산출물 저장소 (#10). 없으면 브리지가 export를 거부한다.
+   *
+   * 씬 저장소와 같은 이유로 여기를 지난다 — 산출물 경로를 아는 곳이 저장소
+   * 하나뿐이어야 하고, 그 경로가 필요한 곳은 브리지의 build 뿐이다.
+   */
+  exports?: ExportStore;
   log?: (line: string) => void;
 }
 
@@ -729,7 +736,11 @@ export class SessionManager {
           ? { request: (op, payload) => request.call(worker, op, payload) }
           : null,
         ...(this.#opts.scenes === undefined ? {} : { scenes: this.#opts.scenes }),
+        ...(this.#opts.exports === undefined ? {} : { exports: this.#opts.exports }),
         sceneId,
+        // 산출물 사이드카에 남는다. 로그의 세션 id와 같은 값이라 "이 파일을
+        // 만든 연결"을 사후에 따라갈 수 있다.
+        sessionId: info.id,
         ...(this.#opts.maxInflightRequests === undefined
           ? {}
           : { maxInflight: this.#opts.maxInflightRequests }),

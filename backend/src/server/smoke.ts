@@ -25,8 +25,8 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { existsSync, statSync } from 'node:fs';
-import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Readable, type Duplex } from 'node:stream';
@@ -39,6 +39,7 @@ import type { MeshDataResult, Op } from '../sdk/protocol.ts';
 import { allowedOps } from './bridge.ts';
 import {
   createServer,
+  defaultExportDir,
   type Gateway,
   type GatewayAddress,
   type GatewayOptions,
@@ -71,6 +72,20 @@ function section(title: string): void {
 }
 
 /**
+ * ⚠️ **스모크가 개발자의 실제 산출물을 지우지 않게 하는 안전망** (#10).
+ *
+ * `exportDir`을 안 주면 게이트웨이는 `backend/data/exports`를 쓰고,
+ * `ExportStore.prepare()`가 리스닝 직전에 **강제 청소를 한 번 돌린다.**
+ * 즉 스모크를 한 번 돌리는 것만으로 수명이 지난 실제 산출물이 사라진다 —
+ * 씬 디렉토리(`withSceneDir`)와 정확히 같은 이유로 격리가 필요하고,
+ * 여기가 **모든** 섹션이 반드시 지나는 한 곳이라 여기서 막는다.
+ *
+ * `...opts`보다 **앞**에 두는 것이 요점이다. 기본값으로만 작동하므로
+ * §10처럼 자기 디렉토리가 필요한 섹션은 그대로 덮어쓸 수 있다.
+ */
+const SMOKE_EXPORT_ROOT = mkdtempSync(path.join(tmpdir(), 'zelus-smoke-exports-'));
+
+/**
  * 서버를 띄우고 **반드시** 닫는다.
  *
  * 콜백이 던지든, check가 실패하든, await가 거부되든 finally가 close()를
@@ -81,7 +96,7 @@ async function withServer<T>(
   fn: (gw: Gateway, addr: GatewayAddress) => Promise<T>,
   opts: GatewayOptions = {},
 ): Promise<T> {
-  const gw = createServer({ onLog: () => {}, ...opts });
+  const gw = createServer({ onLog: () => {}, exportDir: SMOKE_EXPORT_ROOT, ...opts });
   try {
     const addr = await gw.start();
     return await fn(gw, addr);
@@ -170,6 +185,62 @@ async function withSceneDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
     // 103MB를 남기지 않는다. 실패하든 던지든 여기를 지난다.
     await rm(root, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+/**
+ * 임시 익스포트 디렉토리를 만들고 **반드시** 지운다 (#10).
+ *
+ * `SMOKE_EXPORT_ROOT`(안전망)와 별개로 이걸 두는 이유는 **셈**이다. §10은
+ * "디렉토리에 파일이 몇 개 남았는가"로 정리 정책을 판정하는데, 다른 섹션이
+ * 만든 산출물이 섞인 디렉토리에서는 그 수를 말할 수 없다.
+ *
+ * 한 단계 아래에 두는 것(`<root>/exports`)도 의도다 — 저장소가 없는
+ * 디렉토리를 스스로 만드는지(`prepare`의 mkdir) 확인된다.
+ */
+async function withExportDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+  const root = await mkdtemp(path.join(tmpdir(), 'zelus-smoke-exp-'));
+  try {
+    return await fn(path.join(root, 'exports'));
+  } finally {
+    await rm(root, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/** 디렉토리 안의 파일 이름들 (정렬). 없으면 빈 배열 — 정리 정책 판정에 쓴다 */
+async function filesIn(dir: string): Promise<string[]> {
+  try {
+    return (await readdir(dir)).sort();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 익스포트 다운로드. 본문을 **바이트로** 받는다.
+ *
+ * `get()`이 `res.text()`를 쓰는 것과의 차이가 이 단위의 통과 기준 그 자체다 —
+ * 9.7MB짜리 산출물을 문자열로 받으면 UTF-8 디코딩을 지나므로 "바이트가
+ * 일치한다"를 말할 수 없다(비ASCII·잘못된 시퀀스가 대체문자로 바뀐다).
+ */
+async function download(url: string): Promise<{
+  status: number;
+  type: string;
+  disposition: string;
+  cache: string;
+  bytes: Uint8Array;
+  text: string;
+}> {
+  const res = await fetch(url);
+  const buf = new Uint8Array(await res.arrayBuffer());
+  return {
+    status: res.status,
+    type: res.headers.get('content-type') ?? '',
+    disposition: res.headers.get('content-disposition') ?? '',
+    cache: res.headers.get('cache-control') ?? '',
+    bytes: buf,
+    // 진단·오류 본문용. 판정은 위의 bytes로 한다.
+    text: buf.length <= 4096 ? Buffer.from(buf).toString('utf8') : '',
+  };
 }
 
 /** withServer + 격리된 씬 디렉토리. 씬 테스트는 전부 이걸 쓴다 */
@@ -867,6 +938,33 @@ function bulkyMesh(bytes = 48 * 1024): MeshDataResult {
   return {
     patterns: [{ uuid: 'bulk', vertices: 0, triangles: 0, positionStride: 12, positions }],
     topology: false,
+  };
+}
+
+/**
+ * 가짜 릴레이에게 **파일까지 쓰게** 만든다 (#10).
+ *
+ * export는 이 프로토콜에서 워커가 디스크를 건드리는 유일한 op이고, 게이트웨이
+ * 쪽 정리 정책(상한·폐기·TTL)은 전부 "그 파일이 실제로 있다"를 전제로 돈다.
+ * 기본 릴레이처럼 `{echoed:'export'}`만 돌려주면 `ExportStore.commit`의 stat이
+ * 실패해 **차단된 것과 구별되지 않는 ok:false**가 나온다 — 정책을 볼 수가 없다.
+ *
+ * 그래서 여기서 워커의 두 가지 행동만 흉내 낸다: 준 경로에 쓰고,
+ * `{path, format}`을 돌려준다(protocol.cpp:602,607). 실제 워커를 쓰지 않는
+ * 이유는 비용이다 — sample.zls 익스포트 한 건이 1.5초·9.7MB고, 상한·폐기·
+ * 형식별 동작을 실제 산출물로 확인하면 이 섹션 하나가 스모크 전체보다 길어진다.
+ * **"진짜 바이트가 진짜로 오간다"는 §10-1이 실제 워커로 한 번 세운다.**
+ *
+ * `body`가 빈 문자열이면 0바이트 파일이 되고, `null`이면 아예 쓰지 않는다 —
+ * 워커가 "썼다"고 답하고 안 쓴 경우(protocol.cpp:606이 반환값을 안 본다)를
+ * 그대로 재현한다.
+ */
+function exportingRelay(relay: Relay, body: string | null = '{"asset":{"version":"2.0"}}\n'): void {
+  relay.respond = (op, payload) => {
+    const p = payload?.['path'];
+    if (op !== 'export' || typeof p !== 'string') return { echoed: op };
+    if (body !== null) writeFileSync(p, body);
+    return { path: p, format: payload?.['format'] };
   };
 }
 
@@ -2407,12 +2505,22 @@ async function main(): Promise<void> {
         JSON.stringify(pong2),
       );
 
-      // ③ 나머지 차단
+      // ③ export는 #10에서 **열렸다.** 그래도 임의 위치 쓰기는 여전히 막힌다 —
+      //    막는 이유만 "아직 안 열렸다"에서 "열렸지만 경로는 서버가 정한다"로
+      //    바뀌었다(bridge.buildExport). 이 단언을 지우면 그 방어가 무방비가
+      //    되므로, 형태를 바꿔 다시 세운다: 거부되고, 산출물이 하나도 안 생긴다.
+      const expDirBefore = await filesIn(gw.exports.dir);
       const ex = await ask(ws, { id: 4, op: 'export', path: 'C:\\Windows\\evil.gltf' });
       check(
-        'export 차단 (#10 이전) — 임의 위치 파일 쓰기가 막힌다',
-        ex?.['ok'] === false && String(ex['error']).includes('#10'),
+        'export{path} 거부 — 열린 뒤에도 임의 위치 파일 쓰기는 막힌다',
+        ex?.['ok'] === false && String(ex['error']).includes('path'),
         JSON.stringify(ex),
+      );
+      check(
+        '그 거부는 파일을 하나도 만들지 않았다 (익스포트 저장소가 그대로다)',
+        (await filesIn(gw.exports.dir)).join(',') === expDirBefore.join(',')
+        && !existsSync('C:\\Windows\\evil.gltf'),
+        `${expDirBefore.length}개 → ${(await filesIn(gw.exports.dir)).length}개`,
       );
 
       const un = await ask(ws, { id: 5, op: 'rm-rf' });
@@ -2424,10 +2532,13 @@ async function main(): Promise<void> {
       );
       // 차단된 op은 "모르는 op"이 아니라 "부를 수 없는 op"이라 목록에 없어야
       // 한다. 목록에 실리면 프론트엔드가 있다고 믿고 호출을 만든다.
+      // **#10에서 export가 열렸으므로 이제 실려야 한다** — 지키려던 성질은
+      // "차단된 것은 안 실린다"이고, 그 대상이 quit 하나로 줄었을 뿐이다.
+      // 반대 방향(열린 것이 안 실림)도 같은 이유로 프론트엔드를 속인다.
       check(
-        '그 목록에 quit·export이 없다',
-        !unMsg.includes('quit') && !unMsg.includes('export'),
-        unMsg.slice(0, 160),
+        '그 목록에 quit은 없고(차단) export는 있다(#10에서 열림)',
+        !unMsg.includes('quit') && unMsg.includes('export'),
+        unMsg.slice(0, 200),
       );
 
       // ④ ★ 경로 노출 — 이 섹션의 진짜 값어치
@@ -2515,14 +2626,22 @@ async function main(): Promise<void> {
         return;
       }
 
+      // 워커가 export에서 파일을 쓰는 것까지 흉내 낸다. 안 그러면 commit의
+      // stat이 실패해 "열렸는데 실패"와 "차단"이 같은 ok:false로 보인다.
+      exportingRelay(relay);
+
       // protocol.ts의 Request 유니온 전부. 여기서 빠진 op이 있으면 아래
       // 개수 단언이 잡는다.
+      //
+      // ★ export는 #10에서 **통과 + 워커 도달**로 바뀌었다. 워커에 닿는다는
+      //   것이 여기서는 위험이 아니라 계약이다 — 클라이언트가 준 것 중 워커에
+      //   실리는 건 format 하나이고 경로는 서버가 만든다는 것을 §10-2가 본다.
       const TABLE: Array<[string, boolean]> = [
         ['ping', true], ['version', true], ['init', true], ['load', true],
         ['clear', true], ['start', true], ['pause', true], ['reset', true],
         ['step', true], ['status', true], ['getParams', true], ['setParams', true],
         ['meshInfo', true], ['meshData', true], ['subscribe', true], ['unsubscribe', true],
-        ['export', false], ['quit', false],
+        ['export', true], ['quit', false],
       ];
       const extra: Record<string, Record<string, unknown>> = {
         load: { scene: sceneId },
@@ -2544,14 +2663,16 @@ async function main(): Promise<void> {
 
       check('표가 프로토콜 op 18개를 전부 덮는다', TABLE.length === 18, `${TABLE.length}개`);
       check(
-        'allowedOps()가 허용 16개와 정확히 일치 (거부 문구에 실리는 목록)',
+        'allowedOps()가 허용 17개와 정확히 일치 (거부 문구에 실리는 목록)',
         allowedOps().slice().sort().join(',')
           === TABLE.filter(([, a]) => a).map(([o]) => o).sort().join(','),
         allowedOps().join(','),
       );
+      // 지키려는 성질은 "차단된 op은 목록에 안 실린다"이고, #10 뒤로 그
+      // 대상은 quit 하나다. export를 함께 빼 두면 열린 뒤에도 알아채지 못한다.
       check(
-        'allowedOps()에 quit·export이 없다',
-        !allowedOps().includes('quit') && !allowedOps().includes('export'),
+        'allowedOps()에 quit이 없고 export이 있다 (차단만 빠진다)',
+        !allowedOps().includes('quit') && allowedOps().includes('export'),
         allowedOps().join(','),
       );
 
@@ -3818,6 +3939,575 @@ async function main(): Promise<void> {
     }, { sessions: { createPool: () => traced, heartbeatIntervalMs: 0 } });
   }
 
+  // ── §10-1. export → 다운로드 → 바이트 일치 ─────────────
+  // TASKS.json #10의 통과 기준 한 줄이 이 섹션이다:
+  // **"세션에서 export 실행 → 그 파일이 HTTP로 받아지고 바이트가 일치"**.
+  //
+  // ★ 여기만 실제 워커를 쓴다. 기준의 주어가 "그 파일"이라 가짜로는 답할 수
+  //   없는 것이 둘이기 때문이다: (1) 엔진이 정말 산출물을 쓰는가, (2) 게이트웨이가
+  //   워커에 넘긴 경로와 다운로드가 읽는 경로가 같은 파일인가. 가짜 릴레이는
+  //   그 경로에 자기가 쓰므로 (2)를 스스로 참으로 만든다 — 순환이다.
+  //
+  //   대신 **익스포트는 딱 한 번만 한다**(실측 1.5초, 9.7MB). 상한·폐기·형식
+  //   같은 정책은 같은 파일을 몇 번 더 뽑아야 확인되는데, 그건 §10-3이 가짜
+  //   릴레이로 대신한다 — 그쪽이 검증하는 것은 엔진이 아니라 게이트웨이의
+  //   장부이므로 진짜 9.7MB가 필요 없다.
+  //
+  // "바이트가 일치"의 판정은 **길이 + sha256**이다. 전체 비교(memcmp)와 같은
+  // 강도이면서 실패했을 때 로그에 9.7MB를 쏟지 않는다. 크기만 보는 것은
+  // 부족하다 — 응답 조립이 잘못돼 다른 파일을 같은 크기로 내주는 회귀를
+  // (그리고 인코딩이 섞여 바이트가 바뀌는 경우를) 통과시킨다.
+  section('10-1. 세션 export → HTTP 다운로드 → 바이트 일치 (실제 워커, 통과 기준)');
+  {
+    const traced = new TracingPool(new SessionPool({
+      exePath: defaultWorkerExe(),
+      idleTimeout: 0,
+      maxTotal: 1,
+      onLog: () => {},
+    }));
+
+    await withExportDir((expDir) => withScenes(async (gw, addr) => {
+      if (!existsSync(SAMPLE_ZLS)) {
+        check('sample.zls 존재 — 통과 기준에는 진짜 씬이 필요하다', false, SAMPLE_ZLS);
+        return;
+      }
+      const sceneId = await plantScene(gw.scenes);
+
+      const r = await connect(wsUrlOf(addr));
+      const ws = r.ws;
+      strayPids.push(...traced.pids);
+      if (!ws) {
+        check('연결 성립', false, `status=${String(r.status)}, error=${String(r.error)}`);
+        return;
+      }
+      const pid = traced.pids[0];
+      const inbox = new Inbox(ws);
+
+      check(
+        '익스포트 디렉토리가 비어 있다 (이 섹션이 세는 것의 출발점)',
+        (await filesIn(expDir)).length === 0,
+        (await filesIn(expDir)).join(',') || '0개',
+      );
+
+      const loaded = await inbox.send({ op: 'load', scene: sceneId }, 20_000);
+      check(
+        'load(sample.zls) 성공',
+        loaded?.['ok'] === true && isRecord(loaded['result']) && loaded['result']['loaded'] === true,
+        JSON.stringify(loaded).slice(0, 160),
+      );
+
+      // ── ① 세션에서 export ──────────────────────────────
+      // 클라이언트가 보내는 것은 op 하나뿐이다. format 기본값(gltf)도 함께 본다.
+      const t0 = performance.now();
+      const rep = await inbox.send({ op: 'export' }, 20_000);
+      const ms = Math.round(performance.now() - t0);
+      const rec = isRecord(rep?.['result']) ? rep['result'] : null;
+      const id = String(rec?.['id'] ?? '');
+      check(
+        '★ export 성공 → { id, url, bytes, name, format } (통과 기준 전반부)',
+        rep?.['ok'] === true && /^[0-9a-f]{32}$/.test(id)
+        && rec?.['url'] === `/api/exports/${id}`
+        && rec['format'] === 'gltf'
+        && typeof rec['bytes'] === 'number' && (rec['bytes'] as number) > 0,
+        `${ms}ms, ${JSON.stringify(rec).slice(0, 200)}`,
+      );
+      // 파일명은 **열린 씬**에서 따온다(sample.zls → sample.gltf). 경로가 아니라
+      // 헤더 값이므로 아래 Content-Disposition에서 다시 확인한다.
+      check(
+        '다운로드 이름이 열린 씬에서 온다 (sample.zls → sample.gltf)',
+        rec?.['name'] === 'sample.gltf',
+        String(rec?.['name']),
+      );
+      // ★ 워커는 `{path, format}`을 돌려준다. 그 절대경로가 응답에 실리면
+      //   #5·#7이 세운 "경로는 밖으로 안 나간다"가 이 op에서 무너진다.
+      check(
+        '응답에 서버 경로가 없다 (path 필드도, 드라이브 문자도)',
+        rec !== null && !('path' in rec) && !leaksPath(JSON.stringify(rep), expDir),
+        JSON.stringify(rep).slice(0, 200),
+      );
+
+      // 디스크에는 본체와 사이드카 둘뿐이다. glTF는 보통 `.bin`을 곁에 남기는데
+      // 이 익스포트는 **단일 파일**이고(Builder 실측), 정리 정책 전체가 그
+      // 전제 위에 서 있다 — 짝 파일이 생기기 시작하면 discard가 본체만 지운다.
+      const onDisk = await filesIn(expDir);
+      check(
+        '디스크에 `<id>.gltf` + `<id>.json` 둘뿐이다 (.bin 짝 파일이 없다)',
+        onDisk.length === 2 && onDisk.includes(`${id}.gltf`) && onDisk.includes(`${id}.json`),
+        onDisk.join(', '),
+      );
+
+      // ── ② HTTP로 받는다 ────────────────────────────────
+      const url = `${addr.url}/api/exports/${id}`;
+      const got = await download(url);
+      check(
+        'GET /api/exports/:id → 200',
+        got.status === 200,
+        `status=${got.status}, ${got.text.slice(0, 120)}`,
+      );
+      check(
+        'Content-Type이 glTF (확장자 추측이 아니라 서버가 정한 값)',
+        got.type.startsWith('model/gltf+json'),
+        got.type,
+      );
+      check(
+        '첨부로 내려온다 — Content-Disposition: attachment; filename="sample.gltf"',
+        got.disposition.includes('attachment') && got.disposition.includes('sample.gltf'),
+        got.disposition,
+      );
+      // 수명이 짧고 언제든 사라지는 자원이다. 중간 캐시가 들고 있으면
+      // "지웠는데 받아진다"가 된다.
+      check(
+        '캐시 금지 (private, no-store)',
+        got.cache.includes('no-store') && got.cache.includes('private'),
+        got.cache,
+      );
+
+      // ── ③ ★ 바이트가 일치한다 ──────────────────────────
+      const diskPath = gw.exports.pathOf(id, 'gltf');
+      const disk = await readFile(diskPath);
+      check(
+        '★ 받은 바이트 = 디스크의 산출물 (길이와 sha256이 모두 같다, 통과 기준 후반부)',
+        got.bytes.length === disk.length && sha256(got.bytes) === sha256(disk),
+        `${got.bytes.length}바이트, sha256=${sha256(got.bytes).slice(0, 16)}… `
+        + `(디스크 ${disk.length}바이트 ${sha256(disk).slice(0, 16)}…)`,
+      );
+      check(
+        '응답의 bytes 필드가 실제 길이와 같다 (클라이언트가 진행률을 믿을 수 있다)',
+        rec?.['bytes'] === got.bytes.length,
+        `${String(rec?.['bytes'])} vs ${got.bytes.length}`,
+      );
+      // 크기와 해시만 보면 "엔진이 쓰레기를 9.7MB 썼다"도 통과한다. 받은
+      // 바이트를 그대로 파싱해 glTF 2.0 문서인지 본다 — 브라우저의 GLTFLoader가
+      // 하는 일과 같고(#10의 소비자가 그것이다), 9.7MB 파싱은 100ms 남짓이다.
+      let gltf: Record<string, unknown> | null = null;
+      try {
+        const parsed: unknown = JSON.parse(Buffer.from(got.bytes).toString('utf8'));
+        gltf = isRecord(parsed) ? parsed : null;
+      } catch {
+        gltf = null;
+      }
+      const asset = isRecord(gltf?.['asset']) ? gltf['asset'] : null;
+      check(
+        '내용이 실제 glTF 2.0 문서다 (asset.version + 메시가 들어 있다)',
+        asset?.['version'] === '2.0'
+        && Array.isArray(gltf?.['meshes']) && (gltf['meshes'] as unknown[]).length > 0,
+        gltf === null
+          ? 'JSON 파싱 실패'
+          : `asset=${JSON.stringify(asset)}, meshes=${String((gltf['meshes'] as unknown[] | undefined)?.length)}, `
+            + `keys=${Object.keys(gltf).join(',')}`,
+      );
+
+      // ── ④ 다운로드는 산출물을 소모하지 않는다 ───────────
+      // 브라우저가 두 번 클릭하는 것은 정상이고, 여기서 파일이 사라지면
+      // "한 번만 받아지는" 서비스가 된다.
+      const again = await download(url);
+      check(
+        '같은 URL을 다시 받아도 같은 바이트 (다운로드가 파일을 소모하지 않는다)',
+        again.status === 200 && sha256(again.bytes) === sha256(got.bytes),
+        `status=${again.status}, ${again.bytes.length}바이트`,
+      );
+
+      // ── ⑤ 세션이 끝나도 산출물은 남는다 ────────────────
+      // 다운로드는 WS가 아니라 HTTP로 일어난다. 연결이 끊기는 순간 지우면
+      // 브라우저가 받는 도중에 사라진다 (files.ts의 명시적 결정).
+      ws.close();
+      check('종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+      const afterClose = await download(url);
+      check(
+        '세션이 끝난 뒤에도 같은 바이트가 받아진다 (수명은 연결이 아니라 TTL)',
+        afterClose.status === 200 && sha256(afterClose.bytes) === sha256(got.bytes),
+        `status=${afterClose.status}, ${afterClose.bytes.length}바이트`,
+      );
+      check(
+        '워커 프로세스는 사라진다',
+        pid !== undefined && await until(async () => !(await pidAlive(pid))),
+        `pid=${String(pid)}`,
+      );
+      note('실측', `export ${ms}ms, ${got.bytes.length}바이트`);
+    }, { exportDir: expDir, sessions: { createPool: () => traced, heartbeatIntervalMs: 0 } }));
+  }
+
+  // ── §10-2. 무엇이 워커에 닿고 무엇이 밖으로 나가는가 ───
+  // §10-1이 "된다"를 봤다면 여기는 **경로**를 본다. export는 이 프로토콜에서
+  // 게이트웨이가 디스크에 쓰는 유일한 op이라, 클라이언트 문자열이 경로에
+  // 닿는 순간이 곧 임의 파일 쓰기다. 가짜 릴레이를 쓰는 이유는 §7-10과 같다 —
+  // 막혔다는 것을 응답이 아니라 **`relay.calls`(워커에 닿지 않았다)**로 판정할 수 있다.
+  section('10-2. export 경로 방어와 다운로드 라우트 (가짜 릴레이)');
+  {
+    const relay = new Relay();
+    const fake = new FakePool({ relay });
+    await withExportDir((expDir) => withScenes(async (gw, addr) => {
+      exportingRelay(relay);
+      const sceneId = String(
+        sceneOf(await upload(addr, 'my dress.zls', new TextEncoder().encode('zls')))?.['id'] ?? '',
+      );
+      const r = await connect(wsUrlOf(addr, `?scene=${sceneId}`));
+      const ws = r.ws;
+      if (!ws) {
+        check('연결 성립', false, `status=${String(r.status)}`);
+        return;
+      }
+      const inbox = new Inbox(ws);
+      await inbox.send({ op: 'load', scene: sceneId });
+
+      // ── ① 워커에 가는 payload ──────────────────────────
+      relay.reset();
+      const ok = await inbox.send({ op: 'export' });
+      const call = relay.last();
+      const p = String(call?.payload?.['path'] ?? '');
+      check(
+        '워커에 가는 payload는 { path, format } 둘뿐이다',
+        call?.op === 'export' && call.payload !== undefined
+        && Object.keys(call.payload).sort().join(',') === 'format,path',
+        JSON.stringify(call?.payload && Object.keys(call.payload)),
+      );
+      check(
+        '그 path는 서버가 만든 것이다 — 익스포트 디렉토리 안의 `<32자리 hex>.gltf`',
+        p.startsWith(path.resolve(expDir) + path.sep)
+        && /^[0-9a-f]{32}\.gltf$/.test(path.basename(p)),
+        p,
+      );
+      check(
+        '이름은 사이드카에만 있다 — 디스크 파일명은 씬 이름이 아니다',
+        !path.basename(p).includes('dress')
+        && isRecord(ok?.['result']) && ok['result']['name'] === 'my dress.gltf',
+        `${path.basename(p)} / ${String(isRecord(ok?.['result']) ? ok['result']['name'] : '')}`,
+      );
+
+      // ── ② 클라이언트 경로는 거부된다 (무시가 아니라) ────
+      // 무시하면 클라이언트는 자기가 지정한 곳에 파일이 생겼다고 믿는다.
+      const before = await filesIn(expDir);
+      relay.reset();
+      const evil = await inbox.send({ op: 'export', path: 'C:\\Windows\\evil.gltf' });
+      check(
+        'export{path} → 거부 + 워커 미도달',
+        evil?.['ok'] === false && String(evil['error']).includes('path') && relay.calls.length === 0,
+        `${String(evil?.['error'])} / 도달 ${relay.calls.length}건`,
+      );
+
+      // 형식은 표에 있는 두 값뿐이다. 여기가 확장자가 경로에 들어가는 유일한
+      // 통로라, 표에 없는 문자열이 통과하면 확장자로 경로를 조작할 수 있다.
+      for (const bad of ['exe', '../../x', '.gltf', 'GLTF', '']) {
+        relay.reset();
+        const rej = await inbox.send({ op: 'export', format: bad });
+        check(
+          `format=${JSON.stringify(bad)} → 거부 + 워커 미도달`,
+          rej?.['ok'] === false && relay.calls.length === 0,
+          `${String(rej?.['error']).slice(0, 60)} / 도달 ${relay.calls.length}건`,
+        );
+      }
+      relay.reset();
+      const notString = await inbox.send({ op: 'export', format: 123 });
+      check(
+        'format이 문자열이 아니면 거부 + 워커 미도달',
+        notString?.['ok'] === false && relay.calls.length === 0,
+        String(notString?.['error']).slice(0, 60),
+      );
+      check(
+        '거부 6번 동안 익스포트 저장소가 그대로다 (반쪽 파일도 안 생긴다)',
+        (await filesIn(expDir)).join(',') === before.join(','),
+        `${before.length}개 → ${(await filesIn(expDir)).length}개`,
+      );
+
+      // ── ③ 워커 실패 문구에 서버 경로가 실려도 새지 않는다 ──
+      // export는 우리가 만든 절대경로를 워커에 **넘기는** op이라, 실패 문구에
+      // 그 경로가 실릴 확률이 load보다 높다(bridge의 redact가 #10에서
+      // 익스포트 디렉토리를 그물에 추가한 이유).
+      relay.fail = (op, payload) =>
+        op === 'export' ? new Error(`파일을 열지 못했습니다: ${String(payload?.['path'])}`) : null;
+      const failed = await inbox.send({ op: 'export' });
+      const failMsg = String(failed?.['error'] ?? '');
+      check(
+        '워커 실패 문구에서 익스포트 경로가 지워진다',
+        failed?.['ok'] === false && !leaksPath(failMsg, path.resolve(expDir)),
+        failMsg.slice(0, 120),
+      );
+      check(
+        '그래도 엔진의 진단은 남는다 (뭉개지 않는다)',
+        failMsg.includes('열지 못했습니다'),
+        failMsg.slice(0, 120),
+      );
+      relay.fail = () => null;
+
+      // ── ④ zbin도 같은 길을 지난다 ──────────────────────
+      const zb = await inbox.send({ op: 'export', format: 'zbin' });
+      const zrec = isRecord(zb?.['result']) ? zb['result'] : null;
+      const zdl = await download(`${addr.url}${String(zrec?.['url'])}`);
+      check(
+        'format=zbin → .zbin 산출물, content-type은 octet-stream',
+        zrec?.['format'] === 'zbin' && zrec['name'] === 'my dress.zbin'
+        && zdl.status === 200 && zdl.type.startsWith('application/octet-stream'),
+        `${String(zrec?.['name'])} / ${zdl.type}`,
+      );
+
+      // ── ⑤ 씬을 안 열었으면 이름만 떨어진다 (익스포트는 된다) ──
+      const solo = await connect(wsUrlOf(addr));
+      if (solo.ws) {
+        const soloBox = new Inbox(solo.ws);
+        const anon = await soloBox.send({ op: 'export' });
+        check(
+          '열린 씬이 없어도 익스포트는 막히지 않는다 — 이름만 export.gltf로 떨어진다',
+          anon?.['ok'] === true && isRecord(anon['result']) && anon['result']['name'] === 'export.gltf',
+          JSON.stringify(isRecord(anon?.['result']) ? anon['result']['name'] : anon),
+        );
+        solo.ws.close();
+      }
+
+      // ── ⑥ 다운로드 라우트 자체의 방어 ──────────────────
+      // `/api/exports/:id`는 **요청 파라미터가 경로 조립에 직접 닿는** 첫
+      // 라우트다. 32자리 hex가 아니면 pathOf를 부르지도 않아야 한다.
+      const goodId = String(zrec?.['id'] ?? '');
+      const BAD: Array<[string, string]> = [
+        ['abc', '너무 짧다'],
+        ['..%2f..%2fscenes', 'traversal'],
+        ['%2e%2e%5c%2e%2e%5cwin.ini', '역슬래시 traversal'],
+        [`${goodId}.json`, '사이드카 직접 조회'],
+        [goodId.toUpperCase(), '대문자 hex (표기가 하나여야 한다)'],
+        [`${goodId}%00.gltf`, 'NUL 주입'],
+      ];
+      for (const [bad, why] of BAD) {
+        const res = await download(`${addr.url}/api/exports/${bad}`);
+        check(
+          `잘못된 id(${why}) → 400, 본문은 JSON`,
+          res.status === 400 && errorOf(res.text) !== '',
+          `status=${res.status}, ${res.text.slice(0, 80)}`,
+        );
+        check(
+          `그 거절에 서버 경로가 없다 (${why})`,
+          !leaksPath(res.text, path.resolve(expDir)),
+          res.text.slice(0, 100),
+        );
+      }
+      const missing = await download(`${addr.url}/api/exports/${'0'.repeat(32)}`);
+      check(
+        '없는 id → 404 (만료·상한·실패를 구분해 주지 않는다)',
+        missing.status === 404 && !leaksPath(missing.text, path.resolve(expDir)),
+        `status=${missing.status}, ${missing.text.slice(0, 100)}`,
+      );
+      // 목록 라우트를 **일부러 두지 않았다** — 인증이 없어 id가 곧 권한이므로
+      // 목록은 다른 세션의 산출물을 그대로 내주는 것과 같다. 나중에 대칭을
+      // 맞추려는 손이 오면 여기가 먼저 깨진다.
+      const listing = await download(`${addr.url}/api/exports`);
+      check(
+        '목록 라우트는 없다 (GET /api/exports → 404)',
+        listing.status === 404,
+        `status=${listing.status}`,
+      );
+
+      ws.close();
+      check('종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+    }, { exportDir: expDir, sessions: { createPool: () => fake, heartbeatIntervalMs: 0 } }));
+  }
+
+  // ── §10-3. 정리 정책 ──────────────────────────────────
+  // 산출물은 9.7~36.5MB다. 지우는 규칙 없이 열면 기능이 아니라 디스크 고갈
+  // 경로가 하나 생긴다. 세 겹(세션당 상한 / TTL / 실패 즉시 폐기)을 각각 본다.
+  //
+  // ★ **값이 아니라 행동에 단언한다.** 기본값(4개, 30분)을 여기 적어 두면
+  //   운영 판단이 바뀔 때마다 테스트가 깨지고, 정작 "밀려난 것이 지워지는가"는
+  //   확인하지 않게 된다. 그래서 상한 2·수명 몇 초로 **구성해 놓고** 그
+  //   구성에서 무슨 일이 일어나는지만 본다.
+  section('10-3. 정리 정책 — 세션당 상한 · 실패 폐기 · 기동 시 회수 (가짜 릴레이)');
+  {
+    const relay = new Relay();
+    const fake = new FakePool({ relay });
+    await withExportDir((expDir) => withScenes(async (gw, addr) => {
+      exportingRelay(relay);
+      const dl = async (u: unknown): Promise<number> =>
+        (await download(`${addr.url}${String(u)}`)).status;
+
+      const a = await connect(wsUrlOf(addr));
+      if (!a.ws) {
+        check('연결 성립', false, `status=${String(a.status)}`);
+        return;
+      }
+      const boxA = new Inbox(a.ws);
+      const urlsA: string[] = [];
+      for (let i = 0; i < 2; i++) {
+        const rep = await boxA.send({ op: 'export' });
+        urlsA.push(String(isRecord(rep?.['result']) ? rep['result']['url'] : ''));
+      }
+      check(
+        '상한 안에서는 둘 다 살아 있다',
+        (await dl(urlsA[0])) === 200 && (await dl(urlsA[1])) === 200,
+        urlsA.join(' '),
+      );
+
+      // 상한을 넘긴다. 밀려나는 것은 **가장 오래된 것**이고, 밀려남 = 즉시 삭제다.
+      const third = await boxA.send({ op: 'export' });
+      const url3 = String(isRecord(third?.['result']) ? third['result']['url'] : '');
+      check(
+        '★ 상한을 넘기면 가장 오래된 것이 밀려나 404가 된다',
+        (await dl(urlsA[0])) === 404,
+        `첫 번째=${await dl(urlsA[0])}, 두 번째=${await dl(urlsA[1])}, 세 번째=${await dl(url3)}`,
+      );
+      check(
+        '밀려난 것만 사라진다 (나머지는 그대로 받아진다)',
+        (await dl(urlsA[1])) === 200 && (await dl(url3)) === 200,
+        `${urlsA[1]} ${url3}`,
+      );
+      // 사이드카만 지우고 본체를 남기면 디스크는 그대로 찬다.
+      check(
+        '밀려난 것은 본체까지 지워진다 (남은 2건 × 2파일 = 4개)',
+        (await filesIn(expDir)).length === 4,
+        (await filesIn(expDir)).join(', '),
+      );
+
+      // ── 상한은 **연결별**이다. 남의 산출물을 지우면 안 된다 ──
+      const b = await connect(wsUrlOf(addr));
+      if (b.ws) {
+        const boxB = new Inbox(b.ws);
+        for (let i = 0; i < 3; i++) await boxB.send({ op: 'export' });
+        check(
+          '★ 다른 연결이 상한을 넘겨도 내 산출물은 안 지워진다 (자기 것만 센다)',
+          (await dl(urlsA[1])) === 200 && (await dl(url3)) === 200,
+          `A의 남은 2건: ${await dl(urlsA[1])}, ${await dl(url3)}`,
+        );
+        b.ws.close();
+      }
+
+      // ── 실패 즉시 폐기 ─────────────────────────────────
+      // 워커가 반쯤 쓰다 실패하면 아무도 못 받는 수십 MB가 남는다.
+      const beforeFail = (await filesIn(expDir)).length;
+      relay.fail = (op) => (op === 'export' ? new Error('엔진 익스포트 실패') : null);
+      const failed = await boxA.send({ op: 'export' });
+      check(
+        '★ 워커가 실패하면 반쯤 쓰인 파일이 즉시 사라진다',
+        failed?.['ok'] === false && (await filesIn(expDir)).length === beforeFail,
+        `${beforeFail}개 → ${(await filesIn(expDir)).length}개, ${String(failed?.['error'])}`,
+      );
+      relay.fail = () => null;
+
+      // ── 워커가 "썼다"고 답하고 안 썼다 ─────────────────
+      // protocol.cpp:606의 ExportGltf는 반환값을 확인하지 않아 실패해도
+      // ok:true가 나간다. 게이트웨이가 stat 하지 않으면 클라이언트가 URL을
+      // 받아 404를 만나고, 실패가 한 단계 뒤로 밀려 원인을 못 짚는다.
+      exportingRelay(relay, null);
+      const ghost = await boxA.send({ op: 'export' });
+      check(
+        '★ 워커가 ok라 해도 파일이 없으면 실패로 답한다 (URL을 주지 않는다)',
+        ghost?.['ok'] === false && String(ghost['error']).includes('만들어지지 않았습니다'),
+        JSON.stringify(ghost).slice(0, 140),
+      );
+      check(
+        '그 실패 문구에 서버 경로가 없다',
+        !leaksPath(String(ghost?.['error'] ?? ''), path.resolve(expDir)),
+        String(ghost?.['error']),
+      );
+
+      // ── 0바이트 산출물 ─────────────────────────────────
+      const beforeEmpty = (await filesIn(expDir)).length;
+      exportingRelay(relay, '');
+      const empty = await boxA.send({ op: 'export' });
+      check(
+        '0바이트 산출물은 성공으로 치지 않고 지운다',
+        empty?.['ok'] === false && String(empty['error']).includes('비어 있습니다')
+        && (await filesIn(expDir)).length === beforeEmpty,
+        `${String(empty?.['error'])}, ${beforeEmpty}개 → ${(await filesIn(expDir)).length}개`,
+      );
+
+      a.ws.close();
+      check('종료 → busy 0', await until(() => gw.sessions.stats.busy === 0));
+    }, {
+      exportDir: expDir,
+      maxExportsPerSession: 2,
+      sessions: { createPool: () => fake, heartbeatIntervalMs: 0 },
+    }));
+  }
+
+  // ── §10-4. 기동 시 회수 (TTL) ─────────────────────────
+  // 프로세스가 죽으면 세션당 상한을 발동시킬 주체가 통째로 사라진다.
+  // **연결 수명을 넘겨 살아남은 파일을 회수하는 것은 TTL뿐**이고, 그 발동
+  // 계기 중 하나가 기동이다. 여기서도 값이 아니라 행동을 본다 — 수명을
+  // 짧게 **구성해 놓고**, 그보다 오래된 것만 사라지는지.
+  section('10-4. 기동 시 수명 지난 산출물 회수 (TTL)');
+  {
+    await withExportDir(async (expDir) => {
+      await mkdir(expDir, { recursive: true });
+      const old = 'a'.repeat(32);
+      const fresh = 'b'.repeat(32);
+      const stale = 'c'.repeat(32);
+      // 사이드카는 **완결 표시**다. 모양이 맞아야 `get()`이 산출물로 인정하고
+      // 다운로드가 열린다 — 아래 "받아진다" 단언이 그것까지 확인한다.
+      const sidecar = (sid: string): string => JSON.stringify({
+        id: sid,
+        name: 'kept.gltf',
+        format: 'gltf',
+        bytes: 2,
+        createdAt: new Date().toISOString(),
+        sessionId: 'smoke',
+      });
+      for (const [n, body] of [
+        [`${old}.gltf`, '{}'], [`${old}.json`, sidecar(old)],
+        [`${fresh}.gltf`, '{}'], [`${fresh}.json`, sidecar(fresh)],
+        // 사이드카 없는 고아 — 워커가 실패했거나 게이트웨이가 commit 전에
+        // 죽어 남은 것. 아무도 못 받으므로 이것도 걷혀야 한다.
+        [`${stale}.gltf`, '{}'],
+      ] as Array<[string, string]>) {
+        await writeFile(path.join(expDir, n), body, 'utf8');
+      }
+      // mtime을 과거로 돌린다. 실제로 기다리면 스모크가 그만큼 길어진다.
+      const past = new Date(Date.now() - 60_000);
+      for (const n of [`${old}.gltf`, `${old}.json`, `${stale}.gltf`]) {
+        await utimes(path.join(expDir, n), past, past);
+      }
+
+      await withServer(async (_gw, addr) => {
+        const left = await filesIn(expDir);
+        check(
+          '★ 기동 시 수명이 지난 산출물이 회수된다 (사이드카 없는 고아까지)',
+          !left.includes(`${old}.gltf`) && !left.includes(`${old}.json`)
+          && !left.includes(`${stale}.gltf`),
+          left.join(', ') || '0개',
+        );
+        check(
+          '수명이 남은 것은 그대로 있고 받아진다',
+          left.includes(`${fresh}.gltf`) && left.includes(`${fresh}.json`)
+          && (await download(`${addr.url}/api/exports/${fresh}`)).status === 200,
+          left.join(', '),
+        );
+        check(
+          '회수된 것은 404가 된다',
+          (await download(`${addr.url}/api/exports/${old}`)).status === 404,
+          `${old.slice(0, 8)}…`,
+        );
+      }, { exportDir: expDir, exportTtlMs: 10_000 });
+    });
+  }
+
+  // ── §10-5. 스모크가 실제 산출물을 지우지 않는다 ────────
+  // Builder의 경고: 게이트웨이는 exportDir을 안 주면 `backend/data/exports`를
+  // 쓰고 prepare()가 강제 청소를 돌린다. 즉 **스모크 실행 자체가 개발자의
+  // 산출물을 지우는** 부작용을 갖는다. withServer가 임시 디렉토리를
+  // 기본값으로 넣어 막고 있고(SMOKE_EXPORT_ROOT), 그게 실제로 유효한지는
+  // 여기서 **운영 기본 디렉토리를 들여다보는 것**으로만 확인된다.
+  section('10-5. 스모크는 운영 익스포트 디렉토리를 건드리지 않는다');
+  {
+    const realDir = defaultExportDir();
+    const canary = path.join(realDir, 'smoke-canary.txt');
+    await mkdir(realDir, { recursive: true });
+    // 수명이 한참 지난 것으로 만든다 — 청소가 돌았다면 **반드시** 지워질 파일이다.
+    await writeFile(canary, 'do not delete\n', 'utf8');
+    const past = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    await utimes(canary, past, past);
+
+    // exportDir을 **안 주고** 띄운다 — 다른 섹션 대부분이 이 모양이고,
+    // 안전망이 없으면 바로 이 시점(prepare의 강제 청소)에서 canary가 사라진다.
+    await withServer(async () => {});
+
+    check(
+      '★ exportDir 없이 띄운 게이트웨이가 운영 디렉토리의 낡은 파일을 지우지 않았다',
+      existsSync(canary),
+      `${canary} — 지워졌다면 스모크가 실제 산출물을 회수하고 있다는 뜻이다`,
+    );
+    check(
+      '스모크의 산출물은 임시 디렉토리에 있다 (운영 디렉토리와 다른 곳)',
+      SMOKE_EXPORT_ROOT !== realDir && !SMOKE_EXPORT_ROOT.startsWith(realDir),
+      SMOKE_EXPORT_ROOT,
+    );
+    await rm(canary, { force: true }).catch(() => {});
+  }
+
   // ── 7-7. 좀비 최종 확인 ───────────────────────────────
   // 개수가 아니라 **우리가 만든 pid**로 판정한다. 다른 프로세스가 같은 exe를
   // 띄우고 있어도(SDK 스모크 병행 실행 등) 오탐이 나지 않는다.
@@ -3843,9 +4533,15 @@ const guard = setTimeout(() => {
   process.exit(1);
 }, 30_000);
 
+/** 안전망 디렉토리를 남기지 않는다. 어느 경로로 끝나든 지난다 (#10) */
+function cleanupExportRoot(): void {
+  rmSync(SMOKE_EXPORT_ROOT, { recursive: true, force: true });
+}
+
 main().then(
   () => {
     clearTimeout(guard);
+    cleanupExportRoot();
     console.log(failures === 0 ? '\n전부 통과\n' : `\n${failures}건 실패\n`);
     process.exitCode = failures === 0 ? 0 : 1;
 
@@ -3861,6 +4557,7 @@ main().then(
   },
   (err: unknown) => {
     clearTimeout(guard);
+    cleanupExportRoot();
     console.error('\n스모크 테스트 중 예외:', err);
     process.exit(1);
   },
