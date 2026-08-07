@@ -35,6 +35,8 @@ import { fetchHealth } from './http.ts';
 import {
   isServerEvent,
   type ClientOp,
+  type ExportFormat,
+  type ExportResult,
   type FrameMesh,
   type LoadResult,
   type MeshInfoResult,
@@ -497,6 +499,25 @@ export class GatewayClient {
 
   meshInfo(): Promise<MeshInfoResult> {
     return this.request<MeshInfoResult>('meshInfo');
+  }
+
+  /**
+   * 열려 있는 씬을 파일로 내보낸다 (#10). 돌아오는 `url` 로 내려받는다.
+   *
+   * ⚠️ **`path` 를 보내지 않는다.** 게이트웨이는 `path` 가 실려 오면 조용히
+   *    무시하지 않고 **거부한다**(bridge.ts `buildExport`) — 무시하면
+   *    클라이언트가 자기가 지정한 곳에 파일이 생겼다고 믿기 때문이다. 그래서 이
+   *    래퍼는 인자로 형식만 받고, 그 외의 필드를 넣을 통로를 열지 않는다.
+   *
+   * ⚠️ **오래 걸린다.** 실측으로 sample.zls 1.5초 / 사용자 씬(24패턴) 4.3초다.
+   *    기본 제한 시간(60초) 안이지만 호출자는 그동안 화면에 무언가를 보여줘야
+   *    한다 (`viewer3d/snapshot.ts` 가 그 상태 기계다).
+   *
+   * ⚠️ 시뮬이 도는 중에 부르면 **그 시점의 포즈**가 나온다. 정지 상태를 원하면
+   *    `pause()` 를 먼저 보낼 것.
+   */
+  exportScene(format: ExportFormat = 'gltf'): Promise<ExportResult> {
+    return this.request<ExportResult>('export', { format });
   }
 
   /** `topology:true` 면 indices·uvs 까지. 프레임 간 고정이라 보통 한 번만 부른다 */

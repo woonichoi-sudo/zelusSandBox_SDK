@@ -127,3 +127,82 @@ export async function uploadScene(
   }
   return scene as SceneSummary;
 }
+
+/** `downloadExport` 진행 보고. `total` 을 모르면 0 이다 */
+export interface DownloadProgress {
+  loaded: number;
+  total: number;
+}
+
+/**
+ * `GET /api/exports/:id` — 익스포트 산출물을 **바이트 그대로** 받는다 (#10).
+ *
+ * ── 왜 `arrayBuffer()` 인가 ─────────────────────────────────
+ * `res.text()` 로 받으면 UTF-8 디코딩을 한 번 지난다. glTF 는 JSON 이라 그래도
+ * 파싱은 되지만, `GLTFLoader.parse()` 가 ArrayBuffer 를 받으면 GLB 매직을 먼저
+ * 보고 **아니면 스스로 디코딩한다** — 즉 우리가 미리 문자열로 만들면 GLB(`.glb`)
+ * 로 형식이 바뀌는 순간 조용히 깨진다. 바이트를 그대로 넘기면 형식 판별이
+ * 로더에게 남는다.
+ *
+ * ── 왜 진행률을 스스로 세는가 ───────────────────────────────
+ * 사용자 씬이 **36.5MB / 4.3초**다(#10 실측). 그 4.3초 동안 화면이 아무 말도
+ * 안 하면 멈춘 것과 구분되지 않는다. `fetch` 는 진행 이벤트를 주지 않으므로
+ * 본문 스트림을 직접 읽어 센다. 스트림을 못 쓰는 환경(구형 브라우저, 일부
+ * 프록시)에서는 `arrayBuffer()` 로 조용히 되돌아간다 — **진행률은 편의이지
+ * 기능이 아니다.**
+ *
+ * ⚠️ 응답이 `Content-Disposition: attachment` 라도 `fetch` 는 다운로드 창을
+ *    띄우지 않는다. 그 헤더는 `<a download>` 로 갈 때만 의미가 있다.
+ */
+export async function downloadExport(
+  url: string,
+  opts: ApiOptions & {
+    onProgress?: ((p: DownloadProgress) => void) | undefined;
+    /** `Content-Length` 가 없을 때 쓸 기대 크기. `export` 응답의 `bytes` */
+    expectedBytes?: number | undefined;
+  } = {},
+): Promise<ArrayBuffer> {
+  const full = join(opts.base, url);
+  const res = await fetch(full, {
+    headers: { accept: 'model/gltf+json, application/octet-stream' },
+    ...(opts.signal ? { signal: opts.signal } : {}),
+  });
+
+  if (!res.ok) {
+    // 실패 본문은 게이트웨이의 `{ error }` JSON 이다 — readJson 이 그걸 던진다.
+    await readJson(res, full);
+    // readJson 은 !ok 면 반드시 던진다. 여기 오면 그쪽 계약이 깨진 것이다.
+    throw new ApiError(res.status, full, `${res.status} 응답을 해석하지 못했습니다`);
+  }
+
+  const header = Number(res.headers.get('content-length') ?? '');
+  const total = Number.isFinite(header) && header > 0 ? header : (opts.expectedBytes ?? 0);
+  const body = res.body;
+  const report = opts.onProgress;
+
+  if (!body || !report) {
+    return await res.arrayBuffer();
+  }
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let loaded = 0;
+  report({ loaded: 0, total });
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    chunks.push(value);
+    loaded += value.byteLength;
+    report({ loaded, total });
+  }
+
+  // 마지막에 한 번만 합친다. 청크마다 이어붙이면 36MB 에서 O(n²) 가 된다.
+  const out = new Uint8Array(loaded);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.byteLength;
+  }
+  return out.buffer;
+}

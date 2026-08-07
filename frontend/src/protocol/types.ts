@@ -44,15 +44,46 @@ export type {
 /**
  * 게이트웨이가 실제로 받아 주는 op.
  *
- * 워커의 op 전체에서 차단된 둘을 뺀 것이다 (bridge.ts 의 OPS 테이블):
- *   - `quit`   — 세션 종료는 소켓을 닫는 것으로 한다
- *   - `export` — #10 에서 다운로드와 함께 열린다
+ * 워커의 op 전체에서 차단된 것을 뺀 것이다 (bridge.ts 의 OPS 테이블):
+ *   - `quit` — 세션 종료는 소켓을 닫는 것으로 한다
  *
- * `Exclude` 로 **빼서** 정의한 이유는 위와 같다. 목록을 새로 적으면 워커에
- * op 이 늘어도 여기가 모른다. 빼는 형태면 늘어난 op 이 자동으로 들어오고,
- * 그게 틀렸다면 서버가 "알 수 없는 op" 으로 알려 준다.
+ * `export` 는 **#10 에서 열렸다** (커밋 `1a178ab`). 다만 워커의 `export` 는
+ * `path` 를 요구하는 반면 게이트웨이는 **`path` 를 받으면 거부한다** — 산출물
+ * 위치는 서버가 정하고 클라이언트가 넣는 것은 `format` 하나뿐이다. 그래서 이
+ * 타입은 op **이름**만 공유하고 payload 는 공유하지 않는다
+ * (`GatewayClient.exportScene()` 참고).
+ *
+ * `Exclude` 로 **빼서** 정의한 이유: 목록을 새로 적으면 워커에 op 이 늘어도
+ * 여기가 모른다. 빼는 형태면 늘어난 op 이 자동으로 들어오고, 그게 틀렸다면
+ * 서버가 "알 수 없는 op" 으로 알려 준다.
  */
-export type ClientOp = Exclude<Op, 'quit' | 'export'>;
+export type ClientOp = Exclude<Op, 'quit'>;
+
+/** 익스포트 형식. 게이트웨이가 이 둘만 받는다 (bridge.ts `isExportFormat`) */
+export type ExportFormat = 'gltf' | 'zbin';
+
+/**
+ * `export` op 의 결과 — **게이트웨이가 갈아 끼운 모양이다.**
+ *
+ * 워커는 `{ path, format }` 을 돌려주지만 서버 절대경로가 밖으로 나가면 안 되므로
+ * bridge.ts 가 id 와 다운로드 URL 로 바꿔 끼운다. `load` 의 `{ loaded, path }`
+ * → `{ loaded, scene }` 과 정확히 같은 처리다.
+ *
+ * ⚠️ `url` 은 **상대 경로**(`/api/exports/<id>`)다. 오리진을 서버가 지어내면
+ *    프록시 뒤에서 틀리기 때문이다 — 붙일 오리진은 클라이언트가 이미 안다.
+ */
+export interface ExportResult {
+  /** 32자리 hex. **이것이 곧 다운로드 권한이다** — 목록 라우트가 없다 */
+  id: string;
+  format: ExportFormat;
+  /** 산출물 크기. 실측 sample.zls 9.7MB / 사용자 씬 36.5MB */
+  bytes: number;
+  /** `Content-Disposition` 에 실리는 파일명. 열려 있는 씬에서 딴다 */
+  name: string;
+  createdAt: string;
+  /** `/api/exports/<id>`. 상대 경로다 */
+  url: string;
+}
 
 /**
  * 서버 → 클라이언트 이벤트.

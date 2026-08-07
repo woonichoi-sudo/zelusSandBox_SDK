@@ -31,12 +31,21 @@ export {
 
 export { Emitter, type Listener, type Unsubscribe } from './emitter.ts';
 
-export { ApiError, fetchHealth, listScenes, uploadScene } from './http.ts';
+export {
+  ApiError,
+  downloadExport,
+  fetchHealth,
+  listScenes,
+  uploadScene,
+  type DownloadProgress,
+} from './http.ts';
 
 export { isServerEvent } from './types.ts';
 export type {
   ClientOp,
   ErrResponse,
+  ExportFormat,
+  ExportResult,
   FrameMesh,
   HealthBody,
   LoadResult,

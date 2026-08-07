@@ -65,6 +65,20 @@ import {
   type TopologyMismatch,
 } from '../viewer3d/frameStream.ts';
 import { showScene } from '../viewer3d/loader.ts';
+import {
+  SnapshotLoader,
+  SnapshotStaleError,
+  type SnapshotResult,
+  type SnapshotSource,
+  type SnapshotStats,
+  type SnapshotTarget,
+} from '../viewer3d/snapshot.ts';
+import {
+  parseSnapshot,
+  SnapshotObject,
+  SNAPSHOT_SCALE,
+  type ParsedSnapshot,
+} from '../viewer3d/snapshotView.ts';
 import type { Viewer3D } from '../viewer3d/viewer.ts';
 
 import {
@@ -73,6 +87,7 @@ import {
   decodeInt32,
   decodePattern,
   decodePatterns,
+  downloadExport,
   fetchHealth,
   GatewayClient,
   GatewayClosedError,
@@ -85,6 +100,8 @@ import {
   withScene,
   type ClientOp,
   type DecodedPattern,
+  type ExportFormat,
+  type ExportResult,
   type FrameMesh,
   type PatternData,
   type SceneSummary,
@@ -2453,6 +2470,909 @@ async function sectionRealFrames(): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────
+// §8-8 ~ §8-10. 스냅샷 (익스포트한 glTF 를 화면에)
+//
+// 통과 기준은 "아바타와 진짜 옷 색이 보인다" 하나이고 verify 는 manual 이다.
+// 그런데 **사람이 보는 것은 마지막 한 칸뿐이다** — 그 앞의 네 칸(익스포트 요청 →
+// 다운로드 → 파싱 → 부착)이 어디서 어긋나도 화면에는 "아무것도 안 뜬다" 또는
+// "이상한 크기로 뜬다" 로만 나타난다. 아래 셋이 그 네 칸을 전부 가른다:
+//
+//   §8-8  상태 기계 — 실패·취소·중복·세대전환. 주입이 열려 있어 전부 결정적이다
+//   §8-9  부착 — 스케일 100 과 GPU 해제. three 는 쓰되 DOM 은 안 쓴다
+//   §8-10 실제 익스포트 — 진짜 워커의 glTF 로 §8-8·§8-9 를 한 번 더, 진짜 값으로
+//
+// 특히 §8-8 의 `SnapshotStaleError` 집계가 뒤집히면 **정상 동작이 빨간 오류로
+// 찍힌다** — 사용자가 기다리다 다른 씬을 눌렀을 뿐인데 "익스포트 실패" 가
+// 보고된다. 화면으로는 절대 구분되지 않는 종류다.
+// ─────────────────────────────────────────────────────────────
+
+/** 밖에서 풀어 주는 약속. 진행 중 상태를 **원하는 지점에서 멈춰** 세운다 */
+function defer<T>(): { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void } {
+  let resolve!: (v: T) => void;
+  let reject!: (e: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function exportInfo(bytes = 1024): ExportResult {
+  return {
+    id: 'a'.repeat(32),
+    format: 'gltf',
+    bytes,
+    name: 'sample.gltf',
+    createdAt: new Date(0).toISOString(),
+    url: `/api/exports/${'a'.repeat(32)}`,
+  };
+}
+
+/**
+ * 주입 가능한 가짜 source/target 한 벌.
+ *
+ * 각 단계를 `defer` 로 붙잡아 두면 **"익스포트 중에 씬이 바뀌었다"** 같은
+ * 시간이 걸린 상황을 경합 없이 만들 수 있다. 실제 게이트웨이로는 4.3초짜리
+ * 창을 노려야 하는 것들이라 결정적으로 재현할 방법이 없다.
+ */
+function fakeSnapshotRig(): {
+  source: SnapshotSource;
+  target: SnapshotTarget<string>;
+  calls: { export: number; download: number; parse: number; install: number; clear: number; dispose: number };
+  progress: { loaded: number; total: number }[];
+  installed: string[];
+  disposed: string[];
+  gates: {
+    export: { promise: Promise<ExportResult>; resolve: (v: ExportResult) => void; reject: (e: unknown) => void };
+    download: { promise: Promise<ArrayBuffer>; resolve: (v: ArrayBuffer) => void; reject: (e: unknown) => void };
+    parse: { promise: Promise<string>; resolve: (v: string) => void; reject: (e: unknown) => void };
+  };
+  /** 세 단계를 순서대로 즉시 통과시킨다 */
+  passAll: (bytes?: number) => void;
+  /** `install` 이 던지게 한다 */
+  breakInstall: () => void;
+  stats: SnapshotStats;
+  formats: ExportFormat[];
+} {
+  const calls = { export: 0, download: 0, parse: 0, install: 0, clear: 0, dispose: 0 };
+  const progress: { loaded: number; total: number }[] = [];
+  const installed: string[] = [];
+  const disposed: string[] = [];
+  const formats: ExportFormat[] = [];
+  const stats: SnapshotStats = { meshes: 27, vertices: 33_087, materials: 13, textures: 8 };
+  let installThrows = false;
+
+  const gates = {
+    export: defer<ExportResult>(),
+    download: defer<ArrayBuffer>(),
+    parse: defer<string>(),
+  };
+
+  const source: SnapshotSource = {
+    requestExport: (format) => {
+      calls.export += 1;
+      formats.push(format);
+      return gates.export.promise;
+    },
+    download: (_url, onProgress, expectedBytes) => {
+      calls.download += 1;
+      // 실제 `downloadExport` 처럼 중간 보고를 낸다. 화면의 진행률이 이 값이다.
+      onProgress(0, expectedBytes);
+      onProgress(Math.floor(expectedBytes / 2), expectedBytes);
+      onProgress(expectedBytes, expectedBytes);
+      return gates.download.promise;
+    },
+  };
+
+  const target: SnapshotTarget<string> = {
+    parse: () => {
+      calls.parse += 1;
+      return gates.parse.promise;
+    },
+    install: (content) => {
+      calls.install += 1;
+      if (installThrows) throw new Error('install 실패');
+      installed.push(content);
+      return stats;
+    },
+    clear: () => {
+      calls.clear += 1;
+    },
+    dispose: (content) => {
+      calls.dispose += 1;
+      disposed.push(content);
+    },
+  };
+
+  return {
+    source,
+    target,
+    calls,
+    progress,
+    installed,
+    disposed,
+    gates,
+    stats,
+    formats,
+    passAll: (bytes = 1024): void => {
+      gates.export.resolve(exportInfo(bytes));
+      gates.download.resolve(new ArrayBuffer(bytes));
+      gates.parse.resolve('내용');
+    },
+    breakInstall: (): void => {
+      installThrows = true;
+    },
+  };
+}
+
+/** 마이크로태스크가 다 흐르도록 한 박자 쉰다 (실제 시간은 안 쓴다) */
+function tick(): Promise<void> {
+  return new Promise<void>((res) => setImmediate(res));
+}
+
+/**
+ * `caught()` 인데 **제 시간 안에 끝나지 않으면 그 사실을 값으로** 돌려준다.
+ *
+ * 세대 검사가 사라지면 취소된 시도가 다음 단계에서 영원히 매달린다(그 단계의
+ * gate 를 아무도 풀어 주지 않는다). 그때 스모크가 통째로 멎으면 **어느 단언이
+ * 깨졌는지가 아니라 "테스트가 안 끝난다" 만 남는다** — 실제로 돌연변이를
+ * 심었을 때 그렇게 됐다. 멎는 대신 그 항목만 빨간불이 되게 한다.
+ */
+function caughtWithin<T>(p: Promise<T>, msec = 3_000): Promise<unknown> {
+  const overdue = new Error(`${msec}ms 안에 끝나지 않았다`);
+  return Promise.race([caught(p), sleep(msec).then(() => overdue)]);
+}
+
+async function sectionSnapshotMachine(): Promise<void> {
+  section('§8-8. 스냅샷 상태 기계 (snapshot.ts, DOM 도 three 도 없이)');
+
+  // ── 대조군: 아무것도 안 했을 때 ──────────────────────────────
+  {
+    const rig = fakeSnapshotRig();
+    const loader = new SnapshotLoader<string>({ source: rig.source, target: rig.target });
+    const s = loader.stats;
+    check(
+      '대조군 — 부르기 전에는 아무것도 없다 (present:false, idle, 시도 0)',
+      s.present === false && s.phase === 'idle' && s.attempts === 0 && s.succeeded === 0
+        && s.failed === 0 && s.discarded === 0 && s.lastResult === null && s.lastError === null
+        && loader.busy === false,
+      JSON.stringify({ phase: s.phase, present: s.present, attempts: s.attempts }),
+    );
+  }
+
+  // ── 성공 경로 + 주입 시계로 구간별 소요를 고정한다 ───────────
+  {
+    const rig = fakeSnapshotRig();
+    // 시계를 손으로 돌린다. `#run` 이 `now()` 를 부르는 순서는 다섯 번
+    // (시작 / 익스포트 뒤 / 다운로드 뒤 / 파싱 뒤 / 부착 뒤) + onProgress 마다.
+    let clock = 0;
+    const phases: string[] = [];
+    const progress: { phase: string; loaded: number; total: number; elapsedMs: number }[] = [];
+    const loader = new SnapshotLoader<string>({
+      source: rig.source,
+      target: {
+        parse: rig.target.parse.bind(rig.target),
+        // 부착은 동기라 밖에서 시계를 돌릴 틈이 없다. **부착이 도는 동안**
+        // 1ms 가 흘렀다고 해 두면 installMs 가 그 구간을 재는지 보인다.
+        install: (c) => {
+          clock += 1;
+          return rig.target.install(c);
+        },
+        clear: rig.target.clear.bind(rig.target),
+        dispose: rig.target.dispose?.bind(rig.target) ?? ((): void => {}),
+      },
+      now: () => clock,
+      onProgress: (p) => {
+        phases.push(p.phase);
+        progress.push({ phase: p.phase, loaded: p.loaded, total: p.total, elapsedMs: p.elapsedMs });
+      },
+    });
+
+    const pending = loader.load();
+    await tick();
+    check('시작하면 exporting 이고 busy 다 (버튼을 잠그는 조건)',
+      loader.phase === 'exporting' && loader.busy, `${loader.phase}, busy=${loader.busy}`);
+
+    clock = 4_300; // 익스포트 4.3초 (사용자 씬 실측)
+    rig.gates.export.resolve(exportInfo(36_500_000));
+    await tick();
+    clock = 4_732; // 다운로드 432ms
+    rig.gates.download.resolve(new ArrayBuffer(8));
+    await tick();
+    check('다운로드가 끝나면 parsing 이다', loader.phase === 'parsing', loader.phase);
+    clock = 5_302; // 파싱 570ms (부착 1ms 는 install 대역이 직접 흘린다)
+    rig.gates.parse.resolve('내용');
+
+    const r = await pending;
+    check('★ 성공하면 ready 이고 화면에 서 있다 (present)',
+      loader.phase === 'ready' && loader.present,
+      `${loader.phase}, present=${loader.present}`);
+    // 자물쇠는 결과보다 한 마이크로태스크 늦게 풀린다 (아래 "함정" 항목 참고).
+    await tick();
+    check('끝나면 자물쇠가 풀린다 (버튼이 다시 눌린다)', !loader.busy, `busy=${loader.busy}`);
+    check('단계가 순서대로 지나간다 (건너뛰거나 되돌아가지 않는다)',
+      phases.join('>') === 'exporting>downloading>downloading>downloading>downloading>parsing>ready',
+      phases.join('>'));
+    check('★ 구간별 소요가 실제 시각차다 (어디가 느린지가 곧 다음에 고칠 곳이다)',
+      r.timings.exportMs === 4_300 && r.timings.downloadMs === 432
+        && r.timings.parseMs === 570 && r.timings.installMs === 1 && r.elapsedMs === 5_303,
+      JSON.stringify(r.timings) + ` 합 ${r.elapsedMs}`,
+    );
+    check('install 이 돌려준 통계가 그대로 결과에 실린다 (화면에 찍히는 숫자)',
+      r.stats.meshes === 27 && r.stats.vertices === 33_087 && r.stats.textures === 8,
+      JSON.stringify(r.stats));
+    check('export 응답이 그대로 실린다 (파일명·크기를 화면에 쓴다)',
+      r.info.bytes === 36_500_000 && r.info.name === 'sample.gltf', JSON.stringify(r.info.name));
+    check('기본 형식은 gltf 다', rig.formats.join(',') === 'gltf', rig.formats.join(','));
+
+    // 진행률 — 다운로드 보고가 화면에 그대로 찍힌다.
+    const dl = progress.filter((p) => p.phase === 'downloading');
+    check(
+      '★ 다운로드 진행률이 그대로 전달된다 (36MB 동안 화면이 말을 한다)',
+      dl.length === 4 && dl[1]?.loaded === 0 && dl[3]?.loaded === 36_500_000
+        && dl.every((p) => p.total === 36_500_000),
+      dl.map((p) => `${p.loaded}/${p.total}`).join(' '),
+    );
+    check('진행 보고의 elapsedMs 가 단조 증가한다',
+      progress.every((p, i) => i === 0 || p.elapsedMs >= (progress[i - 1]?.elapsedMs ?? 0)),
+      progress.map((p) => p.elapsedMs).join(','));
+    check('한 번 성공에 익스포트는 한 번뿐이다 (36MB 를 두 번 쓰지 않는다)',
+      rig.calls.export === 1 && rig.calls.download === 1 && rig.calls.parse === 1
+        && rig.calls.install === 1,
+      JSON.stringify(rig.calls));
+
+    const s = loader.stats;
+    check('집계 — 성공 1, 실패 0, 버림 0',
+      s.attempts === 1 && s.succeeded === 1 && s.failed === 0 && s.discarded === 0
+        && s.coalesced === 0,
+      JSON.stringify({ a: s.attempts, s: s.succeeded, f: s.failed, d: s.discarded }));
+
+    // clear() — 씬을 갈아 끼우는 자리
+    loader.clear();
+    check('★ clear() 는 화면에서 내리고 target 까지 해제한다',
+      rig.calls.clear === 1 && !loader.present && loader.phase === 'idle',
+      `clear ${rig.calls.clear}, present ${loader.present}, ${loader.phase}`);
+  }
+
+  // ── 중복 호출: 진행 중이면 새로 시작하지 않는다 ──────────────
+  {
+    const rig = fakeSnapshotRig();
+    const loader = new SnapshotLoader<string>({ source: rig.source, target: rig.target });
+    const a = loader.load();
+    const b = loader.load();
+    const c = loader.load();
+    check('★ 진행 중 재호출은 같은 약속을 돌려준다 (버튼 연타가 36MB 를 세 번 쓰지 않는다)',
+      a === b && b === c, `a===b ${a === b}, b===c ${b === c}`);
+    check('★ 익스포트를 다시 시작하지 않았다', rig.calls.export === 1, String(rig.calls.export));
+    const s0 = loader.stats;
+    check('합쳐진 호출이 attempts 가 아니라 coalesced 로 세어진다',
+      s0.attempts === 1 && s0.coalesced === 2, `attempts ${s0.attempts}, coalesced ${s0.coalesced}`);
+
+    rig.passAll();
+    const [ra, rb] = await Promise.all([a, b]);
+    check('합쳐진 호출도 같은 결과를 받는다', ra === rb && ra.stats.meshes === 27);
+
+    // 끝난 뒤에는 다시 시작한다 — 자물쇠가 풀렸는가
+    const rig2 = loader.load();
+    check('★ 끝난 뒤에는 새로 시작한다 (자물쇠가 풀렸다)',
+      rig.calls.export === 2 && loader.stats.attempts === 2,
+      `export ${rig.calls.export}, attempts ${loader.stats.attempts}`);
+    void rig2.catch(() => {});
+    loader.clear(); // 두 번째 시도를 정리한다
+    await caughtWithin(rig2);
+  }
+
+  // ── 실패: 세 단계 각각 ───────────────────────────────────────
+  for (const stage of ['export', 'download', 'parse'] as const) {
+    const rig = fakeSnapshotRig();
+    const loader = new SnapshotLoader<string>({ source: rig.source, target: rig.target });
+    const p = loader.load();
+    if (stage !== 'export') rig.gates.export.resolve(exportInfo());
+    if (stage === 'parse') rig.gates.download.resolve(new ArrayBuffer(8));
+    await tick();
+    rig.gates[stage].reject(new Error(`${stage} 실패`));
+
+    const err = await caughtWithin(p);
+    const s = loader.stats;
+    check(
+      `${stage} 가 실패하면 실패로 세고 이유가 남는다 (phase error)`,
+      err instanceof Error && messageOf(err) === `${stage} 실패`
+        && s.failed === 1 && s.discarded === 0 && s.succeeded === 0
+        && s.phase === 'error' && s.lastError === err && !loader.busy,
+      `${messageOf(err)}, failed ${s.failed}, phase ${s.phase}`,
+    );
+    check(
+      `${stage} 실패 뒤에는 화면에 아무것도 세우지 않는다`,
+      !loader.present && rig.calls.install === 0,
+      `present ${loader.present}, install ${rig.calls.install}`,
+    );
+  }
+
+  // install 이 던지는 경우 — 여기까지 왔으면 바이트는 멀쩡한데 three 가 거부한 것이다
+  {
+    const rig = fakeSnapshotRig();
+    rig.breakInstall();
+    const loader = new SnapshotLoader<string>({ source: rig.source, target: rig.target });
+    const p = loader.load();
+    rig.passAll();
+    const err = await caughtWithin(p);
+    check('install 이 던져도 실패로 잡힌다 (예외가 새어 나가지 않는다)',
+      messageOf(err) === 'install 실패' && loader.stats.failed === 1 && !loader.present,
+      `${messageOf(err)}, present ${loader.present}`);
+  }
+
+  // ── 대조군: 이미 선 스냅샷이 있는 상태에서 다시 찍는다 ───────
+  {
+    const rig = fakeSnapshotRig();
+    const loader = new SnapshotLoader<string>({ source: rig.source, target: rig.target });
+    const first = loader.load();
+    rig.passAll(); // 세 gate 가 모두 resolve 된 상태로 남는다 → 두 번째도 즉시 통과
+    await first;
+    await tick(); // 자물쇠가 풀리기를 기다린다 (바로 아래 항목 참고)
+
+    const second = await loader.load();
+    check(
+      '대조군 — 이미 선 스냅샷이 있어도 다시 찍으면 새로 익스포트해서 갈아 끼운다',
+      loader.stats.succeeded === 2 && loader.present && rig.calls.install === 2
+        && second.stats.meshes === 27,
+      `succeeded ${loader.stats.succeeded}, install ${rig.calls.install}`,
+    );
+    check(
+      '★ 다시 찍을 때 target.clear() 를 호출자가 따로 부르지 않는다 (install 이 이전 것을 해제한다)',
+      rig.calls.clear === 0, `clear ${rig.calls.clear}`,
+    );
+  }
+
+  // ── 함정 기록: 끝나자마자(같은 마이크로태스크 턴) 다시 부르면 ─
+  //
+  // 자물쇠(`#inFlight`)를 푸는 것은 `promise.catch().finally()` 라, **결과가
+  // 나온 turn 보다 한 마이크로태스크 늦다.** 그래서 `await load()` 바로 다음
+  // 줄의 `load()` 는 이미 끝난 시도에 합쳐져 **옛 결과를 그대로 돌려준다** —
+  // 새 익스포트가 돌지 않는다. 사람이 버튼을 누르는 간격은 매크로태스크
+  // 단위라 UI 에서는 닿지 않지만, 코드로 연달아 부르면 닿는다.
+  {
+    const rig = fakeSnapshotRig();
+    const loader = new SnapshotLoader<string>({ source: rig.source, target: rig.target });
+    const p = loader.load();
+    rig.passAll();
+    await p;
+    const immediate = loader.load();
+    check(
+      '함정 — 끝난 직후 같은 턴에 다시 부르면 새로 시작하지 않고 옛 결과를 돌려준다',
+      immediate === p && rig.calls.export === 1 && loader.stats.coalesced === 1,
+      `같은 약속 ${immediate === p}, export ${rig.calls.export}, coalesced ${loader.stats.coalesced}`,
+    );
+    await caughtWithin(immediate);
+  }
+
+  // ── 세대전환 ①: 익스포트 중에 clear() ────────────────────────
+  {
+    const rig = fakeSnapshotRig();
+    const loader = new SnapshotLoader<string>({ source: rig.source, target: rig.target });
+    const p = loader.load();
+    loader.clear(); // 사용자가 다른 씬을 눌렀다
+    rig.gates.export.resolve(exportInfo());
+    const err = await caughtWithin(p);
+    const s = loader.stats;
+    check(
+      '★ 취소는 SnapshotStaleError 다 (main.ts 가 이걸로 오류와 가른다)',
+      err instanceof SnapshotStaleError && (err as Error).name === 'SnapshotStaleError',
+      err instanceof Error ? `${err.name}: ${err.message}` : String(err),
+    );
+    check(
+      '★★ 취소는 failed 가 아니라 discarded 로 세어진다 (뒤집히면 정상 동작이 빨간 오류가 된다)',
+      s.discarded === 1 && s.failed === 0 && s.succeeded === 0,
+      `discarded ${s.discarded}, failed ${s.failed}`,
+    );
+    check(
+      '★ 취소는 phase 를 error 로 덮지 않는다 (clear 가 정한 idle 이 남는다)',
+      s.phase === 'idle', s.phase,
+    );
+    check('★ 취소된 뒤에는 더 내려받지 않는다 (36MB 를 헛되이 받지 않는다)',
+      rig.calls.download === 0 && rig.calls.parse === 0 && rig.calls.install === 0,
+      JSON.stringify(rig.calls));
+    check('취소 뒤에도 자물쇠는 풀린다', !loader.busy, `busy ${loader.busy}`);
+  }
+
+  // ── 세대전환 ②: 파싱이 끝난 **뒤에** 세대가 바뀌었다 ─────────
+  //    여기서만은 GPU 자원이 이미 만들어져 있다. 참조를 놓는 것으로는 안 된다.
+  {
+    const rig = fakeSnapshotRig();
+    const loader = new SnapshotLoader<string>({ source: rig.source, target: rig.target });
+    const p = loader.load();
+    rig.gates.export.resolve(exportInfo());
+    await tick();
+    rig.gates.download.resolve(new ArrayBuffer(8));
+    await tick();
+    check('파싱 직전까지 왔다', loader.phase === 'parsing' && rig.calls.parse === 1, loader.phase);
+    loader.clear(); // 파싱이 도는 사이에 씬이 바뀌었다
+    rig.gates.parse.resolve('버려질 내용');
+    const err = await caughtWithin(p);
+    check(
+      '★ 늦게 온 파싱 결과는 씬에 붙이지 않는다 (다른 씬의 아바타가 서 있게 된다)',
+      err instanceof SnapshotStaleError && rig.calls.install === 0,
+      `${messageOf(err)}, install ${rig.calls.install}`,
+    );
+    check(
+      '★ 버릴 때 dispose 로 넘긴다 (텍스처가 GPU 에 남는다 — 참조를 놓는 것으로는 안 된다)',
+      rig.calls.dispose === 1 && rig.disposed[0] === '버려질 내용',
+      `dispose ${rig.calls.dispose}, ${rig.disposed.join(',')}`,
+    );
+    check('이 경우도 discarded 다', loader.stats.discarded === 1 && loader.stats.failed === 0,
+      `discarded ${loader.stats.discarded}, failed ${loader.stats.failed}`);
+  }
+
+  // ── 세대전환 ③: dispose 가 없는 target 이어도 깨지지 않는다 ──
+  {
+    const rig = fakeSnapshotRig();
+    const noDispose: SnapshotTarget<string> = {
+      parse: rig.target.parse.bind(rig.target),
+      install: rig.target.install.bind(rig.target),
+      clear: rig.target.clear.bind(rig.target),
+    };
+    const loader = new SnapshotLoader<string>({ source: rig.source, target: noDispose });
+    const p = loader.load();
+    rig.gates.export.resolve(exportInfo());
+    await tick();
+    rig.gates.download.resolve(new ArrayBuffer(8));
+    await tick();
+    loader.clear();
+    rig.gates.parse.resolve('x');
+    check('dispose 가 선택적이다 (없어도 취소가 성립한다)',
+      (await caughtWithin(p)) instanceof SnapshotStaleError && loader.stats.discarded === 1);
+  }
+
+  // ── 진행 보고가 던져도 흐름을 깨지 않는다 ────────────────────
+  {
+    const rig = fakeSnapshotRig();
+    const loader = new SnapshotLoader<string>({
+      source: rig.source,
+      target: rig.target,
+      onProgress: () => {
+        throw new Error('화면 갱신이 던졌다');
+      },
+    });
+    const p = loader.load();
+    rig.passAll();
+    const err = await caughtWithin(p);
+    check(
+      '★ 진행률 콜백이 던져도 스냅샷은 완성된다 (숫자 찍는 코드가 36MB 를 죽이지 않는다)',
+      err === null && loader.present && loader.stats.succeeded === 1,
+      err === null ? 'ok' : messageOf(err),
+    );
+  }
+
+  // ── 함정 기록: clear() 직후의 load() ─────────────────────────
+  //
+  // clear() 는 세대만 올릴 뿐 진행 중인 시도를 **끊지 않는다.** 그래서 그
+  // 시도가 아직 살아 있는 동안의 load() 는 (중복 방지 규칙에 따라) 이미
+  // 죽기로 된 약속을 그대로 받는다 — 새 익스포트가 시작되지 않는다.
+  // main.ts 에서는 `snapshots.busy` 로 버튼이 잠겨 있어 사람이 이 경로에
+  // 들어가지 못하지만, 그 잠금이 사라지면 "스냅샷을 눌렀는데 취소됐다고
+  // 나온다" 가 된다. 지금 동작을 못으로 박아 둔다.
+  {
+    const rig = fakeSnapshotRig();
+    const loader = new SnapshotLoader<string>({ source: rig.source, target: rig.target });
+    const p1 = loader.load();
+    void p1.catch(() => {});
+    loader.clear();
+    const p2 = loader.load();
+    check(
+      '함정 — clear() 직후 load() 는 새 익스포트가 아니라 버려질 시도에 합쳐진다',
+      p1 === p2 && rig.calls.export === 1 && loader.stats.coalesced === 1,
+      `같은 약속 ${p1 === p2}, export ${rig.calls.export}`,
+    );
+    rig.gates.export.resolve(exportInfo());
+    check('그 결과는 취소로 온다 (busy 잠금이 사라지면 사용자에게 보인다)',
+      (await caughtWithin(p2)) instanceof SnapshotStaleError);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// §8-9. 스냅샷 부착 — 스케일 100 과 GPU 해제 (snapshotView.ts)
+//
+// 이 파일은 브라우저 전용으로 **표시돼 있지만**, DOM 이 실제로 필요한 것은
+// `parseSnapshot` 하나뿐이다(GLTFLoader 가 임베드 이미지를 `ImageBitmapLoader`
+// 로 연다 — §8-10 이 그 경계를 실제로 확인한다). `SnapshotObject` 는 three 의
+// 데이터 구조만 쓰므로 `cloth.ts` 와 같은 이유로 Node 에서 그대로 돈다.
+//
+// 그래서 이 단위에서 사람이 눈으로 판정해야 할 것 중 **두 가지**를 여기서
+// 뺏어 올 수 있다:
+//   - 스케일: 아바타가 격자 한 칸 안의 점으로 나오는가 / 사람 크기인가
+//   - 해제 : 다시 찍을 때마다 GPU 메모리가 느는가 (눈으로는 아예 안 보인다)
+// ─────────────────────────────────────────────────────────────
+
+/** 텍스처를 단 메시 하나. `install` 통계와 해제를 볼 최소 단위 */
+function texturedMesh(size: number, tex: THREE.Texture, extraSlot = false): THREE.Mesh {
+  const geo = new THREE.BoxGeometry(size, size, size);
+  const mat = new THREE.MeshStandardMaterial({ map: tex });
+  if (extraSlot) {
+    // 이름으로 나열하지 않고 값으로 훑는다는 계약. 로더가 KHR 확장 슬롯에
+    // 텍스처를 꽂아도 새어 나가면 안 된다.
+    (mat as unknown as Record<string, unknown>)['훗날생길확장Map'] = tex;
+  }
+  return new THREE.Mesh(geo, mat);
+}
+
+function countingTexture(): { tex: THREE.Texture; disposals: () => number } {
+  const tex = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
+  let n = 0;
+  tex.addEventListener('dispose', () => {
+    n += 1;
+  });
+  return { tex, disposals: () => n };
+}
+
+function sectionSnapshotObject(): void {
+  section('§8-9. 스냅샷 부착 — 스케일과 해제 (snapshotView.ts, DOM 없이)');
+
+  // ── 스케일: 익스포터가 건 0.01 의 역수라는 관계 ──────────────
+  check(
+    '★ SNAPSHOT_SCALE 은 익스포터가 루트에 거는 0.01 의 역수다 (100 × 0.01 = 1, 근사가 아니다)',
+    SNAPSHOT_SCALE === 100 && SNAPSHOT_SCALE * 0.01 === 1,
+    String(SNAPSHOT_SCALE),
+  );
+
+  const obj = new SnapshotObject();
+  check('그룹에 그 스케일이 걸려 있다',
+    obj.group.scale.x === SNAPSHOT_SCALE && obj.group.scale.y === SNAPSHOT_SCALE
+      && obj.group.scale.z === SNAPSHOT_SCALE,
+    obj.group.scale.toArray().join(','));
+  check(
+    '★ 처음에는 보이지 않는다 (붙는 순간 실시간 옷과 겹쳐 보이는 한 프레임을 만들지 않는다)',
+    obj.group.visible === false, String(obj.group.visible),
+  );
+  check('대조군 — 아무것도 안 붙였으면 present 가 false 이고 경계상자가 비어 있다',
+    obj.present === false && obj.boundingBox().isEmpty() && obj.stats.meshes === 0);
+
+  // ── install: 통계와 좌표 ─────────────────────────────────────
+  const { tex, disposals } = countingTexture();
+  const root = new THREE.Object3D();
+  // 익스포터의 계층을 흉내낸다: 루트에 0.01, 옷 노드에 translation.
+  root.scale.setScalar(0.01);
+  const inner = new THREE.Object3D();
+  inner.position.set(0, 54.7, 0);
+  // 한 텍스처를 **두 메시가 공유**한다. 실제 파일이 그렇다(머티리얼 14 / 텍스처 8).
+  inner.add(texturedMesh(100, tex));
+  inner.add(texturedMesh(50, tex, true));
+  root.add(inner);
+
+  const stats = obj.install({ scene: root });
+  check('통계 — 메시 수와 정점 수', stats.meshes === 2 && stats.vertices === 48,
+    JSON.stringify(stats));
+  check('★ 공유 텍스처를 두 번 세지 않는다 (머티리얼 2 / 텍스처 1)',
+    stats.materials === 2 && stats.textures === 1, JSON.stringify(stats));
+  check('present 와 stats 가 같이 선다', obj.present && obj.stats.vertices === 48);
+
+  const box = obj.boundingBox();
+  const size = box.getSize(new THREE.Vector3());
+  check(
+    '★★ 익스포터의 0.01 이 상쇄돼 엔진 좌표(cm)로 복원된다 (100 × 0.01 = 1)',
+    Math.abs(size.y - 100) < 1e-6 && Math.abs(box.min.y - (54.7 - 50)) < 1e-4,
+    `높이 ${size.y.toFixed(3)}cm, 바닥 y=${box.min.y.toFixed(3)}`,
+  );
+  check(
+    '★ 노드 변환을 손대지 않는다 (옷 노드의 translation 이 그대로 남아 아바타와 맞는다)',
+    Math.abs(inner.position.y - 54.7) < 1e-6 && root.scale.x === 0.01,
+    `inner.y=${inner.position.y}, root.scale=${root.scale.x}`,
+  );
+  check('감싸는 그룹에 붙었다 (씬에 넣을 것이 여기 있다)',
+    obj.group.children.length === 1 && obj.group.children[0] === root,
+    String(obj.group.children.length));
+
+  // ── 다시 install: 이전 것이 해제되는가 ───────────────────────
+  const { tex: tex2 } = countingTexture();
+  const root2 = new THREE.Object3D();
+  root2.add(texturedMesh(10, tex2));
+  const stats2 = obj.install({ scene: root2 });
+  check(
+    '★ 다시 찍으면 이전 것이 해제된다 (안 하면 다시 찍을 때마다 GPU 메모리가 는다)',
+    disposals() === 1, `이전 텍스처 dispose ${disposals()}회`,
+  );
+  check('★ 공유 텍스처를 두 번 해제하지 않는다 (머티리얼 2개가 물고 있었다)',
+    disposals() === 1, String(disposals()));
+  check('겹쳐 쌓이지 않는다 (children 1, 통계도 갈아 끼워진다)',
+    obj.group.children.length === 1 && stats2.meshes === 1 && stats2.textures === 1,
+    `children ${obj.group.children.length}, ${JSON.stringify(stats2)}`);
+
+  // ── clear ────────────────────────────────────────────────────
+  const { tex: tex3, disposals: d3 } = countingTexture();
+  const root3 = new THREE.Object3D();
+  const mesh3 = texturedMesh(10, tex3, true);
+  root3.add(mesh3);
+  const geo3 = mesh3.geometry;
+  let geoDisposed = 0;
+  geo3.addEventListener('dispose', () => {
+    geoDisposed += 1;
+  });
+  obj.install({ scene: root3 });
+  obj.clear();
+  check(
+    '★ clear() 가 지오메트리·텍스처까지 해제한다',
+    d3() === 1 && geoDisposed === 1, `텍스처 ${d3()}, 지오메트리 ${geoDisposed}`,
+  );
+  check('clear() 뒤에는 present 도 통계도 비어 있다',
+    !obj.present && obj.stats.meshes === 0 && obj.group.children.length === 0
+      && obj.boundingBox().isEmpty());
+  check('clear() 를 두 번 불러도 안전하다 (해제가 두 번 일어나지 않는다)',
+    (() => {
+      obj.clear();
+      return d3() === 1;
+    })(), String(d3()));
+
+  // ── dispose(content): 붙이지 못한 결과 ───────────────────────
+  const { tex: tex4, disposals: d4 } = countingTexture();
+  const orphan = new THREE.Object3D();
+  orphan.add(texturedMesh(10, tex4));
+  obj.dispose({ scene: orphan });
+  check(
+    '★ 붙이지 못한 파싱 결과도 해제된다 (세대가 바뀐 36MB 가 GPU 에 남지 않는다)',
+    d4() === 1 && orphan.children.length === 0, `dispose ${d4()}, 남은 자식 ${orphan.children.length}`,
+  );
+
+  // ── 슬롯을 이름으로 나열하지 않는다 ──────────────────────────
+  const { tex: tex5, disposals: d5 } = countingTexture();
+  const exotic = new THREE.Object3D();
+  const m = new THREE.MeshStandardMaterial();
+  // `map` 도 `normalMap` 도 아닌, 이름 목록에 있을 리 없는 슬롯.
+  (m as unknown as Record<string, unknown>)['앞으로생길KHR확장Map'] = tex5;
+  exotic.add(new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), m));
+  const exoticStats = obj.install({ scene: exotic });
+  check(
+    '★ 모르는 이름의 슬롯에 달린 텍스처도 센다 (isTexture 값으로 훑는다)',
+    exoticStats.textures === 1, JSON.stringify(exoticStats),
+  );
+  obj.clear();
+  check('★ 모르는 이름의 슬롯도 해제된다 (새 KHR 확장이 조용히 새어 나가지 않는다)',
+    d5() === 1, String(d5()));
+}
+
+// ─────────────────────────────────────────────────────────────
+// §8-10. 실제 익스포트 → 화면 직전까지 (진짜 워커 glTF 한 번)
+//
+// §8-8·§8-9 는 전부 **우리가 만든 값**으로 돈다. 그것만으로는 "익스포터가
+// 정말 루트에 0.01 을 거는가", "그 파일에 아바타와 텍스처가 정말 들어 있는가"
+// 를 증명하지 않는다 — 그리고 그 둘이 이 단위의 통과 기준 전부다.
+//
+// 그래서 여기서는 **익스포트를 딱 한 번** 돌린다. sample.zls 로 9.7MB / 1~2초다
+// (사용자 씬은 36.5MB / 4.3초라 자동 테스트에 넣을 크기가 아니고, 애초에
+// 저장소에 없다). 그 한 파일로 세 가지를 본다:
+//
+//   ① 실제 source(client.exportScene + downloadExport)로 상태 기계가 도는가
+//   ② 파일에 아바타·머티리얼·이미지가 실제로 들어 있는가 (= "진짜 색")
+//   ③ 그 파일이 우리 씬에 섰을 때 **사람 크기(cm)** 인가
+//
+// ③ 은 `parseSnapshot` 이 브라우저 전용이라 그대로는 못 돌린다. 무엇이 DOM 을
+// 요구하는지 정확히 짚어 그 부분만 덜어낸다 — 아래 `stripImages` 참고. 덜어낸
+// 뒤에도 **지오메트리·노드 계층·루트 0.01 은 실제 파일 그대로다.**
+// ─────────────────────────────────────────────────────────────
+
+/** 이 절에서 실제로 읽는 glTF 필드만 (전체 스키마를 옮겨 적지 않는다) */
+interface GltfShape {
+  nodes?: { name?: string; scale?: number[]; children?: number[] }[];
+  scenes?: { nodes?: number[] }[];
+  meshes?: unknown[];
+  materials?: unknown[];
+  images?: unknown[];
+}
+
+/**
+ * glTF 에서 **이미지만** 덜어낸다. 나머지(정점·노드 변환·머티리얼 색)는 그대로다.
+ *
+ * 왜 필요한가: `GLTFLoader` 는 이미지를 만나면 `ImageBitmapLoader` 로 가고
+ * 그 안에서 `self` 를 읽는다. Node 에는 없다 — 그래서 `parseSnapshot` 이
+ * `snapshot.ts` 밖(브라우저 쪽)에 있는 것이다. 이 함수는 그 경계를 **우회하는
+ * 것이 아니라 정확히 어디인지 표시한다**: 이미지를 뺀 같은 파일은 Node 에서
+ * 그대로 열린다(아래에서 원본이 실패하는 것도 함께 확인한다).
+ */
+function stripImages(bytes: ArrayBuffer): { data: ArrayBuffer; json: GltfShape } {
+  const json = JSON.parse(new TextDecoder().decode(bytes)) as GltfShape;
+  const stripped = JSON.parse(JSON.stringify(json)) as Record<string, unknown>;
+  delete stripped['images'];
+  delete stripped['textures'];
+  delete stripped['samplers'];
+  const drop = (o: unknown): void => {
+    if (!o || typeof o !== 'object') return;
+    for (const [k, v] of Object.entries(o as Record<string, unknown>)) {
+      if (k.endsWith('Texture')) delete (o as Record<string, unknown>)[k];
+      else drop(v);
+    }
+  };
+  for (const m of (stripped['materials'] ?? []) as unknown[]) drop(m);
+  // `bufferViews` 를 지우지 않는 것이 중요하다 — 정점이 거기 들어 있다.
+  // 이미지가 쓰던 view 는 참조가 사라져 아무도 읽지 않는다.
+  const encoded = new TextEncoder().encode(JSON.stringify(stripped));
+  return { data: encoded.buffer.slice(0, encoded.byteLength) as ArrayBuffer, json };
+}
+
+/**
+ * Node 에 없는 `ProgressEvent` 를 잠깐 세워 둔다 (three 의 `FileLoader` 가
+ * data URI 를 읽을 때 만든다). **DOM 을 흉내내려는 것이 아니다** — 이 한
+ * 생성자만 없어서 버퍼 경로가 막히는 것을 열어, 진짜 경계(이미지)를 드러낸다.
+ */
+function withProgressEvent<T>(fn: () => Promise<T>): Promise<T> {
+  const g = globalThis as unknown as Record<string, unknown>;
+  const had = 'ProgressEvent' in g;
+  if (!had) {
+    g['ProgressEvent'] = class extends Event {
+      lengthComputable = false;
+      loaded = 0;
+      total = 0;
+      constructor(type: string, init: Record<string, unknown> = {}) {
+        super(type);
+        Object.assign(this, init);
+      }
+    };
+  }
+  return fn().finally(() => {
+    if (!had) delete g['ProgressEvent'];
+  });
+}
+
+async function sectionSnapshotRealExport(): Promise<void> {
+  section('§8-10. 스냅샷 종단 — 실제 워커가 뽑은 glTF (익스포트 1회)');
+
+  if (!existsSync(EXE) || !existsSync(ZLS)) {
+    note('생략', `exe=${existsSync(EXE)}, zls=${existsSync(ZLS)}`);
+    return;
+  }
+
+  // 산출물은 임시 디렉토리로 보낸다. 기본값(`backend/data/exports`)을 쓰면
+  // 스모크를 한 번 돌 때마다 9.7MB 가 쌓인다 — TTL 은 게이트웨이가 살아 있는
+  // 동안만 도는데 이 게이트웨이는 몇 초 뒤에 닫힌다.
+  await withTempDir(async (tmp) => await withGateway(async (_gw, addr) => {
+    const scene = await findOrUploadScene(addr.url);
+    if (!scene) {
+      check('씬 준비', false, 'sample.zls를 준비하지 못했다');
+      return;
+    }
+
+    const client = new GatewayClient({ url: addr.url, requestTimeoutMs: 120_000 });
+    try {
+      await client.connect();
+      await client.load(scene.id);
+
+      // ── ① 실제 source 로 상태 기계를 돌린다 ──────────────────
+      //
+      // target 은 Node 에서 돌 수 있는 대역이다(파싱만 JSON 으로 대신한다).
+      // 여기서 보는 것은 **바이트가 상태 기계를 타고 끝까지 오는가**이고,
+      // 그 바이트로 무엇을 하는지는 ②·③ 이 본다.
+      const progress: { loaded: number; total: number }[] = [];
+      let received: ArrayBuffer | null = null;
+      const loader = new SnapshotLoader<ArrayBuffer>({
+        source: {
+          requestExport: (format) => client.exportScene(format),
+          download: (url, onProgress, expectedBytes) =>
+            downloadExport(url, {
+              base: addr.url,
+              expectedBytes,
+              onProgress: ({ loaded, total }) => onProgress(loaded, total),
+            }),
+        },
+        target: {
+          parse: async (bytes) => bytes,
+          install: (bytes) => {
+            received = bytes;
+            return { meshes: 0, vertices: 0, materials: 0, textures: 0 };
+          },
+          clear: () => {},
+        },
+        onProgress: (p) => {
+          if (p.phase === 'downloading') progress.push({ loaded: p.loaded, total: p.total });
+        },
+        now: () => performance.now(),
+      });
+
+      const r: SnapshotResult = await loader.load();
+      const bytes = received as ArrayBuffer | null;
+      check(
+        '★ 실제 익스포트가 상태 기계를 타고 끝까지 온다 (export → GET → parse → install)',
+        loader.phase === 'ready' && loader.present && bytes !== null,
+        `${loader.phase}, ${r.elapsedMs}ms`,
+      );
+      if (!bytes) {
+        check('받은 바이트가 있다', false);
+        return;
+      }
+      check(
+        '★ export 가 말한 크기와 실제로 받은 바이트가 같다 (중간에 잘리면 파싱이 실패한다)',
+        bytes.byteLength === r.info.bytes, `${bytes.byteLength} === ${r.info.bytes}`,
+      );
+      check(
+        '진행률이 단조 증가해 전체에 도달한다 (36MB 동안 화면이 멈춘 것처럼 보이지 않는다)',
+        progress.length > 1
+          && progress.every((p, i) => i === 0 || p.loaded >= (progress[i - 1]?.loaded ?? 0))
+          && progress[progress.length - 1]?.loaded === bytes.byteLength,
+        `보고 ${progress.length}회, 마지막 ${progress[progress.length - 1]?.loaded}/${progress[progress.length - 1]?.total}`,
+      );
+      note('실측', `${(r.info.bytes / (1 << 20)).toFixed(1)}MB — 익스포트 ${r.timings.exportMs}ms / 다운로드 ${r.timings.downloadMs}ms`);
+
+      // ── ② 파일 안에 무엇이 들어 있는가 ───────────────────────
+      const { data: strippedBytes, json } = stripImages(bytes);
+      const nodes = (json['nodes'] ?? []) as { name?: string; scale?: number[]; children?: number[] }[];
+      const rootIdx = ((json['scenes'] ?? [])[0]?.nodes ?? [])[0] as number | undefined;
+      const rootNode = rootIdx === undefined ? undefined : nodes[rootIdx];
+
+      check(
+        '★★ 익스포터가 루트에 거는 스케일이 0.01 이다 — SNAPSHOT_SCALE 100 의 근거',
+        rootNode?.scale?.length === 3 && rootNode.scale.every((v) => v === 0.01)
+          && SNAPSHOT_SCALE * (rootNode.scale[0] ?? 0) === 1,
+        `root scale = ${JSON.stringify(rootNode?.scale)}`,
+      );
+      const names = nodes.map((n) => n.name ?? '');
+      const avatars = names.filter((n) => n.startsWith('zeta_body')).length;
+      const cloths = names.filter((n) => n.startsWith('cloth')).length;
+      check(
+        '★ 한 파일에 아바타와 옷이 같이 들어 있다 (실시간 경로에는 아바타가 없다 — 이게 스냅샷의 이유다)',
+        avatars > 0 && cloths > 0, `아바타 노드 ${avatars}, 옷 노드 ${cloths}`,
+      );
+      check(
+        '★ 머티리얼과 임베드 이미지가 들어 있다 (= "진짜 옷 색")',
+        ((json['materials'] ?? []) as unknown[]).length > 0
+          && ((json['images'] ?? []) as unknown[]).length > 0,
+        `머티리얼 ${((json['materials'] ?? []) as unknown[]).length}, 이미지 ${((json['images'] ?? []) as unknown[]).length}`,
+      );
+
+      // ── ③ 진짜 GLTFLoader 로 세워 본다 ───────────────────────
+      //
+      // 이미지만 덜어낸 같은 파일이다. 정점·노드 변환·루트 0.01 은 실제 그대로라
+      // **크기와 위치**는 사람이 브라우저에서 보게 될 것과 정확히 같다.
+      await withProgressEvent(async () => {
+        // 대조군: 원본 그대로는 Node 에서 열리지 않는다. 이 실패가 곧
+        // `parseSnapshot` 이 `snapshot.ts` 밖에 있는 이유이고, 그래서
+        // 파싱만은 자동으로 못 덮는다는 사실의 증거다.
+        const rawErr = await caught(parseSnapshot(bytes));
+        check(
+          '★ 대조군 — 임베드 이미지가 있는 원본은 Node 에서 못 연다 (파싱이 주입인 이유)',
+          rawErr !== null, rawErr === null ? '열렸다(예상 밖)' : messageOf(rawErr),
+        );
+
+        const obj = new SnapshotObject();
+        try {
+          const parsed: ParsedSnapshot = await parseSnapshot(strippedBytes);
+          const stats = obj.install(parsed);
+          check(
+            '★ 실제 glTF 가 three 씬 그래프로 선다 (메시·정점이 파일과 맞는다)',
+            stats.meshes === ((json['meshes'] ?? []) as unknown[]).length && stats.vertices > 10_000,
+            `메시 ${stats.meshes}, 정점 ${stats.vertices.toLocaleString('ko-KR')}, 머티리얼 ${stats.materials}`,
+          );
+
+          const box = obj.boundingBox();
+          const size = box.getSize(new THREE.Vector3());
+          // ★ 이 한 줄이 "아바타가 격자 한 칸 안의 점으로 보인다" 를 막는다.
+          //   스케일이 1 이면 높이가 1.8cm 가 되고, 화면에서는 그냥 안 보인다.
+          check(
+            '★★ 실제 파일이 사람 크기(cm)로 선다 (높이 150~200cm) — 스케일 100 의 종단 확인',
+            size.y > 150 && size.y < 200,
+            `${size.x.toFixed(1)} × ${size.y.toFixed(1)} × ${size.z.toFixed(1)} cm`,
+          );
+          check(
+            '★ 발이 바닥(y≈0)에 있다 (격자 위에 서 있다 — 카메라 맞춤이 이 경계에 걸려 있다)',
+            Math.abs(box.min.y) < 5, `바닥 y = ${box.min.y.toFixed(2)}cm`,
+          );
+          check(
+            '옷이 아바타 안쪽 높이에 있다 (노드 translation 이 살아 있다)',
+            size.y > 100, `높이 ${size.y.toFixed(1)}cm`,
+          );
+          note('실측', `bbox ${size.x.toFixed(1)} × ${size.y.toFixed(1)} × ${size.z.toFixed(1)} cm, 바닥 y=${box.min.y.toFixed(2)}`);
+        } catch (err: unknown) {
+          check('이미지를 덜어낸 실제 glTF 파싱', false, messageOf(err));
+        } finally {
+          obj.clear();
+        }
+      });
+    } catch (err: unknown) {
+      check('스냅샷 종단', false, messageOf(err));
+    } finally {
+      await client.close().catch(() => {});
+    }
+  }, {
+    exportDir: path.join(tmp, 'exports'),
+    sessions: { idleTimeout: 0, requestTimeoutMs: 120_000 },
+  }));
+}
+
+// ─────────────────────────────────────────────────────────────
 // §9. 좀비 프로세스
 // ─────────────────────────────────────────────────────────────
 
@@ -2509,9 +3429,12 @@ async function main(): Promise<void> {
   sectionClothFrames();
   sectionFrameStreamQueue();
   sectionFrameStreamCloth();
+  await sectionSnapshotMachine();
+  sectionSnapshotObject();
   await sectionViewerRealScene();
   await sectionReconnectReload();
   await sectionRealFrames();
+  await sectionSnapshotRealExport();
   await sectionZombies();
 
   clearInterval(keepAlive);

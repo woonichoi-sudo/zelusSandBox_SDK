@@ -23,6 +23,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 
 import { ClothObject } from './cloth.ts';
+import { SnapshotObject } from './snapshotView.ts';
 
 export interface Viewer3DOptions {
   canvas: HTMLCanvasElement;
@@ -30,8 +31,32 @@ export interface Viewer3DOptions {
   background?: number;
 }
 
+/**
+ * 화면에 무엇을 세울지 — **둘 중 하나뿐이다.**
+ *
+ * - `live`     워커가 40/s 로 보내는 패턴 메시 (`cloth.ts`). **움직인다.**
+ *              아바타가 없고 색은 패턴 구분용 임의 팔레트다.
+ * - `snapshot` 익스포트한 glTF (`snapshotView.ts`). **정지 화면이다.**
+ *              아바타·머티리얼·텍스처가 들어 있다.
+ *
+ * ★ 둘을 동시에 켜지 않는 이유는 취향이 아니라 **좌표계가 다르기 때문이다**
+ *   (ISSUE-011). 익스포터는 옷 패턴 노드에 translation 을 걸어 내보내지만
+ *   `meshData` 는 그 변환 없이 패턴 로컬 정점만 준다. 겹쳐 놓으면 **같은 옷이
+ *   서로 어긋난 채 두 벌** 보이고, 그 화면을 보고 "익스포트가 틀렸나 실시간이
+ *   틀렸나"를 사람이 구분할 방법이 없다.
+ */
+export type ViewMode = 'live' | 'snapshot';
+
 export class Viewer3D {
   readonly cloth = new ClothObject();
+
+  /**
+   * 익스포트한 glTF 가 서는 자리 (#: 아바타 + 진짜 색).
+   *
+   * `SnapshotTarget` 을 구현하므로 `SnapshotLoader` 에 그대로 넘긴다 —
+   * 뷰어는 여전히 프로토콜을 모른다. 받아오는 일은 `snapshot.ts` 가 한다.
+   */
+  readonly snapshot = new SnapshotObject();
 
   readonly #canvas: HTMLCanvasElement;
   readonly #renderer: THREE.WebGLRenderer;
@@ -45,6 +70,7 @@ export class Viewer3D {
   #running = false;
   /** 렌더 루프가 실제로 몇 번 돌았는지. "화면이 멈춘 건가" 를 구분한다 */
   #renders = 0;
+  #mode: ViewMode = 'live';
 
   /**
    * 렌더 직전에 부를 콜백들 (#13 의 프레임 드레인이 여기 붙는다).
@@ -104,6 +130,10 @@ export class Viewer3D {
     this.#scene.add(this.#grid);
 
     this.#scene.add(this.cloth.group);
+    this.#scene.add(this.snapshot.group);
+    // 두 그룹의 visible 을 처음부터 한 곳에서 정한다. 생성자에서 이걸 빼면
+    // "아직 setMode 를 안 불렀을 때" 라는 정의되지 않은 상태가 생긴다.
+    this.setMode('live');
 
     this.#resizeObserver = new ResizeObserver(() => this.resize());
     this.#resizeObserver.observe(opts.canvas);
@@ -116,6 +146,29 @@ export class Viewer3D {
 
   get camera(): THREE.PerspectiveCamera {
     return this.#camera;
+  }
+
+  get mode(): ViewMode {
+    return this.#mode;
+  }
+
+  /**
+   * 실시간 ↔ 스냅샷을 전환한다. **겹쳐 보이는 상태를 표현할 수 없다.**
+   *
+   * 두 `visible` 을 **한 값에서 파생**시키는 것이 이 함수의 전부다. 토글을
+   * 두 개 두거나 각 그룹의 `visible` 을 밖에서 만지게 두면 "둘 다 켜짐" 이
+   * 언젠가 반드시 나온다 — 그리고 그 화면은 어긋난 옷 두 벌이라 원인을 못 읽는다
+   * (`ViewMode` 주석 / ISSUE-011).
+   *
+   * ⚠️ 안 보이는 쪽도 **갱신은 계속된다.** `cloth` 는 스냅샷 모드에서도 프레임을
+   *    계속 받아 두므로 실시간으로 돌아오는 순간이 즉시다. 숨기는 것은 그리는
+   *    것뿐이고 데이터가 아니다.
+   */
+  setMode(mode: ViewMode): void {
+    this.#mode = mode;
+    const live = mode === 'live';
+    this.cloth.group.visible = live;
+    this.snapshot.group.visible = !live;
   }
 
   /**
@@ -177,7 +230,9 @@ export class Viewer3D {
    * 경계 상자만 있으면 맞는다.
    */
   frameCamera(padding = 1.35): void {
-    const box = this.cloth.boundingBox();
+    // 지금 보이는 쪽에 맞춘다. 스냅샷은 아바타까지 들어 있어 경계가 옷보다
+    // 훨씬 크므로(약 170cm), 옷 기준으로 잡으면 머리가 화면 밖으로 나간다.
+    const box = this.#mode === 'snapshot' ? this.snapshot.boundingBox() : this.cloth.boundingBox();
     if (box.isEmpty()) return;
 
     const size = box.getSize(new THREE.Vector3());
@@ -245,6 +300,7 @@ export class Viewer3D {
     this.#resizeObserver.disconnect();
     this.#controls.dispose();
     this.cloth.clear();
+    this.snapshot.clear();
     this.#grid.geometry.dispose();
     (this.#grid.material as THREE.Material).dispose();
     this.#renderer.dispose();

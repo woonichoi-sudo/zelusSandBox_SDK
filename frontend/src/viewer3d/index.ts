@@ -10,8 +10,18 @@
  * 어차피 덮어써져 버려질 프레임을 푸느라 이벤트 루프를 태운다. 지오메트리는
  * 다시 만들지 않는다(`setTopology()` 는 로드할 때 한 번뿐).
  *
- * `FrameStream` 과 `ClothObject` 는 DOM·WebGL 을 만지지 않으므로 Node 스모크가
- * 그대로 돌린다. `Viewer3D` 만 브라우저 전용이다.
+ * `FrameStream` · `ClothObject` · `SnapshotLoader` 는 DOM 을 만지지 않으므로
+ * Node 스모크가 그대로 돌린다. 브라우저 전용은 `Viewer3D` 와, glTF 파싱이
+ * `ImageLoader` 를 타는 `SnapshotObject`/`parseSnapshot` 뿐이다.
+ *
+ * ── 스냅샷(#: 아바타 + 진짜 색)의 배선도 세 줄이다 ──────────
+ *
+ *   const snap = new SnapshotLoader({
+ *     source: { requestExport: (f) => client.exportScene(f), download: downloadExport },
+ *     target: viewer.snapshot,             // SnapshotTarget 을 이미 구현하고 있다
+ *   });
+ *   await snap.load();                     // export → GET → parse → install
+ *   viewer.setMode('snapshot');            // 실시간 옷과 **동시에 보이지 않는다**
  */
 
 export { ClothObject, type PatternMesh } from './cloth.ts';
@@ -24,4 +34,22 @@ export {
   type TopologyMismatch,
 } from './frameStream.ts';
 export { showScene, type ShownScene } from './loader.ts';
-export { Viewer3D, type Viewer3DOptions } from './viewer.ts';
+export {
+  SnapshotLoader,
+  SnapshotStaleError,
+  type SnapshotLoaderOptions,
+  type SnapshotLoaderStats,
+  type SnapshotPhase,
+  type SnapshotProgress,
+  type SnapshotResult,
+  type SnapshotSource,
+  type SnapshotStats,
+  type SnapshotTarget,
+} from './snapshot.ts';
+export {
+  parseSnapshot,
+  SnapshotObject,
+  SNAPSHOT_SCALE,
+  type ParsedSnapshot,
+} from './snapshotView.ts';
+export { Viewer3D, type ViewMode, type Viewer3DOptions } from './viewer.ts';
