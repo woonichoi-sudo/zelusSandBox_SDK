@@ -154,14 +154,14 @@
       "verify": "auto",
       "files": ["frontend/vite.config.ts", "frontend/src/protocol/", "backend/src/server/index.ts"],
       "depends": [8],
-      "status": "todo",
-      "commit": null
+      "status": "done",
+      "commit": "cd98123"
     },
     {
       "id": 12,
       "group": "frontend",
       "title": "three.js 3D 뷰",
-      "detail": "토폴로지(indices, uvs)는 최초 1회, positions만 매 프레임 교체. 카메라 조작은 전부 클라이언트에서 끝나 서버 왕복이 없다. 이 프로젝트의 첫 결승선.",
+      "detail": "토폴로지(indices, uvs)는 최초 1회, positions만 매 프레임 교체. 카메라 조작은 전부 클라이언트에서 끝나 서버 왕복이 없다. 이 프로젝트의 첫 결승선. 11번이 프로토콜 계층을 끝냈으므로 여기서 아는 사실: import는 frontend/src/protocol/index.ts 하나로 한다 — 내부 파일을 직접 가리키지 말 것. frame 이벤트는 mesh를 디코딩하지 않은 채로 준다. 40/s × 47.8KB라 이벤트 핸들러에서 디코딩하면 프레임을 놓치므로, decodePatterns 호출 시점은 렌더러가 정한다(밀린 프레임의 latest-wins 드롭은 게이트웨이 쪽 9번 몫이다). 비구독 상태면 mesh는 null이 아니라 키 자체가 없다 — mesh === null은 영원히 거짓이다. indices/uvs는 프레임 간 고정이라 frame 이벤트에 절대 오지 않는다. meshData(true)로 한 번만 받을 것. 재연결하면 새 워커다 — open 이벤트의 reconnected: true를 보고 씬을 다시 로드하는 코드가 12번에 있어야 한다(재연결은 기본 꺼져 있다). three.js는 frontend/package.json에만 추가하면 된다. 프록시·정적 서빙은 이미 배선돼 있다. 마지막으로, Node에 Uint8Array.fromBase64가 없어 브라우저 주 디코딩 경로가 자동 테스트에서 한 번도 실행되지 않는다 — 프론트 스모크가 폴리필로 우회한다. 형체가 깨져도 예외는 안 나는 종류라, 실브라우저 검증을 여기서 눈으로 한 번 해야 한다.",
       "test": "브라우저에 옷이 뜬다",
       "verify": "manual",
       "files": ["frontend/src/viewer3d/"],
