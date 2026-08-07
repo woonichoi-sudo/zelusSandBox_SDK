@@ -125,13 +125,13 @@
       "id": 9,
       "group": "gateway",
       "title": "백프레셔 latest-wins",
-      "detail": "시뮬이 브라우저보다 빠를 수 있다. ws.bufferedAmount가 임계값을 넘으면 중간 프레임을 버리고 최신 것만 보낸다. 시뮬 속도와 전송 속도를 분리한다. 8번이 백프레셔 없이 이벤트를 흘리게 됐고 그 비용이 실측됐다 — 구독 중 세션 하나가 1.82MB/s(프레임당 47.8KB, 40/s)이고, 클라이언트가 소켓 읽기를 멈추면 30초에 RSS +121MB가 쌓인 뒤 재개 시 밀린 1133건이 한꺼번에 온다. 하트비트 회수까지 최대 60초라 동시 4세션이면 1GB대가 된다. 고칠 곳은 sessions.ts의 #emit() 하나다 — 역방향의 유일한 통로이고 ws.bufferedAmount와 conn.droppedEvents가 거기서 다 보이므로, conn에 보류 프레임을 얹으면 된다. engineMessage는 frame과 같은 40/s이지만 ~30바이트다. 같은 정책으로 버리면 진단이 통째로 사라지므로 분리할 것. #detach가 리스너를 떼기 직전에 큐에 들어온 이벤트가 있을 수 있어, 보류 프레임을 #detach에서 비우는 것도 이 작업이다. conn.droppedEvents는 지금 어떤 테스트도 읽지 않는다 — 소켓이 닫히는 찰나에만 증가해 결정적 재현이 불가능하다. latest-wins를 넣을 때 이 카운터를 관측 가능한 형태로 노출해야 테스트가 선다. 테스트에서 ask()(ws.once('message'))를 시뮬 중에 쓰면 안 된다. 이벤트가 초당 80건 섞이므로 smoke.ts의 Inbox를 쓸 것.",
+      "detail": "시뮬이 브라우저보다 빠를 수 있다. ws.bufferedAmount가 임계값을 넘으면 중간 프레임을 버리고 최신 것만 보낸다. 시뮬 속도와 전송 속도를 분리한다. 8번이 백프레셔 없이 이벤트를 흘리게 됐고 그 비용이 실측됐다 — 구독 중 세션 하나가 1.82MB/s(프레임당 47.8KB, 40/s)이고, 클라이언트가 소켓 읽기를 멈추면 30초에 RSS +121MB가 쌓인 뒤 재개 시 밀린 1133건이 한꺼번에 온다. 하트비트 회수까지 최대 60초라 동시 4세션이면 1GB대가 된다. 고칠 곳은 sessions.ts의 #emit() 하나다 — 역방향의 유일한 통로이고 ws.bufferedAmount와 conn.droppedEvents가 거기서 다 보이므로, conn에 보류 프레임을 얹으면 된다. engineMessage는 frame과 같은 40/s이지만 ~30바이트다. 같은 정책으로 버리면 진단이 통째로 사라지므로 분리할 것. #detach가 리스너를 떼기 직전에 큐에 들어온 이벤트가 있을 수 있어, 보류 프레임을 #detach에서 비우는 것도 이 작업이다. conn.droppedEvents는 지금 어떤 테스트도 읽지 않는다 — 소켓이 닫히는 찰나에만 증가해 결정적 재현이 불가능하다. latest-wins를 넣을 때 이 카운터를 관측 가능한 형태로 노출해야 테스트가 선다. 테스트에서 ask()(ws.once('message'))를 시뮬 중에 쓰면 안 된다. 이벤트가 초당 80건 섞이므로 smoke.ts의 Inbox를 쓸 것. 통과했지만 커버리지 공백 2건이 남았다. #detach가 보류 프레임을 비우는 것(sessions.ts:820)은 테스트가 없다 — connections가 연결이 살아 있는 동안만 읽히고 닫힌 뒤 최종값은 종료 로그뿐이라 밖에서 관측할 방법이 없었다. 실제 워커 시나리오(9-3)의 \"최신 프레임 도착\" 단언은 드레인 경로에 이빨이 없다 — 재개 후 시뮬이 계속 돌아 새 프레임이 그냥 나가므로 #drainFrame 없이도 통과한다. 그 몫은 가짜 세션 테스트(9-1)가 전부 진다.",
       "test": "느린 소비자 흉내 → 중간 프레임이 드롭되고 최신 프레임이 도착",
       "verify": "auto",
-      "files": ["backend/src/server/sessions.ts"],
+      "files": ["backend/src/server/sessions.ts", "backend/src/server/smoke.ts", "backend/src/server/bridge.ts"],
       "depends": [8],
-      "status": "todo",
-      "commit": null
+      "status": "done",
+      "commit": "cc2b788"
     },
     {
       "id": 10,
@@ -173,7 +173,7 @@
       "id": 13,
       "group": "frontend",
       "title": "프레임 스트리밍",
-      "detail": "구독한 프레임을 positionAttr에 덮어쓴다. 3,022정점 × 12B = 36KB/프레임, 25fps면 약 900KB/s. 12번이 3D 뷰를 세웠으므로 여기서 아는 사실: 얹힐 자리는 viewer.cloth.updatePositions(patterns) 하나다 — 지오메트리를 다시 만들지 말 것. setTopology()를 매 프레임 부르면 GPU 버퍼를 매번 새로 할당한다. position은 이미 DynamicDrawUsage이고 updatePositions()가 법선과 boundingSphere를 다시 계산한다. decodePatterns()를 frame 이벤트 핸들러 안에서 부르면 안 된다 — 40/s × 47.8KB다. 최신 mesh만 들고 있다가 rAF에서 푸는 구조여야 하고, main.ts에 세기만 하는 자리가 비어 있다. 검증할 때 needsUpdate로 단언하지 말 것 — three에서 setter 전용이라 읽으면 undefined다. 실제 신호는 BufferAttribute.version 증가다. cloth.ts와 loader.ts는 DOM을 안 써서 Node 스모크에서 그대로 돈다 — 갱신 로직을 cloth.ts에 두는 한 자동 테스트가 붙고, viewer.ts나 main.ts로 새어 나가는 순간 수동 확인만 남는다. 백프레셔는 아직 없다(9번) — 구독 중 1.82MB/s가 그대로 흐른다.",
+      "detail": "구독한 프레임을 positionAttr에 덮어쓴다. 3,022정점 × 12B = 36KB/프레임, 25fps면 약 900KB/s. 12번이 3D 뷰를 세웠으므로 여기서 아는 사실: 얹힐 자리는 viewer.cloth.updatePositions(patterns) 하나다 — 지오메트리를 다시 만들지 말 것. setTopology()를 매 프레임 부르면 GPU 버퍼를 매번 새로 할당한다. position은 이미 DynamicDrawUsage이고 updatePositions()가 법선과 boundingSphere를 다시 계산한다. decodePatterns()를 frame 이벤트 핸들러 안에서 부르면 안 된다 — 40/s × 47.8KB다. 최신 mesh만 들고 있다가 rAF에서 푸는 구조여야 하고, main.ts에 세기만 하는 자리가 비어 있다. 검증할 때 needsUpdate로 단언하지 말 것 — three에서 setter 전용이라 읽으면 undefined다. 실제 신호는 BufferAttribute.version 증가다. cloth.ts와 loader.ts는 DOM을 안 써서 Node 스모크에서 그대로 돈다 — 갱신 로직을 cloth.ts에 두는 한 자동 테스트가 붙고, viewer.ts나 main.ts로 새어 나가는 순간 수동 확인만 남는다. 백프레셔가 들어왔다(9번) — sessions.ts의 #emit()이 ws.bufferedAmount > 256KiB이면 프레임을 보류 칸 하나에 얹고 ws.send 완료 콜백이 드레인한다. latest-wins라 중간 프레임은 게이트웨이에서 이미 버려진다 — 프레임 번호의 연속성을 가정하지 말 것. 번호는 건너뛰지만 역행하지는 않는다(칸이 하나이지 큐가 아니다). 이건 위의 \"최신 mesh만 들고 있다가 rAF에서 푼다\"와 같은 방향이라 서버가 한 겹 걸러 준 만큼 도착하는 프레임 수 자체가 줄지만, 게이트웨이 임계값은 소켓 버퍼 기준이라 브라우저가 디코딩을 못 따라가는 경우는 못 막는다 — 프론트 쪽 최신-only 큐는 여전히 필요하다. engineMessage는 흐름 제어 대상이 아니라 프레임이 드롭돼도 전부 온다. 관측 표면은 gw.sessions.connections[0]의 ConnectionInfo다 — droppedFrames(백프레셔로 버림), unsentEvents(소켓이 닫혀 못 보냄), pendingFrame, bufferedBytes. 다만 연결이 살아 있는 동안만 읽힌다. 테스트 함정(9번에서 실증): 30바이트짜리 프레임은 아무리 몰아쳐도 소켓 쓰기가 동기로 끝나 bufferedAmount가 0에서 안 올라간다. 백프레셔 경로를 밟게 하려면 실측 크기(~47.8KB)의 메시가 필요하고 smoke.ts의 bulkyMesh() 헬퍼가 그것이다. SessionsOptions.frameHighWaterMark: 0을 주면 파이프라인 깊이 1로 결정적 재현이 된다(이때 heartbeatIntervalMs: 0을 같이 줄 것). 시뮬 중에 ask()(ws.once('message'))를 쓰지 말고 smoke.ts의 Inbox를 쓸 것.",
       "test": "옷이 움직인다",
       "verify": "manual",
       "files": ["frontend/src/viewer3d/"],
