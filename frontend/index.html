@@ -3,41 +3,88 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Cobalt — 게이트웨이 상태</title>
+    <title>Cobalt — 3D 뷰</title>
     <style>
-      :root { color-scheme: light dark; }
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; background: #1b1e24; color: #e6e9ef; }
       body {
-        margin: 0;
-        padding: 2rem;
-        font: 14px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace;
+        font: 13px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+        overflow: hidden;
       }
-      h1 { font-size: 1rem; margin: 0 0 1.25rem; opacity: 0.6; font-weight: 600; }
-      dl { display: grid; grid-template-columns: 10rem 1fr; gap: 0.25rem 1rem; margin: 0; }
-      dt { opacity: 0.55; }
-      dd { margin: 0; overflow-wrap: anywhere; }
+
+      /* 캔버스가 바닥을 깔고, 나머지는 그 위에 얹힌다. 뷰포트가 곧 화면이다. */
+      #view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+
+      .bar {
+        position: fixed; top: 0; left: 0; right: 0; z-index: 2;
+        display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem;
+        padding: 0.5rem 0.75rem;
+        background: rgba(20, 23, 28, 0.82);
+        backdrop-filter: blur(6px);
+        border-bottom: 1px solid #2c333f;
+      }
+      .bar label { opacity: 0.55; }
+      select, button, input[type="file"] {
+        font: inherit; color: inherit;
+        background: #262b34; border: 1px solid #3a424f; border-radius: 4px;
+        padding: 0.25rem 0.5rem;
+      }
+      select { max-width: 26rem; }
+      button { cursor: pointer; }
+      button:hover:not(:disabled) { background: #313846; }
+      button:disabled, select:disabled { opacity: 0.45; cursor: default; }
+      .spacer { flex: 1 1 auto; }
+
+      #status { opacity: 0.8; }
+      #status.err { color: #ff9a9a; opacity: 1; }
+      .stat { opacity: 0.5; }
+      .stat b { font-weight: 600; opacity: 0.95; }
+
+      #hint {
+        position: fixed; left: 0.75rem; bottom: 0.6rem; z-index: 2;
+        opacity: 0.35; pointer-events: none;
+      }
+
+      #logWrap {
+        position: fixed; right: 0.75rem; bottom: 0.6rem; z-index: 2;
+        width: min(38rem, 46vw);
+      }
+      #logWrap summary { cursor: pointer; opacity: 0.45; text-align: right; }
       #log {
-        margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid currentColor;
-        opacity: 0.5; white-space: pre-wrap; max-height: 40vh; overflow-y: auto;
+        margin-top: 0.4rem; padding: 0.5rem;
+        max-height: 34vh; overflow-y: auto; white-space: pre-wrap;
+        background: rgba(20, 23, 28, 0.88); border: 1px solid #2c333f; border-radius: 4px;
+        opacity: 0.75; font-size: 12px;
       }
     </style>
   </head>
   <body>
     <!--
-      #11 은 프로토콜 계층까지다. 이 페이지는 그 계층이 살아 있다는 것을
-      눈으로 확인하기 위한 최소 판이고, 3D 뷰는 #12 에서 붙는다.
-      three.js 는 아직 의존성에 없다.
+      #12 = 3D 뷰. 옷이 **정지 상태로** 보이는 데까지다.
+      프레임 스트리밍은 #13, 재생 컨트롤은 #14, 2D 펼침은 #15, 파라미터는 #16.
+      여기에 그것들을 미리 넣지 말 것 — 각 단위가 자기 화면으로 판정된다.
     -->
-    <h1>Cobalt 게이트웨이 — 프로토콜 계층 (#11)</h1>
-    <dl>
-      <dt>연결 상태</dt><dd id="state">-</dd>
-      <dt>WS 주소</dt><dd id="ws">-</dd>
-      <dt>헬스</dt><dd id="health">-</dd>
-      <dt>엔진 버전</dt><dd id="version">-</dd>
-      <dt>프레임</dt><dd id="frame">-</dd>
-      <dt>엔진 메시지</dt><dd id="engine">-</dd>
-      <dt>대기 중 요청</dt><dd id="pending">0</dd>
-    </dl>
-    <div id="log"></div>
+    <canvas id="view"></canvas>
+
+    <div class="bar">
+      <label for="scene">씬</label>
+      <select id="scene"><option value="">불러오는 중…</option></select>
+      <button id="load" disabled>로드</button>
+      <input id="file" type="file" accept=".zls" />
+      <button id="upload" disabled>업로드</button>
+      <span class="spacer"></span>
+      <span id="stat" class="stat">-</span>
+      <span id="status">시작하는 중…</span>
+    </div>
+
+    <div id="hint">좌드래그 회전 · 우드래그 팬 · 휠 줌 &nbsp;|&nbsp; 격자 한 칸 = 10cm</div>
+
+    <details id="logWrap">
+      <summary>로그</summary>
+      <div id="log"></div>
+    </details>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

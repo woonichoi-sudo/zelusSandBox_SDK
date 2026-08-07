@@ -13,9 +13,13 @@
  *   - 재연결     — 뚫리면 앱이 빈 세션을 "복구됐다"고 믿는다 (§4)
  *   - 개발 프록시 — 뚫리면 #12 이후 전부가 원인 모를 1006/파싱오류가 된다 (§5)
  *   - SPA 폴백   — 뚫리면 fetch가 JSON 대신 HTML을 받아 진짜 원인이 묻힌다 (§6)
+ *   - 3D 지오메트리 — 뚫리면 증상이 전부 "화면이 비었다" 하나로 수렴한다 (§8)
  *
  * 프로토콜 계층은 DOM을 쓰지 않으므로(`WebSocket`/`JSON`/`setTimeout`뿐) Node에서
  * 그대로 돈다. `main.ts`는 DOM을 쓰므로 **여기서 import하지 않는다.**
+ * `viewer3d/cloth.ts`·`loader.ts`도 DOM을 쓰지 않는다(three의 데이터 구조뿐).
+ * DOM이 필요한 것은 `viewer.ts`의 WebGLRenderer 쪽이고, 그건 §8이 대역으로
+ * 대신한다 — 자세한 이유는 §8 머리말에 있다.
  *
  * 스타일은 backend/src/{sdk,server}/smoke.ts를 그대로 따른다. 프레임워크 없음.
  *
@@ -40,6 +44,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
+import * as THREE from 'three';
+
 import {
   decodeFloat32 as sdkDecodeFloat32,
   decodeInt32 as sdkDecodeInt32,
@@ -50,6 +56,9 @@ import {
   type GatewayAddress,
   type GatewayOptions,
 } from '../../../backend/src/server/index.ts';
+import { ClothObject } from '../viewer3d/cloth.ts';
+import { showScene } from '../viewer3d/loader.ts';
+import type { Viewer3D } from '../viewer3d/viewer.ts';
 
 import {
   base64ToBytes,
@@ -68,6 +77,7 @@ import {
   uploadScene,
   withScene,
   type ClientOp,
+  type DecodedPattern,
   type FrameMesh,
   type PatternData,
   type SceneSummary,
@@ -1281,10 +1291,52 @@ async function sectionStatic(): Promise<void> {
       if (m?.[1]) {
         const js = await fetch(`${addr.url}${m[1]}`);
         const body = await js.text();
+
+        // ── 왜 `\bBuffer\b` 를 세지 않는가 ────────────────────────
+        // three.js 가 자기 경고 문자열에 그 단어를 쓴다:
+        //   "BufferGeometry: Buffer size too small for points data…"
+        // `setFromPoints` 안의 리터럴이라 트리셰이킹으로 빠지지 않는다. 단어를
+        // 세는 방식은 three 를 들이는 순간(#12) 영구 오탐이 된다. 그래서 단어가
+        // 아니라 **Node 런타임을 실제로 부르는 형태**만 본다.
+        const NODE_ONLY: readonly [string, RegExp][] = [
+          ['Buffer.<메서드>', /\bBuffer\s*\.\s*(?:from|alloc|allocUnsafe|isBuffer|concat|byteLength)\b/],
+          ['globalThis.Buffer', /\bglobalThis\s*\.\s*Buffer\b/],
+          ['require(buffer)', /\brequire\s*\(\s*["'](?:node:)?buffer["']\s*\)/],
+          ['node: 스킴', /["']node:[a-z_]+["']/],
+          ['createRequire', /\bcreateRequire\b/],
+          ['__dirname/__filename', /\b__dirname\b|\b__filename\b/],
+          ['process.versions', /\bprocess\s*\.\s*versions\b/],
+        ];
+        const hits = NODE_ONLY.filter(([, re]) => re.test(body)).map(([name]) => name);
         check(
-          '★ 번들에 backend 코드가 섞이지 않았다 (import type만 썼다)',
-          js.status === 200 && !body.includes('require("buffer")') && !/\bBuffer\b/.test(body),
-          `status=${js.status}, ${body.length}바이트`,
+          '★ 번들에 Node 런타임 호출이 없다 (backend SDK가 섞이면 여기가 걸린다)',
+          js.status === 200 && hits.length === 0,
+          hits.length > 0 ? `걸린 패턴: ${hits.join(', ')}` : `status=${js.status}, ${body.length}바이트`,
+        );
+
+        // ★ 이쪽이 진짜 계약이다. 위 패턴은 "무엇을 부르는가"를 보므로 구멍이
+        //   있다 — Buffer를 안 쓰는 함수 하나(예: isEvent)만 값으로 import해도
+        //   backend 모듈은 번들에 들어오는데 위 목록은 조용하다. 소스맵의
+        //   `sources`는 **번들에 들어간 모듈 목록 그 자체**라 그 구멍이 없다.
+        //   (vite.config.ts가 sourcemap:true다. 꺼지면 이 단언이 먼저 알려준다.)
+        const map = await fetch(`${addr.url}${m[1]}.map`);
+        const sources = map.ok
+          ? ((JSON.parse(await map.text()) as { sources?: string[] }).sources ?? [])
+          : [];
+        const leaked = sources
+          .map((s) => s.replace(/\\/g, '/'))
+          .filter((s) => /(^|\/)backend\//.test(s));
+        const appSources = sources.filter((s) => !s.includes('node_modules'));
+        check(
+          '★ 번들 모듈 목록에 backend/ 가 하나도 없다 (import type만 썼다 — 소스맵 근거)',
+          map.ok && sources.length > 0 && leaked.length === 0,
+          leaked.length > 0
+            ? `섞인 모듈: ${leaked.join(', ')}`
+            : `모듈 ${sources.length}개 (앱 소스 ${appSources.length}개), 소스맵 status=${map.status}`,
+        );
+        note(
+          '번들 크기',
+          `${body.length}바이트 (three 포함). 상한을 걸지 않는 이유는 backend 누출이 겨우 수십 KB라 크기로는 안 잡히기 때문이다 — 위 두 단언이 그 일을 한다`,
         );
       }
     }, { staticDir: DIST });
@@ -1488,13 +1540,382 @@ async function sectionRealWorker(): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────
-// §8. 좀비 프로세스
+// §8. 3D 뷰 계층 (viewer3d) — 화면을 봐도 원인이 안 보이는 것들
+//
+// #12의 통과 기준은 `verify: manual`이라 "옷이 떴는가"는 사람이 본다. 그런데
+// 사람이 볼 수 있는 것은 **결과뿐이고 원인이 아니다.** 아래 셋은 전부 증상이
+// "화면이 비었다" 하나로 수렴해서, 눈으로는 어느 것인지 절대 구분할 수 없다:
+//
+//   - 인덱스가 Int32Array로 넘어간다 → drawElements가 거부 → 아무것도 안 그려짐
+//   - 법선이 없다                    → 조명 아래 새까맣게 → "안 그려짐"으로 보임
+//   - 경계구를 갱신 안 한다          → 프러스텀 컬링에 잘림 → 움직이다 사라짐
+//
+// 그리고 이 셋은 전부 DOM 없이 검증된다. `cloth.ts`는 three의 **데이터 구조만**
+// 쓰고 WebGLRenderer를 모른다(그건 viewer.ts다). 그래서 Node에서 그대로 돈다 —
+// 여기가 #12에서 자동으로 고정할 수 있는 유일한 영역이다.
+//
+// ⚠️ viewer.ts는 여기서 값으로 import하지 않는다. WebGLRenderer/ResizeObserver/
+//    OrbitControls는 DOM이 있어야 만들어진다. `showScene()`이 실제로 만지는
+//    표면은 `viewer.cloth`와 `viewer.frameCamera()` 둘뿐이라 대역으로 충분하다.
+// ─────────────────────────────────────────────────────────────
+
+/** 합성 패턴 하나. 값은 서로 겹치지 않게 seed로 어긋내 둔다 */
+function synthPattern(uuid: string, vertices: number, triangles: number, seed = 0): DecodedPattern {
+  const positions = new Float32Array(vertices * 3);
+  for (let i = 0; i < positions.length; i++) positions[i] = seed * 1000 + i * 0.5;
+  const indices = new Int32Array(triangles * 3);
+  for (let i = 0; i < indices.length; i++) indices[i] = (i * 7 + seed) % vertices;
+  const uvs = new Float32Array(vertices * 2);
+  for (let i = 0; i < uvs.length; i++) uvs[i] = i * 0.25;
+  return { uuid, positions, indices, uvs, vertices, triangles };
+}
+
+/**
+ * Node에서 세울 수 있는 최소한의 Viewer3D 대역.
+ *
+ * `showScene()`이 쓰는 것만 갖춘다. 진짜 Viewer3D를 만들면 WebGLRenderer가
+ * 캔버스를 요구해서 Node에서는 생성 자체가 불가능하다.
+ */
+function stubViewer(): { viewer: Viewer3D; cloth: ClothObject; framed: () => number } {
+  const cloth = new ClothObject();
+  let framed = 0;
+  const viewer = {
+    cloth,
+    frameCamera: (): void => {
+      framed += 1;
+    },
+  } as unknown as Viewer3D;
+  return { viewer, cloth, framed: () => framed };
+}
+
+function isGlIndexArray(a: ArrayLike<number>): boolean {
+  // WebGL의 drawElements는 UNSIGNED_BYTE/SHORT/INT만 받는다. three는 배열
+  // 타입을 보고 GL 타입을 정하므로, 이 셋이 아니면 그리기가 성립하지 않는다.
+  return a instanceof Uint8Array || a instanceof Uint16Array || a instanceof Uint32Array;
+}
+
+function sectionClothTopology(): void {
+  section('§8. 3D 뷰 — 토폴로지 (cloth.ts, DOM 없이)');
+
+  const src = synthPattern('p0', 6, 4, 1);
+  // 디코더가 준 배열을 나중에 건드려 본다. 소유권 검사에 쓴다.
+  const srcPositions = src.positions;
+  const srcIndices = src.indices as Int32Array;
+
+  const cloth = new ClothObject();
+  cloth.setTopology([src, synthPattern('p1', 5, 3, 2)]);
+
+  check('패턴 수', cloth.patternCount === 2, String(cloth.patternCount));
+  check('정점·삼각형 합계', cloth.vertexCount === 11 && cloth.triangleCount === 7,
+    `정점 ${cloth.vertexCount}, 삼각형 ${cloth.triangleCount}`);
+  check('메시가 group에 붙었다 (씬에 넣을 것이 여기 있다)',
+    cloth.group.children.length === 2, String(cloth.group.children.length));
+
+  const p0 = cloth.patterns[0];
+  if (!p0) {
+    check('패턴 0이 있다', false);
+    return;
+  }
+  const idx = p0.geometry.getIndex();
+
+  // ★ 이 단위에서 가장 조용한 회귀. toIndexArray()가 사라지면 예외도 경고도
+  //   없이 그냥 아무것도 안 그려진다 — 화면만 보면 원인이 보이지 않는다.
+  check(
+    '★ 인덱스가 WebGL이 받는 타입이다 (Int32Array 그대로면 아무것도 안 그려진다)',
+    idx !== null && isGlIndexArray(idx.array),
+    idx === null ? 'index가 없다' : idx.array.constructor.name,
+  );
+  check(
+    '★ 타입을 바꿔도 인덱스 값이 보존된다 (비트 재해석이지 캐스팅이 아니다)',
+    idx !== null && idx.array.length === srcIndices.length
+      && Array.from(idx.array).every((v, i) => v === srcIndices[i]),
+    idx === null ? '-' : `${Array.from(idx.array).slice(0, 6).join(',')} ← ${Array.from(srcIndices).slice(0, 6).join(',')}`,
+  );
+
+  // 소유권 — 디코더 버퍼는 프레임마다 새로 나므로 붙잡고 있으면 안 된다.
+  srcPositions[0] = -12345;
+  srcIndices[0] = 99;
+  check(
+    '★ 지오메트리가 디코더 버퍼를 붙잡지 않는다 (복사본을 소유한다)',
+    (p0.position.array as Float32Array)[0] !== -12345
+      && (idx === null || idx.array[0] !== 99),
+    `position[0]=${(p0.position.array as Float32Array)[0]}, index[0]=${idx?.array[0]}`,
+  );
+
+  check('position은 vec3다', p0.position.itemSize === 3 && p0.position.count === 6,
+    `itemSize=${p0.position.itemSize}, count=${p0.position.count}`);
+  const uv = p0.geometry.getAttribute('uv');
+  check('uv는 vec2다 (#15가 cm 단위 2D 좌표로 쓴다)',
+    uv !== undefined && uv.itemSize === 2 && uv.count === 6,
+    uv === undefined ? '없음' : `itemSize=${uv.itemSize}, count=${uv.count}`);
+
+  // ★ 법선이 없으면 조명 아래에서 새까맣다 = 눈에는 "안 그려짐"과 같다.
+  const normal = p0.geometry.getAttribute('normal');
+  check(
+    '★ 법선이 만들어졌다 (프로토콜에 없으므로 여기서 안 만들면 새까맣게 나온다)',
+    normal !== undefined && normal.count === 6
+      && Array.from(normal.array).every((v) => Number.isFinite(v)),
+    normal === undefined ? '없음' : `count=${normal.count}`,
+  );
+
+  check('position이 매 프레임 갱신될 것이라고 표시돼 있다 (#13)',
+    p0.position.usage === THREE.DynamicDrawUsage, String(p0.position.usage));
+  check('★ 머티리얼이 양면이다 (단면이면 옷 안쪽에서 통째로 사라진다)',
+    (p0.mesh.material as THREE.MeshStandardMaterial).side === THREE.DoubleSide,
+    String((p0.mesh.material as THREE.MeshStandardMaterial).side));
+  check('프러스텀 컬링이 꺼져 있다 (패턴 하나가 잘려 나가는 사고를 막는다)',
+    p0.mesh.frustumCulled === false, String(p0.mesh.frustumCulled));
+  check('경계구·경계상자가 계산돼 있다',
+    p0.geometry.boundingSphere !== null && p0.geometry.boundingBox !== null
+    && Number.isFinite(p0.geometry.boundingSphere?.radius ?? NaN),
+    `r=${p0.geometry.boundingSphere?.radius}`);
+  check('boundingBox()가 비어 있지 않다 (카메라 맞춤이 여기에 걸려 있다)',
+    !cloth.boundingBox().isEmpty());
+
+  // ── setTopology 멱등 — 재연결 후 재로드가 정확히 이 경로다 ──
+  let disposed = 0;
+  for (const p of cloth.patterns) p.geometry.addEventListener('dispose', () => { disposed += 1; });
+  cloth.setTopology([synthPattern('p0', 6, 4, 3), synthPattern('p1', 5, 3, 4)]);
+  check(
+    '★ setTopology를 다시 불러도 메시가 겹쳐 쌓이지 않는다 (재연결 재로드 경로)',
+    cloth.group.children.length === 2 && cloth.patternCount === 2,
+    `children=${cloth.group.children.length}, patterns=${cloth.patternCount}`,
+  );
+  check('★ 이전 지오메트리가 해제됐다 (반복 재로드가 GPU 메모리를 흘리지 않는다)',
+    disposed === 2, `${disposed}/2`);
+  check('정점·삼각형 수가 누적되지 않는다',
+    cloth.vertexCount === 11 && cloth.triangleCount === 7,
+    `정점 ${cloth.vertexCount}, 삼각형 ${cloth.triangleCount}`);
+
+  cloth.clear();
+  check('clear()가 전부 비운다',
+    cloth.patternCount === 0 && cloth.group.children.length === 0 && cloth.vertexCount === 0);
+}
+
+function sectionClothFrames(): void {
+  section('§8-2. 3D 뷰 — 프레임 갱신 계약 (#13이 얹힐 자리)');
+
+  const cloth = new ClothObject();
+  cloth.setTopology([synthPattern('p0', 6, 4, 1), synthPattern('p1', 5, 3, 2)]);
+  const p0 = cloth.patterns[0];
+  if (!p0) {
+    check('패턴 0이 있다', false);
+    return;
+  }
+  const sphereBefore = p0.geometry.boundingSphere?.center.x ?? NaN;
+  // ⚠️ `needsUpdate`는 three에서 **setter 전용**이다(getter가 없어 읽으면
+  //    undefined). 실제로 올라간 표시는 `version` 증가 쪽이다.
+  const versionBefore = p0.position.version;
+
+  // 정상 경로
+  const next0 = synthPattern('p0', 6, 4, 9);
+  const ok = cloth.updatePositions([next0, synthPattern('p1', 5, 3, 9)]);
+  check('정상 갱신은 true', ok === true, String(ok));
+  check('★ 실제로 값이 반영됐다',
+    (p0.position.array as Float32Array)[0] === next0.positions[0],
+    `${(p0.position.array as Float32Array)[0]} === ${next0.positions[0]}`);
+  check('★ GPU 업로드가 예약됐다 (needsUpdate → version 증가. 안 서면 화면이 멎는다)',
+    p0.position.version > versionBefore, `${versionBefore} → ${p0.position.version}`);
+  check(
+    '★ 경계구가 다시 계산됐다 (안 하면 옷이 움직이다 컬링에 잘려 사라진다 / #16 레이캐스팅이 같은 값을 쓴다)',
+    (p0.geometry.boundingSphere?.center.x ?? NaN) !== sphereBefore,
+    `${sphereBefore} → ${p0.geometry.boundingSphere?.center.x}`,
+  );
+
+  // ── 거부해야 하는 것들. 여기서 true를 돌려주면 어긋난 메시를 조용히 그린다 ──
+  const mark = (p0.position.array as Float32Array)[0];
+  const versionAtReject = p0.position.version;
+
+  check('패턴 수가 다르면 false (토폴로지가 바뀌었다는 뜻이다)',
+    cloth.updatePositions([synthPattern('p0', 6, 4, 5)]) === false);
+  check('모르는 uuid면 false (다른 씬이다)',
+    cloth.updatePositions([synthPattern('p0', 6, 4, 5), synthPattern('그런패턴없음', 5, 3, 5)]) === false);
+  // 뒤쪽 패턴만 어긋나게 둔다. 앞쪽(p0)은 멀쩡하므로, 사전 검증 없이 쓰는
+  // 구현이면 p0에 5000이 들어가 버린다 — 바로 아래 단언이 그걸 본다.
+  check('정점 수가 다르면 false',
+    cloth.updatePositions([synthPattern('p0', 6, 4, 5), synthPattern('p1', 4, 3, 5)]) === false);
+
+  // ★ 절반만 쓰이면 화면에 형체가 깨진 옷이 뜨는데 원인을 눈으로 못 찾는다.
+  check(
+    '★ 거부할 때 절반도 쓰지 않는다 (앞 패턴이 멀쩡해도 건드리지 않는다)',
+    (p0.position.array as Float32Array)[0] === mark
+      && p0.position.version === versionAtReject,
+    `값 ${(p0.position.array as Float32Array)[0]} === ${mark}, version ${p0.position.version} === ${versionAtReject}`,
+  );
+
+  cloth.clear();
+}
+
+// ── §8-3. 실제 워커 바이트 → 화면에 설 지오메트리 ──────────────
+//
+// §7이 "바이트가 디코딩된다"까지 봤다면 여기는 그 다음 한 칸이다:
+// 디코딩된 것이 실제로 three 지오메트리로 서는가, 그리고 그 지오메트리가
+// 사람 옷의 규모인가. 후자는 사람이 화면에서 "커 보인다/작아 보인다"로만
+// 판정할 수 있는 것이라, 숫자로 박아 두면 그 판정이 필요 없어진다.
+
+async function sectionViewerRealScene(): Promise<void> {
+  section('§8-3. 3D 뷰 — 실제 워커 메시로 화면에 서는가 (loader.ts)');
+
+  if (!existsSync(EXE) || !existsSync(ZLS)) {
+    note('생략', `exe=${existsSync(EXE)}, zls=${existsSync(ZLS)}`);
+    return;
+  }
+
+  await withGateway(async (_gw, addr) => {
+    const scene = await findOrUploadScene(addr.url);
+    if (!scene) {
+      check('씬 준비', false, 'sample.zls를 준비하지 못했다');
+      return;
+    }
+
+    const client = new GatewayClient({ url: addr.url, requestTimeoutMs: 60_000 });
+    const { viewer, cloth, framed } = stubViewer();
+    try {
+      await client.connect();
+
+      const shown = await showScene(client, viewer, scene.id);
+      check(
+        '★ 실제 씬이 three 지오메트리로 선다 (load만으로 정지 드레이프가 나온다)',
+        shown.patterns === 5 && shown.vertices === 3022 && shown.triangles === 5472,
+        `패턴 ${shown.patterns}, 정점 ${shown.vertices}, 삼각형 ${shown.triangles}, ${shown.elapsedMs}ms`,
+      );
+      check('카메라를 맞췄다 (기본값 frameCamera:true)', framed() === 1, String(framed()));
+
+      const allGl = cloth.patterns.every((p) => {
+        const i = p.geometry.getIndex();
+        return i !== null && isGlIndexArray(i.array);
+      });
+      check('★ 실제 인덱스도 전부 WebGL이 받는 타입이다', allGl);
+
+      const finite = cloth.patterns.every((p) =>
+        Array.from(p.position.array as Float32Array).every((v) => Number.isFinite(v)));
+      check('실제 좌표가 전부 유한하다 (NaN 하나면 경계상자가 통째로 깨진다)', finite);
+
+      const box = cloth.boundingBox();
+      const size = box.getSize(new THREE.Vector3());
+      // 엔진 좌표는 cm다. 옷 한 벌이 대략 100cm 높이 — 여기가 어긋나면 화면에서
+      // 옷이 점으로 보이거나 카메라 안에 파묻힌다.
+      check(
+        '★ 씬 규모가 cm 단위 옷이다 (높이 50~200cm)',
+        size.y > 50 && size.y < 200 && size.x > 5 && size.z > 5,
+        `${size.x.toFixed(1)} × ${size.y.toFixed(1)} × ${size.z.toFixed(1)} cm`,
+      );
+
+      // #15(2D 펼침)가 uvs를 **cm 좌표**로 쓴다. 누가 정규화하면 조용히 깨진다.
+      const uvs = cloth.patterns[0]?.uvs;
+      const uvMax = uvs ? Math.max(...Array.from(uvs)) : NaN;
+      check(
+        '★ uvs가 0~1로 정규화돼 있지 않다 (cm 단위 2D 패턴 좌표 — #15의 전제)',
+        Number.isFinite(uvMax) && uvMax > 2,
+        `최대 ${uvMax.toFixed(2)}`,
+      );
+
+      // ── 재로드 멱등. main.ts의 재연결 핸들러가 정확히 이 호출을 한다 ──
+      const again = await showScene(client, viewer, scene.id, { frameCamera: false });
+      check(
+        '★ 같은 씬을 다시 로드해도 메시가 겹쳐 쌓이지 않는다 (재연결 재로드 경로)',
+        cloth.group.children.length === 5 && again.vertices === shown.vertices,
+        `children=${cloth.group.children.length}, 정점 ${again.vertices}`,
+      );
+      check('frameCamera:false면 카메라를 다시 맞추지 않는다 (사용자 시점을 뺏지 않는다)',
+        framed() === 1, String(framed()));
+    } finally {
+      cloth.clear();
+      await client.close().catch(() => {});
+    }
+  }, { sessions: { idleTimeout: 0, requestTimeoutMs: 60_000 } });
+}
+
+// ── §8-4. 게이트웨이를 죽였다 살린다 ───────────────────────────
+//
+// §4가 재연결을 보지만 가짜 게이트웨이라 "붙었다"까지다. 실제로 끊겼다 붙으면
+// **워커 프로세스가 새로 뜨고 씬이 로드돼 있지 않다.** main.ts는 그때
+// showScene()을 다시 부르는데, 그게 정말 되는지는 여기서만 확인된다.
+// (Builder가 못 한 자리다. DOM이 필요한 것은 main.ts의 배선 한 줄뿐이고,
+//  그 한 줄이 부르는 대상 전체가 여기서 실제로 검증된다.)
+
+async function sectionReconnectReload(): Promise<void> {
+  section('§8-4. 3D 뷰 — 게이트웨이 재시작 → 자동 재연결 → 씬 재로드');
+
+  if (!existsSync(EXE) || !existsSync(ZLS)) {
+    note('생략', `exe=${existsSync(EXE)}, zls=${existsSync(ZLS)}`);
+    return;
+  }
+
+  const port = await freePort();
+  const opts: GatewayOptions = {
+    port,
+    onLog: () => {},
+    sessions: { idleTimeout: 0, requestTimeoutMs: 60_000 },
+  };
+
+  let gw1: Gateway | null = createGateway(opts);
+  let gw2: Gateway | null = null;
+  const client = new GatewayClient({
+    url: `http://127.0.0.1:${port}`,
+    requestTimeoutMs: 60_000,
+    reconnect: { minDelayMs: 300, maxDelayMs: 1_500, maxAttempts: 10 },
+  });
+  const opens: { reconnected: boolean; attempt: number }[] = [];
+  client.on('open', (e) => opens.push({ reconnected: e.reconnected, attempt: e.attempt }));
+
+  const { viewer, cloth } = stubViewer();
+  try {
+    const addr = await gw1.start();
+    const scene = await findOrUploadScene(addr.url);
+    if (!scene) {
+      check('씬 준비', false, 'sample.zls를 준비하지 못했다');
+      return;
+    }
+
+    await client.connect();
+    const first = await showScene(client, viewer, scene.id);
+    check('재시작 전에 씬이 서 있다', first.patterns === 5, `패턴 ${first.patterns}`);
+
+    // 죽인다. 소켓이 끊기고 워커도 같이 사라진다.
+    await gw1.close();
+    gw1 = null;
+    check('끊긴 것을 클라이언트가 안다', await until(() => !client.connected, 5_000),
+      `state=${client.state}`);
+
+    // 같은 포트로 살린다. 브라우저에서 게이트웨이를 재시작한 것과 같은 상황이다.
+    gw2 = createGateway(opts);
+    await gw2.start();
+
+    const back = await until(() => opens.length === 2, 20_000);
+    check('★ 자동으로 다시 붙는다', back, `opens=${opens.length}, state=${client.state}`);
+    check('★ 두 번째 open은 reconnected로 표시된다 (main.ts가 이걸 보고 재로드한다)',
+      opens[1]?.reconnected === true, JSON.stringify(opens));
+
+    if (back) {
+      // main.ts의 재연결 핸들러가 하는 일 그대로.
+      const reloaded = await showScene(client, viewer, scene.id, { frameCamera: false });
+      check(
+        '★ 새 워커에 씬이 다시 로드되고 지오메트리가 다시 선다',
+        reloaded.patterns === 5 && reloaded.vertices === first.vertices,
+        `패턴 ${reloaded.patterns}, 정점 ${reloaded.vertices}`,
+      );
+      check('재로드 후에도 메시가 5개다 (겹쳐 쌓이지 않았다)',
+        cloth.group.children.length === 5, String(cloth.group.children.length));
+    }
+  } catch (err: unknown) {
+    check('재연결 재로드 종단', false, messageOf(err));
+  } finally {
+    cloth.clear();
+    await client.close().catch(() => {});
+    await gw1?.close().catch(() => {});
+    await gw2?.close().catch(() => {});
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// §9. 좀비 프로세스
 // ─────────────────────────────────────────────────────────────
 
 const execFileAsync = promisify(execFile);
 
 async function sectionZombies(): Promise<void> {
-  section('§8. 좀비 프로세스');
+  section('§9. 좀비 프로세스');
   if (process.platform !== 'win32') {
     note('생략', `windows가 아니다 (${process.platform})`);
     return;
@@ -1540,6 +1961,10 @@ async function main(): Promise<void> {
   await sectionViteProxy();
   await sectionStatic();
   await sectionRealWorker();
+  sectionClothTopology();
+  sectionClothFrames();
+  await sectionViewerRealScene();
+  await sectionReconnectReload();
   await sectionZombies();
 
   clearInterval(keepAlive);
