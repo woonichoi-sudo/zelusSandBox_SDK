@@ -1,0 +1,37 @@
+{
+  // backend/tsconfig.json 과 **같은 엄격도**다. 두 계층이 같은 메시지 타입을
+  // 공유하는데(src/protocol/types.ts), 한쪽만 느슨하면 그 경계에서만 타입이
+  // 조용히 약해진다 — 정확히 가장 위험한 자리다.
+  "compilerOptions": {
+    "target": "ES2023",
+    // DOM 이 먼저다. @types/node 는 DOM 이 있으면 WebSocket·fetch·atob 같은
+    // 겹치는 전역을 DOM 쪽에 양보하도록 쓰여 있다.
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "verbatimModuleSyntax": true,
+
+    // Vite 가 트랜스파일하고 tsc 는 검사만 한다. 그래서 noEmit 이고,
+    // 그 덕에 allowImportingTsExtensions 를 rewriteRelativeImportExtensions
+    // 없이 쓸 수 있다. import 경로에 .ts 를 적는 표기는 backend 와 같다 —
+    // Vite 도, `node --experimental-strip-types` 도 그대로 받는다.
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+
+    // @types/node 가 필요한 이유는 둘이다: vite.config.ts 의 process/path,
+    // 그리고 프로토콜 계층을 Node 에서 그대로 돌리는 스모크(브라우저 API 는
+    // Node 22+ 전역에 이미 있다).
+    "types": ["node"],
+
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true
+  },
+  "include": ["src/**/*.ts", "vite.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

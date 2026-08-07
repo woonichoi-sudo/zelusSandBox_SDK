@@ -18,6 +18,7 @@
  * 죽는다 — 그래서 등록 자리를 한 곳으로 고정했다 (app 게터 주석 참고).
  */
 
+import { existsSync } from 'node:fs';
 import { createServer as createHttpServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import path from 'node:path';
@@ -89,6 +90,20 @@ export interface GatewayOptions {
   /** 업로드 1건의 상한(바이트). 기본 DEFAULT_MAX_SCENE_BYTES (512MiB) */
   maxSceneBytes?: number;
   /**
+   * 프론트엔드 빌드 산출물(`frontend/dist`)을 서빙할 디렉토리 (#11).
+   *
+   * **기본값은 "끔"이다.** 켜져 있으면 404 catch-all이 SPA 폴백에 가려서,
+   * `GET /없는경로`가 JSON 404 대신 index.html을 돌려준다 — 임베딩·테스트가
+   * 기대하는 계약이 조용히 바뀐다. 그래서 "서빙한다"는 배포 시점의 명시적
+   * 결정으로 두고, CLI(main)만 `defaultStaticDir()`을 켠다.
+   *
+   * 디렉토리가 없어도 죽지 않는다. `express.static`은 stat 실패 시 next()로
+   * 흘리고 SPA 폴백도 index.html이 없으면 건너뛰므로, 개발 중(빌드 전)에는
+   * 켜 두더라도 API·WS만 있는 서버와 동작이 같다.
+   */
+  staticDir?: string | null;
+
+  /**
    * WS 세션(#6). 워커 exe 경로·세션 상한·하트비트 등.
    *
    * 라우트가 아니라 별도 옵션인 이유는 WS가 Express 스택을 지나지 않기
@@ -107,6 +122,16 @@ export interface GatewayOptions {
  */
 export function defaultSceneDir(): string {
   return path.resolve(import.meta.dirname, '..', '..', 'data', 'scenes');
+}
+
+/**
+ * 기본 정적 루트 = `<repo>/frontend/dist` (#11).
+ *
+ * defaultSceneDir과 같은 이유로 cwd가 아니라 모듈 위치 기준이다.
+ * `src/server/`에서든 `dist/server/`에서든 세 단계 위가 저장소 루트다.
+ */
+export function defaultStaticDir(): string {
+  return path.resolve(import.meta.dirname, '..', '..', '..', 'frontend', 'dist');
 }
 
 /** start()가 알려주는 실제 바인딩 결과 */
@@ -291,6 +316,12 @@ export class Gateway {
     // (b) 바깥에서 주입한 라우트. 내장 뒤, catch-all 앞.
     for (const register of this.#opts.routes ?? []) use(register);
 
+    // (c) 정적 파일 (#11). **API 라우트 뒤, 404 catch-all 앞**이어야 한다.
+    //     앞이면 `/api/*`가 정적 파일 조회를 먼저 지나고, 뒤면 SPA 폴백이
+    //     영원히 실행되지 않는다(ISSUE-001과 같은 실패 모드).
+    const staticDir = this.#opts.staticDir;
+    if (staticDir) this.#useStatic(app, staticDir);
+
     // 404도 JSON이어야 한다. 클라이언트가 한 종류의 파서만 쓰게 된다.
     app.use((req: Request, res: Response) => {
       res.status(404).json({ error: `찾을 수 없음: ${req.method} ${req.path}` });
@@ -312,6 +343,67 @@ export class Gateway {
       }
       res.status(status).json({ error: message });
     });
+  }
+
+  /**
+   * 프론트엔드 번들 서빙 (#11).
+   *
+   * 두 겹이다.
+   *   ① `express.static` — 실제 파일(`/assets/*.js`, `/favicon.ico`, `/`)
+   *   ② SPA 폴백        — 그 밖의 GET을 index.html로. 라우팅이 클라이언트에
+   *                        있는 한 `/scene/abc` 같은 주소를 새로고침해도 떠야 한다.
+   *
+   * 폴백이 삼키면 안 되는 것 두 가지를 명시적으로 뺀다:
+   *   - `/api/*` — 없는 API는 **JSON 404**여야 한다. HTML을 돌려주면
+   *     클라이언트가 `res.json()`에서 파싱 오류로 죽고, 진짜 원인(오타난 경로)이
+   *     그 뒤에 묻힌다.
+   *   - HTML을 원하지 않는 요청 — `fetch`가 Accept: application/json으로 물어본
+   *     것에 index.html을 주면 같은 일이 벌어진다.
+   * (`/ws`는 애초에 Express 스택을 지나지 않는다 — http.Server의 upgrade다.)
+   *
+   * dist가 없어도(개발 중) 죽지 않는다. ①은 stat 실패로 next(), ②는 존재
+   * 확인에서 next() — 결과적으로 404 catch-all까지 그대로 흘러간다.
+   * existsSync를 요청 시점에 보는 이유도 그것이다: 서버를 띄운 뒤에 프론트를
+   * 빌드해도 재기동 없이 잡힌다.
+   */
+  #useStatic(app: Express, dir: string): void {
+    const index = path.join(dir, 'index.html');
+
+    app.use(
+      express.static(dir, {
+        // 해시가 박힌 에셋은 영구 캐시해도 되지만, index.html은 절대 안 된다.
+        // 구별을 여기서 흉내 내지 않고 전부 재검증시킨다 — 정적 서빙이
+        // 병목인 배포라면 앞단에 리버스 프록시를 두는 편이 맞다.
+        etag: true,
+        lastModified: true,
+        maxAge: 0,
+        // 디렉토리 목록은 절대 노출하지 않는다.
+        index: ['index.html'],
+        redirect: false,
+        fallthrough: true,
+        dotfiles: 'ignore',
+      }),
+    );
+
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+      if (req.path === '/api' || req.path.startsWith('/api/')) return next();
+      if (!req.accepts('html')) return next();
+      if (!existsSync(index)) return next();
+
+      res.sendFile(index, (err: unknown) => {
+        if (!err) return;
+        // 전송 도중 끊겼으면 헤더가 이미 나갔다 — 여기서 next()로 넘기면
+        // 404 JSON이 헤더 뒤에 덧붙어 응답이 깨진다.
+        if (res.headersSent) {
+          res.end();
+          return;
+        }
+        next();
+      });
+    });
+
+    this.#log(`정적 서빙: ${dir}`);
   }
 
   /** 리스닝을 시작한다. 이미 떠 있으면 현재 주소를 그대로 돌려준다. */
@@ -397,10 +489,20 @@ async function main(): Promise<void> {
   const maxSceneBytes = Number(process.env['MAX_SCENE_BYTES'] ?? Number.NaN);
   const maxSessions = Number(process.env['MAX_SESSIONS'] ?? Number.NaN);
   const idleTimeout = Number(process.env['SESSION_IDLE_TIMEOUT'] ?? Number.NaN);
+  // 배포에서는 게이트웨이가 프론트 번들도 서빙한다 — 브라우저가 한 오리진만
+  // 보게 되어 CORS 자체가 발생하지 않는다(ISSUE-002의 결정). 개발은 Vite
+  // 프록시가 같은 모양을 흉내 내므로 프론트 코드는 양쪽에서 동일하다.
+  // STATIC_DIR=off 로 끌 수 있다 — API만 띄우고 프론트는 Vite로 볼 때.
+  const staticEnv = process.env['STATIC_DIR'];
+  const staticDir = staticEnv === 'off' || staticEnv === 'none'
+    ? null
+    : (staticEnv ?? defaultStaticDir());
+
   const gateway = createServer({
     port,
     host: process.env['HOST'] ?? '127.0.0.1',
     onLog: (line) => console.log(line),
+    staticDir,
     ...(process.env['SCENE_DIR'] ? { sceneDir: process.env['SCENE_DIR'] } : {}),
     ...(Number.isFinite(maxSceneBytes) ? { maxSceneBytes } : {}),
     sessions: {
@@ -428,6 +530,11 @@ async function main(): Promise<void> {
   const { url } = await gateway.start();
   console.log(`health: ${url}/api/health`);
   console.log(`씬 디렉토리: ${gateway.scenes.dir} (상한 ${gateway.scenes.maxBytes} 바이트)`);
+  console.log(
+    staticDir
+      ? `정적 루트: ${staticDir}${existsSync(staticDir) ? '' : ' (아직 없음 — frontend에서 npm run build)'}`
+      : '정적 루트: 없음 (STATIC_DIR=off)',
+  );
   console.log(`WS: ${url.replace(/^http/, 'ws')}${gateway.sessions.path}  (연결 1개 = 워커 프로세스 1개)`);
 }
 

@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cobalt — 게이트웨이 상태</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        margin: 0;
+        padding: 2rem;
+        font: 14px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace;
+      }
+      h1 { font-size: 1rem; margin: 0 0 1.25rem; opacity: 0.6; font-weight: 600; }
+      dl { display: grid; grid-template-columns: 10rem 1fr; gap: 0.25rem 1rem; margin: 0; }
+      dt { opacity: 0.55; }
+      dd { margin: 0; overflow-wrap: anywhere; }
+      #log {
+        margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid currentColor;
+        opacity: 0.5; white-space: pre-wrap; max-height: 40vh; overflow-y: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      #11 은 프로토콜 계층까지다. 이 페이지는 그 계층이 살아 있다는 것을
+      눈으로 확인하기 위한 최소 판이고, 3D 뷰는 #12 에서 붙는다.
+      three.js 는 아직 의존성에 없다.
+    -->
+    <h1>Cobalt 게이트웨이 — 프로토콜 계층 (#11)</h1>
+    <dl>
+      <dt>연결 상태</dt><dd id="state">-</dd>
+      <dt>WS 주소</dt><dd id="ws">-</dd>
+      <dt>헬스</dt><dd id="health">-</dd>
+      <dt>엔진 버전</dt><dd id="version">-</dd>
+      <dt>프레임</dt><dd id="frame">-</dd>
+      <dt>엔진 메시지</dt><dd id="engine">-</dd>
+      <dt>대기 중 요청</dt><dd id="pending">0</dd>
+    </dl>
+    <div id="log"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
