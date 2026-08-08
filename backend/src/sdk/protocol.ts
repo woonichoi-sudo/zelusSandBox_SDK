@@ -114,6 +114,27 @@ export interface MeshInfoResult {
   totalTriangles: number;
 }
 
+/**
+ * 패턴 로컬 → 월드 변환 (ISSUE-011). **정점에 곱해져 있지 않다.**
+ *
+ * `positions` 는 패턴 로컬 좌표라 이 변환 없이는 위치가 정해지지 않는다.
+ * 워커가 `ztDesignClothPattern::GetTransformIn3D()` 를 그대로 분해해 싣고,
+ * 이것은 glTF 익스포터가 옷 패턴 **노드 변환**으로 쓰는 값과 같은 출처다 —
+ * 따라서 익스포트 산출물과 대조하면 정답지가 있는 검증이 된다.
+ *
+ * ⚠️ 단위는 정점과 같은 **cm** 다. 익스포터가 거는 cm→m 스케일 0.01 은 glTF
+ *    **루트 노드**의 것이지 이 변환의 것이 아니다.
+ * ⚠️ TRS 분해다(4×4 행렬이 아니다). `rotation` 은 glTF·three.js 와 같은
+ *    **[x, y, z, w]** 순서 쿼터니언이다.
+ */
+export interface PatternTransform {
+  /** [x, y, z], cm */
+  translation: [number, number, number];
+  /** [x, y, z, w] 쿼터니언 */
+  rotation: [number, number, number, number];
+  scale: [number, number, number];
+}
+
 export interface PatternData {
   uuid: string;
   vertices: number;
@@ -126,6 +147,14 @@ export interface PatternData {
   indexStride?: number;
   /** base64. float32 x2. topology:true 일 때만 */
   uvs?: string;
+  /**
+   * 패턴 로컬 → 월드 (ISSUE-011). **topology:true 일 때만.**
+   *
+   * 프레임 이벤트의 mesh(= topology:false)에는 없다. 프레임마다 바뀌지 않는
+   * 값이라 최초 1회만 싣기 때문이다(sample.zls 249프레임 실측에서 비트 단위
+   * 동일). 받는 쪽은 한 번 받아 계속 쓴다.
+   */
+  transform?: PatternTransform;
 }
 
 export interface MeshDataResult {

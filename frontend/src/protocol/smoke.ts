@@ -106,6 +106,9 @@ import {
   type PatternData,
   type SceneSummary,
 } from './index.ts';
+// `PatternTransform` 만은 배럴(`index.ts`)이 재export 하지 않아 여기서 직접 꺼낸다.
+// (`types.ts` 가 `sdk/protocol.ts` 의 정의를 재export 하는 그 타입이다.)
+import type { PatternTransform } from './types.ts';
 
 // ── 하네스 ───────────────────────────────────────────────────
 
@@ -527,6 +530,109 @@ function sectionDecodeLength(): void {
       msg = messageOf(err);
     }
     check(`${label} → 던진다`, msg.includes(expect) && msg.includes(pattern.uuid), msg || '통과해버렸다');
+  }
+
+  // ── transform (ISSUE-011) — 없으면 identity, 틀리면 던진다 ───
+  //
+  // 이 갈림이 이 단위에서 가장 조용한 실패다. **형식이 틀린 것을 통과시키면**
+  // `Mesh.position.fromArray` 가 undefined 를 읽어 좌표가 NaN 이 되고, three 는
+  // 예외도 경고도 없이 **아무것도 그리지 않는다** — 화면은 비는데 정점 수는
+  // 정상으로 찍히므로 원인을 화면에서 읽을 방법이 없다. 반대로 **없는 것을
+  // 오류로 만들면** 프레임 이벤트의 mesh 마다 던져서 옷이 아예 안 움직인다.
+  // 두 방향 모두 못으로 박는다.
+  const tBase: PatternData = {
+    uuid: 'p-t',
+    vertices: 2,
+    triangles: 1,
+    positions: f32Base64([0, 0, 0, 1, 1, 1]),
+    indices: i32Base64([0, 1, 0]),
+  };
+  /** 타입이 막는 모양을 일부러 넣는다 — 워커는 타입 검사를 지나지 않는다 */
+  const withTransform = (raw: unknown): PatternData =>
+    ({ ...tBase, transform: raw } as unknown as PatternData);
+
+  const rt = decodePattern(withTransform({
+    translation: [1, 2, 3],
+    rotation: [0, 0.7071067811865476, 0, 0.7071067811865476],
+    scale: [1, 2, 3],
+  })).transform;
+  check(
+    'transform 왕복 — 열 개 숫자가 순서 그대로 실린다',
+    rt !== undefined
+      && rt.translation.join(',') === '1,2,3'
+      && rt.rotation.length === 4 && rt.rotation[1] === 0.7071067811865476
+      && rt.scale.join(',') === '1,2,3',
+    JSON.stringify(rt),
+  );
+  // 던지는 쪽으로 뒤집히면 이 절 앞의 `decodePattern(good)` 에서 먼저 죽어
+  // 스모크가 통째로 멎는다. 그래도 **여기가 빨간불이 되도록** 잡아 둔다 —
+  // "테스트가 안 끝난다" 보다 "이 단언이 깨졌다" 가 원인을 지목한다.
+  const absent = (label: string, p: PatternData): { ok: boolean; detail: string } => {
+    try {
+      const d = decodePattern(p);
+      return {
+        ok: d.transform === undefined && !('transform' in d),
+        detail: 'transform' in d ? `${label}: 키가 남았다 ${JSON.stringify(d.transform)}` : `${label}: 키 자체가 없다`,
+      };
+    } catch (err: unknown) {
+      return { ok: false, detail: `${label}: 던졌다 — ${messageOf(err)}` };
+    }
+  };
+  const noKey = absent('키 없음', tBase);
+  const nullKey = absent('null', withTransform(null));
+  check(
+    '★ transform 이 없으면 undefined 다 (프레임 이벤트·구버전 워커 → identity)',
+    noKey.ok, noKey.detail,
+  );
+  check(
+    '★ null 도 오류가 아니다 (JSON 이 null 을 실어 보내도 identity 로 간다)',
+    nullKey.ok, nullKey.detail,
+  );
+
+  const badTransforms: [string, unknown, string][] = [
+    ['★ rotation 이 3개 (쿼터니언을 오일러각으로 착각한 워커)',
+      { translation: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+      'transform.rotation 는 길이 4'],
+    ['★ translation 이 4개',
+      { translation: [0, 0, 0, 0], rotation: [0, 0, 0, 1], scale: [1, 1, 1] },
+      'transform.translation 는 길이 3'],
+    ['★ scale 이 2개',
+      { translation: [0, 0, 0], rotation: [0, 0, 0, 1], scale: [1, 1] },
+      'transform.scale 는 길이 3'],
+    ['★ translation 에 NaN (fromArray 가 그대로 삼켜 화면이 빈다)',
+      { translation: [0, Number.NaN, 0], rotation: [0, 0, 0, 1], scale: [1, 1, 1] },
+      'transform.translation 에 숫자가 아닌 값'],
+    ['★ rotation 에 Infinity',
+      { translation: [0, 0, 0], rotation: [0, 0, 0, Number.POSITIVE_INFINITY], scale: [1, 1, 1] },
+      'transform.rotation 에 숫자가 아닌 값'],
+    ['★ scale 에 문자열 ("1" 은 숫자가 아니다)',
+      { translation: [0, 0, 0], rotation: [0, 0, 0, 1], scale: ['1', 1, 1] },
+      'transform.scale 에 숫자가 아닌 값'],
+    ['★ translation 이 배열이 아니라 객체 ({x,y,z} 로 보낸 워커)',
+      { translation: { x: 0, y: 0, z: 0 }, rotation: [0, 0, 0, 1], scale: [1, 1, 1] },
+      'transform.translation 는 길이 3'],
+    ['★ 키가 통째로 빠졌다 (rotation 없음)',
+      { translation: [0, 0, 0], scale: [1, 1, 1] },
+      'transform.rotation 는 길이 4'],
+    ['★ transform 이 객체가 아니다 (4×4 행렬을 평평하게 보낸 워커)',
+      [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+      'transform.translation 는 길이 3'],
+    ['★ transform 이 숫자다',
+      42,
+      'transform 이 객체가 아닙니다'],
+  ];
+  for (const [label, raw, expect] of badTransforms) {
+    let msg = '';
+    try {
+      decodePattern(withTransform(raw));
+    } catch (err: unknown) {
+      msg = messageOf(err);
+    }
+    check(
+      `${label} → 던진다`,
+      msg.includes(expect) && msg.includes('p-t'),
+      msg || '조용히 통과해버렸다 — 화면이 비고 원인을 못 읽는다',
+    );
   }
 
   // positions가 아예 없는 패턴(topology 없이 온 빈 패턴)은 정상이다.
@@ -1456,6 +1562,8 @@ async function sectionRealWorker(): Promise<void> {
 
       let decoded = 0;
       let decodeErr = '';
+      /** 로드 직후의 변환 원문. 시뮬을 돌린 뒤 그대로인지 아래에서 다시 본다 */
+      let transformsAtLoad: string | null = null;
       try {
         const patterns = decodePatterns(md);
         decoded = patterns.length;
@@ -1490,6 +1598,46 @@ async function sectionRealWorker(): Promise<void> {
         check('디코딩된 좌표가 유한하고 0이 아니다', finite && nonzero, first
           ? `첫 정점 (${first.positions[0]}, ${first.positions[1]}, ${first.positions[2]})`
           : '패턴 없음');
+
+        // ── 패턴 변환 (ISSUE-011) — 원문 JSON 수준에서 ─────────
+        //
+        // 여기서 보는 것은 "워커가 무엇을 실었는가" 하나다. 그 값이 **옳은가**는
+        // 정답지(익스포트한 glTF)와 대조해야 하고, 그건 §8-10 이 한다.
+        const raws = md.patterns.map((p) => (p as unknown as Record<string, unknown>)['transform']);
+        transformsAtLoad = JSON.stringify(raws);
+        check(
+          '★ topology:true 응답의 모든 패턴에 transform 이 실려 있다 (ISSUE-011)',
+          raws.length > 0 && raws.every((t) => t !== undefined && t !== null),
+          `${raws.filter((t) => t !== undefined && t !== null).length}/${raws.length}개`,
+        );
+        check(
+          '★ decodePattern 이 그 형식을 통과시킨다 (길이 3/4/3, 전부 유한)',
+          patterns.length > 0 && patterns.every((p) => p.transform !== undefined),
+          `${patterns.filter((p) => p.transform).length}/${patterns.length}개`,
+        );
+        const quats = patterns.map((p) => p.transform?.rotation).filter((r) => r !== undefined);
+        check(
+          '★ 쿼터니언이 단위 쿼터니언이다 (노름 1 — 아니면 three 가 메시를 늘리거나 찌그러뜨린다)',
+          quats.length === patterns.length
+            && quats.every((q) => Math.abs(Math.hypot(q[0], q[1], q[2], q[3]) - 1) < 1e-4),
+          quats.map((q) => Math.hypot(q[0], q[1], q[2], q[3]).toFixed(6)).join(' '),
+        );
+        check(
+          '★ scale 이 0 이 아니다 (0 이면 그 패널이 한 점으로 찌부러져 화면에서 사라진다)',
+          patterns.every((p) => (p.transform?.scale ?? [1, 1, 1]).every((v) => Math.abs(v) > 1e-9)),
+          patterns.map((p) => (p.transform?.scale ?? []).join('/')).join(' '),
+        );
+        // 회전각 분포는 씬이 정하는 값이라 판정에 넣지 않는다. 다만 **이 씬에는
+        // 180° 패널이 있다** 는 사실이 §8-11 의 방향 단언이 왜 필요한지의 근거다.
+        const angles = patterns.map((p) => {
+          const q = p.transform?.rotation;
+          return q ? 2 * Math.acos(Math.min(1, Math.abs(q[3]))) * 180 / Math.PI : 0;
+        });
+        note('회전각', `${angles.map((a) => `${a.toFixed(1)}°`).join(', ')} — 0°가 아닌 것이 ${angles.filter((a) => a > 1).length}개`);
+        note('변환', patterns.map((p) => {
+          const t = p.transform?.translation;
+          return t ? `[${t.map((v) => v.toFixed(2)).join(',')}]` : '없음';
+        }).join(' '));
 
         const stats = meshStats(md);
         note('메시 규모', `패턴 ${stats.patterns}, 정점 ${stats.vertices}, 삼각형 ${stats.triangles}, base64 ${stats.base64Bytes}바이트`);
@@ -1547,6 +1695,48 @@ async function sectionRealWorker(): Promise<void> {
         '★ 구독 중 모든 프레임의 모든 패턴이 길이 검증을 통과한다',
         frameDecodeErr === '' && checkedPatterns > 0,
         frameDecodeErr || `프레임 ${withMesh.length}개 / 패턴 ${checkedPatterns}개`,
+      );
+
+      // ── 변환은 프레임 이벤트에 실리지 않는다 (ISSUE-011) ────
+      //
+      // 프레임마다 실어 보내면 대역폭은 프레임당 40바이트뿐이라 문제가 아니지만,
+      // **이 사실이 뒤집히면 클라이언트 쪽 가정이 뒤집힌다** — `cloth.ts` 의
+      // `updatePositions()` 는 변환을 다시 걸지 않고 `Mesh` 에 남은 값을 믿는다.
+      // 반대로 워커가 나중에 프레임에도 싣기 시작하면 그건 회귀가 아니라 설계
+      // 변경이고, 그때는 `updatePositions()` 도 함께 고쳐야 한다.
+      const framePatterns = withMesh.flatMap((f) => f.mesh?.patterns ?? []);
+      const withTransformKey = framePatterns.filter(
+        (p) => 'transform' in (p as unknown as Record<string, unknown>),
+      ).length;
+      check(
+        '★★ 프레임 이벤트의 mesh 에는 transform 키가 아예 없다 (topology:true 에만 실린다)',
+        framePatterns.length > 0 && withTransformKey === 0,
+        `패턴 ${framePatterns.length}개 중 ${withTransformKey}개에 실렸다`,
+      );
+
+      // ── 프레임 불변 — 워커가 "한 번만 보낸다"는 근거 ────────
+      //
+      // 시뮬을 11프레임 이상 돌린 **뒤** 다시 물어 로드 직후 값과 비교한다.
+      // 문자열 비교라 부동소수 반올림도 잡는다. 이게 깨진다면 대역폭 문제가
+      // 아니라 **화면이 틀린다** — 클라이언트는 첫 값을 계속 쓰므로 정점만
+      // 흔들리고 옷 전체가 옛 자리에 고정된다.
+      const md2 = await client.meshData(true);
+      const raws2 = JSON.stringify(
+        md2.patterns.map((p) => (p as unknown as Record<string, unknown>)['transform']),
+      );
+      check(
+        '★★ 시뮬을 돌린 뒤에도 transform 이 한 글자도 안 바뀐다 (프레임 불변 — 한 번만 보내는 근거)',
+        transformsAtLoad !== null && raws2 === transformsAtLoad,
+        transformsAtLoad === null ? '로드 직후 값을 못 받았다'
+          : raws2 === transformsAtLoad ? `${md2.patterns.length}개 동일 (frame ${reached}+)` : `달라졌다: ${raws2.slice(0, 160)}`,
+      );
+      check(
+        '대조군 — 그 사이 정점은 실제로 움직였다 (아무것도 안 변한 것이 아니다)',
+        (() => {
+          const a = md.patterns[0]?.positions;
+          const b = md2.patterns[0]?.positions;
+          return typeof a === 'string' && typeof b === 'string' && a !== b;
+        })(),
       );
 
       check('종단 중 protocolError가 없었다', protocolErrors.length === 0, protocolErrors.join(' | '));
@@ -1768,6 +1958,290 @@ function sectionClothFrames(): void {
   );
 
   cloth.clear();
+}
+
+// ─────────────────────────────────────────────────────────────
+// §8-11. 패턴 변환 — 옷이 제자리에 서는가 (ISSUE-011)
+//
+// 정점은 **패턴 로컬 좌표**로 오고, 월드 위치는 패턴마다 딸려 오는 `transform`
+// (TRS)을 곱해야 정해진다. 여기가 뚫리면 옷은 그려지는데 **원점 근처에 뭉쳐**
+// 서고, 아바타(#14 이후)를 얹는 순간 몸에서 떨어진다.
+//
+// ★ 이 절이 존재하는 진짜 이유는 **회전**이다. 경계 상자만 보는 단언은 회전을
+//   거의 못 잡는다 — 특히 sample.zls 의 절반 이상인 **Y축 180° 뒤집기**
+//   (`rotation ≈ [0, 1, 0, 3e-7]`, w 가 0 에 가깝다)는, 로컬 형상이 x·z 에
+//   대칭이면 AABB 가 **한 치도 변하지 않는다.** "w 가 거의 0이니 회전은 없는
+//   셈" 으로 다루거나 쿼터니언을 wxyz 로 읽어도 상자는 그대로다. 그래서 여기서는
+//   상자가 아니라 **점이 어디로 가는가**를 단언한다. 아래에 그 둘의 차이를
+//   같은 데이터로 나란히 보여 두는 항목이 있다.
+// ─────────────────────────────────────────────────────────────
+
+/** 로컬 좌표를 손으로 준 패턴 하나 (+ 선택적 변환) */
+function localPattern(
+  uuid: string,
+  coords: readonly number[],
+  transform?: PatternTransform,
+): DecodedPattern {
+  const vertices = coords.length / 3;
+  const p: DecodedPattern = {
+    uuid,
+    positions: Float32Array.from(coords),
+    indices: Int32Array.from([0, 1, 2]),
+    vertices,
+    triangles: 1,
+  };
+  if (transform) p.transform = transform;
+  return p;
+}
+
+/** 로컬 점 하나를 그 패턴 메시의 월드 좌표로 옮긴다 (three 가 실제로 쓰는 행렬로) */
+function toWorld(cloth: ClothObject, uuid: string, x: number, y: number, z: number): THREE.Vector3 {
+  const mesh = cloth.patterns.find((p) => p.uuid === uuid)?.mesh;
+  if (!mesh) return new THREE.Vector3(Number.NaN, Number.NaN, Number.NaN);
+  return new THREE.Vector3(x, y, z).applyMatrix4(mesh.matrixWorld);
+}
+
+function near(v: THREE.Vector3, x: number, y: number, z: number, eps = 1e-4): boolean {
+  return Math.abs(v.x - x) < eps && Math.abs(v.y - y) < eps && Math.abs(v.z - z) < eps;
+}
+
+function xyz(v: THREE.Vector3): string {
+  return `(${v.x.toFixed(3)}, ${v.y.toFixed(3)}, ${v.z.toFixed(3)})`;
+}
+
+const IDENTITY: PatternTransform = {
+  translation: [0, 0, 0],
+  rotation: [0, 0, 0, 1],
+  scale: [1, 1, 1],
+};
+
+function sectionClothTransform(): void {
+  section('§8-11. 3D 뷰 — 패턴 변환 (ISSUE-011, cloth.ts, DOM 없이)');
+
+  // ── ① TRS 가 지오메트리가 아니라 Mesh 에 걸린다 ──────────────
+  //
+  // 정점에 미리 곱하면 #15 의 2D 펼침 뷰가 로컬 좌표를 되찾을 방법이 없어진다.
+  {
+    const t: PatternTransform = {
+      translation: [10, 20, 30],
+      rotation: [0, 0, 0, 1],
+      scale: [2, 3, 4],
+    };
+    const cloth = new ClothObject();
+    cloth.setTopology([localPattern('a', [1, 0, 0, 0, 1, 0, 0, 0, 1], t)]);
+    const p = cloth.patterns[0];
+    if (!p) {
+      check('패턴이 섰다', false);
+      return;
+    }
+    check(
+      '★ translation/scale 이 Mesh 에 그대로 걸린다',
+      p.mesh.position.x === 10 && p.mesh.position.y === 20 && p.mesh.position.z === 30
+        && p.mesh.scale.x === 2 && p.mesh.scale.y === 3 && p.mesh.scale.z === 4,
+      `pos ${p.mesh.position.toArray().join(',')} scale ${p.mesh.scale.toArray().join(',')}`,
+    );
+    check(
+      '★★ 정점에는 미리 곱하지 않는다 (#15 의 2D 펼침이 로컬 좌표를 원한다)',
+      (p.position.array as Float32Array)[0] === 1
+        && (p.position.array as Float32Array)[1] === 0
+        && (p.position.array as Float32Array)[2] === 0,
+      Array.from((p.position.array as Float32Array).slice(0, 3)).join(','),
+    );
+    check(
+      '★ 렌더를 한 번도 안 돌렸는데 matrixWorld 가 이미 맞다 (카메라 맞춤·레이캐스팅이 렌더보다 먼저 온다)',
+      near(toWorld(cloth, 'a', 0, 0, 0), 10, 20, 30),
+      xyz(toWorld(cloth, 'a', 0, 0, 0)),
+    );
+    check(
+      '★ 스케일이 실제로 곱해진다 (로컬 (1,1,1) → (2,3,4) 만큼 이동)',
+      near(toWorld(cloth, 'a', 1, 1, 1), 12, 23, 34),
+      xyz(toWorld(cloth, 'a', 1, 1, 1)),
+    );
+    cloth.clear();
+  }
+
+  // ── ② 쿼터니언 순서 — [x, y, z, w] 이지 [w, x, y, z] 가 아니다 ─
+  //
+  // 순서를 바꿔 읽어도 **노름이 1이라 아무 검사에도 안 걸린다.** 걸리는 것은
+  // 점이 어디로 가는가뿐이다. Z축 90°를 쓰는 이유: wxyz 로 읽으면 X축 90°가
+  // 되는데, 두 결과가 명확히 다른 점을 고를 수 있다.
+  {
+    const s = Math.SQRT1_2; // sin45 = cos45
+    const zq90: PatternTransform = { ...IDENTITY, rotation: [0, 0, s, s] };
+    const cloth = new ClothObject();
+    cloth.setTopology([localPattern('z90', [1, 0, 0, 0, 1, 0, 0, 0, 1], zq90)]);
+    check(
+      '★★ [x,y,z,w] 로 읽는다 — Z축 90°: 로컬 +X 가 월드 +Y 로 간다 (wxyz 면 +X 에 그대로 남는다)',
+      near(toWorld(cloth, 'z90', 1, 0, 0), 0, 1, 0),
+      xyz(toWorld(cloth, 'z90', 1, 0, 0)),
+    );
+    check(
+      '★ 같은 회전에서 로컬 +Z 는 제자리다 (축이 Z 라는 것까지 고정한다)',
+      near(toWorld(cloth, 'z90', 0, 0, 1), 0, 0, 1),
+      xyz(toWorld(cloth, 'z90', 0, 0, 1)),
+    );
+    cloth.clear();
+  }
+
+  // ── ③ Y축 180° 뒤집기 — 이 절의 핵심 ────────────────────────
+  //
+  // sample.zls 의 패턴 5개 중 3개가 |w| ≈ 3e-7 인 **180°** 회전이다. 부호만
+  // 보고 "거의 0이니 없는 셈" 으로 다루면 그 패널이 뒤집힌 채 놓인다.
+  {
+    const flip: PatternTransform = {
+      translation: [100, 200, 300],
+      // 실제 씬에서 나온 모양 그대로 — w 가 3e-7 이다.
+      rotation: [0, 1, 0, 3.1391647326017846e-7],
+      scale: [1, 1, 1],
+    };
+    const cloth = new ClothObject();
+    // x·z 에 **대칭이 아닌** 형상. 방향을 읽을 수 있어야 한다.
+    cloth.setTopology([localPattern('flip', [7, 0, 3, 0, 5, 0, 0, 0, 0], flip)]);
+    const w = toWorld(cloth, 'flip', 7, 0, 3);
+    check(
+      '★★ Y축 180° 가 실제로 걸린다 — 로컬 (7,0,3) 이 월드에서 (−7,0,−3)+t 로 간다',
+      near(w, 100 - 7, 200, 300 - 3, 1e-3),
+      `${xyz(w)} (기대 (93, 200, 297) / 회전을 무시하면 (107, 200, 303))`,
+    );
+    check(
+      '★ w 가 3e-7 이어도 회전각은 180° 다 (2·acos|w| — 부호 크기로 판정하면 안 된다)',
+      Math.abs(2 * Math.acos(Math.min(1, Math.abs(flip.rotation[3]))) * 180 / Math.PI - 180) < 0.01,
+      `${(2 * Math.acos(Math.abs(flip.rotation[3])) * 180 / Math.PI).toFixed(4)}°`,
+    );
+
+    // ── 경계 상자만 보는 단언이 왜 이걸 못 잡는지 ───────────────
+    //
+    // 같은 변환을 **x·z 에 대칭인** 형상에 걸면 AABB 가 한 치도 안 변한다.
+    // 이 두 줄이 "경계 상자 대조로 충분하다"는 판단을 막는다.
+    const sym = [4, 0, 2, -4, 0, -2, 4, 1, -2];
+    const rotated = new ClothObject();
+    rotated.setTopology([localPattern('s', sym, { ...flip, translation: [0, 0, 0] })]);
+    const plain = new ClothObject();
+    plain.setTopology([localPattern('s', sym)]);
+    const br = rotated.boundingBox();
+    const bp = plain.boundingBox();
+    check(
+      '★★ 대칭 형상에서는 180° 회전이 경계 상자를 전혀 바꾸지 않는다 (상자 대조만으로는 못 잡는다는 증거)',
+      br.min.distanceTo(bp.min) < 1e-4 && br.max.distanceTo(bp.max) < 1e-4,
+      `회전 ${xyz(br.min)}~${xyz(br.max)} / 무회전 ${xyz(bp.min)}~${xyz(bp.max)}`,
+    );
+    check(
+      '★★ 같은 데이터에서 점의 행선지는 확실히 다르다 (그래서 위의 방향 단언이 필요하다)',
+      !near(toWorld(rotated, 's', 4, 0, 2), 4, 0, 2, 1e-3)
+        && near(toWorld(plain, 's', 4, 0, 2), 4, 0, 2),
+      `회전 ${xyz(toWorld(rotated, 's', 4, 0, 2))} vs 무회전 ${xyz(toWorld(plain, 's', 4, 0, 2))}`,
+    );
+    rotated.clear();
+    plain.clear();
+    cloth.clear();
+  }
+
+  // ── ④ 변환이 없으면 identity — 그리고 잔류하지 않는다 ────────
+  {
+    const cloth = new ClothObject();
+    cloth.setTopology([localPattern('none', [1, 2, 3, 0, 0, 0, 0, 0, 0])]);
+    const p = cloth.patterns[0];
+    check(
+      '★ transform 이 없으면 identity 다 (구버전 워커·프레임 이벤트 — NaN 이 아니라 옛 화면)',
+      p !== undefined && p.mesh.position.length() === 0 && p.mesh.scale.x === 1
+        && p.mesh.quaternion.w === 1 && p.mesh.quaternion.x === 0,
+      p === undefined ? '패턴 없음'
+        : `pos ${p.mesh.position.toArray().join(',')} quat ${p.mesh.quaternion.toArray().join(',')}`,
+    );
+    check(
+      'identity 면 로컬 좌표가 곧 월드 좌표다',
+      near(toWorld(cloth, 'none', 1, 2, 3), 1, 2, 3),
+      xyz(toWorld(cloth, 'none', 1, 2, 3)),
+    );
+
+    // 변환이 있는 씬을 열었다가 없는 씬으로 갈아 끼운다 (재연결·다른 씬).
+    cloth.setTopology([localPattern('none', [1, 2, 3, 0, 0, 0, 0, 0, 0], {
+      ...IDENTITY, translation: [50, 60, 70],
+    })]);
+    cloth.setTopology([localPattern('none', [1, 2, 3, 0, 0, 0, 0, 0, 0])]);
+    check(
+      '★ 변환이 남아 있지 않다 (setTopology 는 메시를 새로 만든다 — 옛 씬의 위치가 새 씬에 새지 않는다)',
+      near(toWorld(cloth, 'none', 0, 0, 0), 0, 0, 0),
+      xyz(toWorld(cloth, 'none', 0, 0, 0)),
+    );
+    cloth.clear();
+  }
+
+  // ── ⑤ boundingBox() 가 월드 좌표다 (스냅샷과 같은 공간) ──────
+  //
+  // 로컬 상자를 그대로 합치면 카메라가 옷이 없는 자리를 겨눈다. 그리고
+  // `snapshotView.boundingBox()` 와 공간이 달라져 §8-10 의 대조가 성립하지 않는다.
+  {
+    const t: PatternTransform = { ...IDENTITY, translation: [0, 100, 0] };
+    const moved = new ClothObject();
+    moved.setTopology([localPattern('m', [-1, -1, -1, 1, 1, 1, 0, 0, 0], t)]);
+    const local = new ClothObject();
+    local.setTopology([localPattern('m', [-1, -1, -1, 1, 1, 1, 0, 0, 0])]);
+
+    const bm = moved.boundingBox();
+    const bl = local.boundingBox();
+    check(
+      '★★ boundingBox() 가 월드다 (변환만큼 통째로 옮겨진 상자)',
+      Math.abs(bm.min.y - 99) < 1e-4 && Math.abs(bm.max.y - 101) < 1e-4,
+      `${xyz(bm.min)} ~ ${xyz(bm.max)}`,
+    );
+    check(
+      '★ 대조군 — 변환을 안 걸면 같은 정점이 원점 근처에 남는다 (ISSUE-011 이전의 화면)',
+      Math.abs(bl.min.y + 1) < 1e-4 && Math.abs(bl.max.y - 1) < 1e-4,
+      `${xyz(bl.min)} ~ ${xyz(bl.max)}`,
+    );
+    check(
+      '★ 크기는 같고 자리만 다르다 (변환이 상자를 부풀리지 않았다)',
+      Math.abs(bm.getSize(new THREE.Vector3()).length()
+        - bl.getSize(new THREE.Vector3()).length()) < 1e-4,
+    );
+    moved.clear();
+    local.clear();
+  }
+
+  // ── ⑥ 프레임 갱신이 변환을 지우지 않는다 ────────────────────
+  //
+  // frame 이벤트의 mesh 에는 transform 이 오지 않는다. `updatePositions()` 가
+  // 그때 변환을 건드리면 **정점은 흔들리는데 옷이 원점으로 튀어간다.**
+  {
+    const t: PatternTransform = {
+      translation: [12.436, 54.653, 15],
+      rotation: [0, 1, 0, 3.1391647326017846e-7],
+      scale: [1, 1, 1],
+    };
+    const cloth = new ClothObject();
+    cloth.setTopology([localPattern('f', [1, 0, 0, 0, 1, 0, 0, 0, 1], t)]);
+    const before = toWorld(cloth, 'f', 0, 0, 0).clone();
+
+    // 프레임 이벤트가 주는 모양 그대로 — positions 만 있고 transform 은 없다.
+    const frame: DecodedPattern = {
+      uuid: 'f',
+      positions: Float32Array.from([2, 0, 0, 0, 2, 0, 0, 0, 2]),
+      vertices: 3,
+      triangles: 1,
+    };
+    const ok = cloth.updatePositions([frame]);
+    const after = toWorld(cloth, 'f', 0, 0, 0);
+    check(
+      '★★ transform 없는 프레임을 100번 먹여도 옷이 제자리에 남는다',
+      ok && (() => {
+        for (let i = 0; i < 100; i++) cloth.updatePositions([frame]);
+        return near(toWorld(cloth, 'f', 0, 0, 0), before.x, before.y, before.z, 1e-6);
+      })(),
+      `${xyz(before)} → ${xyz(after)}`,
+    );
+    check(
+      '★ 그 사이 정점은 실제로 갈렸다 (움직이지 않는 것과 구분한다)',
+      (cloth.patterns[0]?.position.array as Float32Array)[0] === 2,
+      String((cloth.patterns[0]?.position.array as Float32Array)[0]),
+    );
+    check(
+      '★ 갱신 뒤 경계 상자도 여전히 월드다 (computeBoundingBox 를 다시 부르면서 변환을 잃지 않는다)',
+      Math.abs(cloth.boundingBox().getCenter(new THREE.Vector3()).y - 54.653) < 2,
+      xyz(cloth.boundingBox().getCenter(new THREE.Vector3())),
+    );
+    cloth.clear();
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -3148,12 +3622,40 @@ function sectionSnapshotObject(): void {
 // ─────────────────────────────────────────────────────────────
 
 /** 이 절에서 실제로 읽는 glTF 필드만 (전체 스키마를 옮겨 적지 않는다) */
+interface GltfNode {
+  name?: string;
+  /** [x, y, z]. 없으면 원점 */
+  translation?: number[];
+  /** [x, y, z, w]. glTF 규약이 three.js 와 같은 순서다 */
+  rotation?: number[];
+  scale?: number[];
+  children?: number[];
+}
 interface GltfShape {
-  nodes?: { name?: string; scale?: number[]; children?: number[] }[];
+  nodes?: GltfNode[];
   scenes?: { nodes?: number[] }[];
   meshes?: unknown[];
   materials?: unknown[];
   images?: unknown[];
+}
+
+/** `cloth0003_side1` → 3. 옷 패턴 노드가 아니면 null */
+function clothPatternIndex(name: string): number | null {
+  const m = /^cloth(\d+)_side\d+$/.exec(name);
+  return m?.[1] === undefined ? null : Number(m[1]);
+}
+
+/** 두 배열의 성분별 최대 절대 편차. 길이가 다르면 Infinity */
+function maxDiff(a: readonly number[], b: readonly number[]): number {
+  if (a.length !== b.length) return Number.POSITIVE_INFINITY;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d = Math.max(d, Math.abs((a[i] ?? 0) - (b[i] ?? 0)));
+  return d;
+}
+
+/** 쿼터니언 회전각(도). w 의 크기만 보면 180° 를 0° 로 착각한다 */
+function angleDeg(q: readonly number[]): number {
+  return 2 * Math.acos(Math.min(1, Math.abs(q[3] ?? 1))) * 180 / Math.PI;
 }
 
 /**
@@ -3207,6 +3709,244 @@ function withProgressEvent<T>(fn: () => Promise<T>): Promise<T> {
   return fn().finally(() => {
     if (!had) delete g['ProgressEvent'];
   });
+}
+
+/**
+ * ★ ISSUE-011 의 **유일한 진짜 증명.** 실시간 옷과 스냅샷 옷이 같은 자리에 오는가.
+ *
+ * ── 왜 여기에 얹었는가 ──────────────────────────────────────
+ * 이 대조에는 **정답지가 필요하다** — 익스포트한 glTF 의 노드 계층은 엔진이
+ * 직접 만든 것이라 옳다고 간주한다. 그런데 정답지를 얻으려면 실제 워커로
+ * 익스포트를 돌려야 하고(9.7MB / 1~2초), 그것만으로 독립 절을 세우면 스모크가
+ * 통째로 그만큼 느려진다. §8-10 이 **이미 그 익스포트를 하고 파싱까지 해 둔다.**
+ * 여기에 더해지는 비용은 `meshData(topology:true)` 한 번(~30ms)뿐이다.
+ *
+ * ── 무엇을 대조하는가 ───────────────────────────────────────
+ * 두 층이다. 둘 다 있어야 한다:
+ *   ⓐ **TRS 성분별** — 워커가 실은 열 개 숫자 vs 익스포터가 노드에 쓴 열 개 숫자.
+ *      **회전을 여기서 잡는다.** 경계 상자는 회전에 거의 반응하지 않는다(§8-11).
+ *   ⓑ **월드 경계 상자** — 그 숫자가 three 의 행렬을 타고 나온 결과. ⓐ 가 맞아도
+ *      `cloth.ts` 가 그것을 안 걸거나 `boundingBox()` 가 로컬을 돌려주면 어긋난다.
+ *
+ * ── 그리고 대조군 ───────────────────────────────────────────
+ * 같은 패턴에서 `transform` 만 뺀 `ClothObject` 를 하나 더 세운다. 이것이
+ * **ISSUE-011 이전의 동작**이다. 이게 없으면 "원래 맞았던 것 아닌가" 를 배제할
+ * 방법이 없다 — 위 두 대조가 통과해도 그 사실만으로는 변환이 일을 했다는
+ * 증거가 되지 않는다.
+ *
+ * ⚠️ 씬별 좌표값을 박지 않는다. 박는 것은 **관계**뿐이고("정답지와 같다",
+ *    "대조군은 다르다"), 정답지는 같은 실행에서 방금 뽑은 파일이다.
+ */
+async function compareLiveToGltf(
+  client: GatewayClient,
+  json: GltfShape,
+  parsed: ParsedSnapshot,
+  obj: SnapshotObject,
+): Promise<void> {
+  // ── 정답지: glTF 노드의 TRS ────────────────────────────────
+  const truth = new Map<number, { t: number[]; r: number[]; s: number[]; nodes: number }>();
+  let inconsistentSides = 0;
+  for (const n of (json['nodes'] ?? []) as GltfNode[]) {
+    const i = clothPatternIndex(n.name ?? '');
+    if (i === null) continue;
+    const trs = {
+      t: n.translation ?? [0, 0, 0],
+      r: n.rotation ?? [0, 0, 0, 1],
+      s: n.scale ?? [1, 1, 1],
+    };
+    const seen = truth.get(i);
+    if (!seen) {
+      truth.set(i, { ...trs, nodes: 1 });
+      continue;
+    }
+    seen.nodes += 1;
+    // 한 패턴의 side 노드들은 같은 변환을 가져야 한다. 정답지 자신의 무결성 검사다.
+    if (maxDiff(seen.t, trs.t) > 1e-6 || maxDiff(seen.r, trs.r) > 1e-6
+      || maxDiff(seen.s, trs.s) > 1e-6) inconsistentSides += 1;
+  }
+
+  check(
+    '★ 정답지가 성립한다 — glTF 에 옷 패턴 노드가 있고 side 노드끼리 변환이 같다',
+    truth.size > 0 && inconsistentSides === 0,
+    `패턴 ${truth.size}개 / side 불일치 ${inconsistentSides}건`,
+  );
+
+  // ── 실시간 경로: 같은 세션의 meshData(topology:true) ────────
+  const live = decodePatterns(await client.meshData(true));
+  const cloth = new ClothObject();
+  const control = new ClothObject();
+  try {
+    cloth.setTopology(live);
+    // 대조군 — `transform` 만 뺀다. ISSUE-011 이전의 `cloth.ts` 가 하던 일이다.
+    control.setTopology(live.map((p) => {
+      const { transform: _drop, ...rest } = p;
+      return rest;
+    }));
+
+    check(
+      '★ 실시간 패턴 수와 정답지의 옷 패턴 수가 같다 (짝을 지을 수 있다)',
+      live.length === truth.size && live.length > 0,
+      `실시간 ${live.length} / glTF ${truth.size}`,
+    );
+
+    // ── ⓐ TRS 성분별 대조 ────────────────────────────────────
+    //
+    // 두 값의 출처는 엔진 안에서 같아야 한다(`GetTransformIn3D()`). 달라진다면
+    // 둘 중 하나가 잘못된 것을 보고 있다는 뜻이고, 그건 회귀가 아니라 설계 사고다.
+    let worstT = 0;
+    let worstR = 0;
+    let worstS = 0;
+    let missing = 0;
+    let unmatched = 0;
+    const rows: string[] = [];
+    live.forEach((p, i) => {
+      const g = truth.get(i);
+      const t = p.transform;
+      if (!g) {
+        unmatched += 1;
+        return;
+      }
+      if (!t) {
+        missing += 1;
+        return;
+      }
+      const dt = maxDiff(t.translation, g.t);
+      const dr = maxDiff(t.rotation, g.r);
+      const ds = maxDiff(t.scale, g.s);
+      worstT = Math.max(worstT, dt);
+      worstR = Math.max(worstR, dr);
+      worstS = Math.max(worstS, ds);
+      rows.push(`#${i} Δt=${dt.toExponential(1)} Δr=${dr.toExponential(1)} ${angleDeg(g.r).toFixed(0)}°`);
+    });
+
+    check(
+      '★★ 실시간 변환이 정답지(익스포트한 glTF 노드)와 일치한다 — translation',
+      missing === 0 && unmatched === 0 && worstT < 1e-3,
+      `최대 편차 ${worstT.toExponential(2)}cm (없음 ${missing}, 짝 못 지음 ${unmatched})`,
+    );
+    check(
+      '★★ 같은 대조 — rotation (쿼터니언 4성분. 순서가 틀리면 여기서 벌어진다)',
+      missing === 0 && worstR < 1e-5,
+      `최대 편차 ${worstR.toExponential(2)}`,
+    );
+    check(
+      '★★ 같은 대조 — scale',
+      missing === 0 && worstS < 1e-6,
+      `최대 편차 ${worstS.toExponential(2)}`,
+    );
+    note('패턴별', rows.join('  '));
+
+    // ── ⓐ-2 회전이 실제로 일을 했다 ──────────────────────────
+    //
+    // 위 세 줄이 통과해도, 정답지 자체가 전부 identity 면 "회전을 무시하는 구현"
+    // 도 통과한다. 이 씬은 그렇지 않다는 것을 먼저 확인하고, 그 비자명 회전이
+    // three 의 행렬까지 실제로 도달했는지를 **점의 행선지로** 본다 —
+    // 180° 회전은 경계 상자를 안 바꿀 수 있기 때문이다(§8-11 참고).
+    const spun = [...truth.entries()].filter(([, g]) => angleDeg(g.r) > 1);
+    check(
+      '★ 이 씬에는 회전이 자명하지 않은 패턴이 있다 (identity 뿐이면 아래 단언에 이빨이 없다)',
+      spun.length > 0,
+      `${spun.length}/${truth.size}개 — ${spun.map(([i, g]) => `#${i} ${angleDeg(g.r).toFixed(0)}°`).join(', ')}`,
+    );
+    let rotatedApplied = 0;
+    let rotatedTotal = 0;
+    for (const [i, g] of spun) {
+      const p = live[i];
+      const mesh = p ? cloth.patterns.find((m) => m.uuid === p.uuid)?.mesh : undefined;
+      if (!mesh) continue;
+      rotatedTotal += 1;
+      // 정답지의 행렬로 옮긴 점 vs 실시간 메시의 행렬로 옮긴 점.
+      const probe = new THREE.Vector3(10, 20, 30);
+      // ⚠️ 순서는 T·R·S — **스케일이 먼저**다. 뒤집어 적으면 이 씬(scale
+      //    [1,1,1])에서는 우연히 같은 값이 나오고, 스케일이 1이 아닌 씬이
+      //    들어오는 순간 멀쩡한 구현을 빨간불로 만든다.
+      const expect = probe.clone()
+        .multiply(new THREE.Vector3().fromArray(g.s))
+        .applyQuaternion(new THREE.Quaternion().fromArray(g.r))
+        .add(new THREE.Vector3().fromArray(g.t));
+      const got = probe.clone().applyMatrix4(mesh.matrixWorld);
+      // 회전을 무시했을 때 갔을 자리. 여기로 가면 안 된다.
+      const naive = probe.clone().add(new THREE.Vector3().fromArray(g.t));
+      if (got.distanceTo(expect) < 1e-2 && got.distanceTo(naive) > 1) rotatedApplied += 1;
+    }
+    check(
+      '★★ 비자명 회전이 three 의 행렬까지 실제로 도달했다 (180° 패널이 뒤집힌 채 놓이지 않는다)',
+      rotatedTotal > 0 && rotatedApplied === rotatedTotal,
+      `${rotatedApplied}/${rotatedTotal}개 — 회전을 무시했다면 0이 된다`,
+    );
+
+    // ── ⓑ 월드 경계 상자 대조 ────────────────────────────────
+    //
+    // 정답지 쪽은 **옷 노드만** 골라 잰다. 스냅샷 전체 상자에는 아바타가 들어
+    // 있어 실시간(옷만)과 같은 대상이 아니다.
+    obj.boundingBox(); // group.matrixWorld 를 갱신시킨다 (렌더를 안 돌렸다)
+    const gltfCloth = new THREE.Box3();
+    const tmp = new THREE.Box3();
+    parsed.scene.traverse((o) => {
+      if (clothPatternIndex(o.name) === null) return;
+      gltfCloth.union(tmp.setFromObject(o));
+    });
+
+    const liveBox = cloth.boundingBox();
+    const ctrlBox = control.boundingBox();
+    const minGap = liveBox.min.distanceTo(gltfCloth.min);
+    const maxGap = liveBox.max.distanceTo(gltfCloth.max);
+
+    check(
+      '★ 정답지에서 옷 노드만 골라낸 상자가 서 있다 (아바타가 섞이지 않았다)',
+      !gltfCloth.isEmpty(),
+      `${xyz(gltfCloth.min)} ~ ${xyz(gltfCloth.max)}`,
+    );
+    check(
+      '★★★ 실시간 옷의 월드 경계 상자가 정답지와 같은 자리에 있다 (ISSUE-011 의 통과 기준)',
+      !liveBox.isEmpty() && minGap < 0.5 && maxGap < 0.5,
+      `min 차 ${minGap.toFixed(3)}cm / max 차 ${maxGap.toFixed(3)}cm`,
+    );
+    note('LIVE ', `${xyz(liveBox.min)} ~ ${xyz(liveBox.max)}`);
+    note('GLTF ', `${xyz(gltfCloth.min)} ~ ${xyz(gltfCloth.max)}`);
+    note('LOCAL', `${xyz(ctrlBox.min)} ~ ${xyz(ctrlBox.max)}  (대조군)`);
+
+    // ── 대조군 — 변환을 빼면 확실히 어긋난다 ──────────────────
+    const ctrlGap = ctrlBox.min.distanceTo(gltfCloth.min);
+    check(
+      '★★ 대조군 — 변환을 빼면 정답지에서 확연히 벗어난다 ("원래 맞았던 것 아닌가"를 배제한다)',
+      ctrlGap > 10 && ctrlGap > minGap * 20,
+      `대조군 ${ctrlGap.toFixed(1)}cm 어긋남 vs 변환 적용 ${minGap.toFixed(3)}cm`,
+    );
+    check(
+      '★ 대조군의 옷은 원점을 중심에 두고 절반이 바닥 아래로 내려간다 (ISSUE-011 의 증상 그대로)',
+      ctrlBox.min.y < 0 && Math.abs(ctrlBox.getCenter(new THREE.Vector3()).y) < 20,
+      `바닥 y=${ctrlBox.min.y.toFixed(2)}, 중심 y=${ctrlBox.getCenter(new THREE.Vector3()).y.toFixed(2)}`,
+    );
+    check(
+      '★ 두 상자의 **크기**는 대조군도 비슷하다 (달라진 것은 자리이지 형상이 아니다)',
+      Math.abs(ctrlBox.getSize(new THREE.Vector3()).y - liveBox.getSize(new THREE.Vector3()).y)
+        < liveBox.getSize(new THREE.Vector3()).y,
+      `대조군 높이 ${ctrlBox.getSize(new THREE.Vector3()).y.toFixed(1)} / 적용 ${liveBox.getSize(new THREE.Vector3()).y.toFixed(1)}cm`,
+    );
+
+    // ── 그리고 아바타와의 관계 (#14 가 이 위에 쌓인다) ────────
+    //
+    // ISSUE-011 이 **차단**인 이유가 여기다. 옷이 몸 안쪽 높이에 오는가.
+    const avatar = new THREE.Box3();
+    parsed.scene.traverse((o) => {
+      if (!o.name.startsWith('zeta_body')) return;
+      avatar.union(tmp.setFromObject(o));
+    });
+    check(
+      '★★ 실시간 옷이 아바타의 높이 범위 안에 든다 (아바타를 얹어도 몸에서 떨어지지 않는다)',
+      !avatar.isEmpty() && liveBox.min.y > avatar.min.y - 5 && liveBox.max.y < avatar.max.y + 5,
+      `옷 y ${liveBox.min.y.toFixed(1)}~${liveBox.max.y.toFixed(1)} / 아바타 y ${avatar.min.y.toFixed(1)}~${avatar.max.y.toFixed(1)}`,
+    );
+    check(
+      '★ 대조군은 그 범위를 벗어난다 (이 단언에 이빨이 있다는 증거)',
+      !avatar.isEmpty() && ctrlBox.min.y < avatar.min.y - 5,
+      `대조군 바닥 y=${ctrlBox.min.y.toFixed(1)} vs 아바타 바닥 ${avatar.min.y.toFixed(1)}`,
+    );
+  } finally {
+    cloth.clear();
+    control.clear();
+  }
 }
 
 async function sectionSnapshotRealExport(): Promise<void> {
@@ -3289,7 +4029,7 @@ async function sectionSnapshotRealExport(): Promise<void> {
 
       // ── ② 파일 안에 무엇이 들어 있는가 ───────────────────────
       const { data: strippedBytes, json } = stripImages(bytes);
-      const nodes = (json['nodes'] ?? []) as { name?: string; scale?: number[]; children?: number[] }[];
+      const nodes = (json['nodes'] ?? []) as GltfNode[];
       const rootIdx = ((json['scenes'] ?? [])[0]?.nodes ?? [])[0] as number | undefined;
       const rootNode = rootIdx === undefined ? undefined : nodes[rootIdx];
 
@@ -3355,6 +4095,9 @@ async function sectionSnapshotRealExport(): Promise<void> {
             size.y > 100, `높이 ${size.y.toFixed(1)}cm`,
           );
           note('실측', `bbox ${size.x.toFixed(1)} × ${size.y.toFixed(1)} × ${size.z.toFixed(1)} cm, 바닥 y=${box.min.y.toFixed(2)}`);
+
+          // ── ④ 정답지 대조 (ISSUE-011) ──────────────────────
+          await compareLiveToGltf(client, json, parsed, obj);
         } catch (err: unknown) {
           check('이미지를 덜어낸 실제 glTF 파싱', false, messageOf(err));
         } finally {
@@ -3427,6 +4170,7 @@ async function main(): Promise<void> {
   await sectionRealWorker();
   sectionClothTopology();
   sectionClothFrames();
+  sectionClothTransform();
   sectionFrameStreamQueue();
   sectionFrameStreamCloth();
   await sectionSnapshotMachine();

@@ -2,6 +2,8 @@
 
 #include <ZestManager.h>
 
+#include <zsTransform.h>   // 패턴 → 월드 변환 (MeshData)
+
 #include <ztDesignClothPattern.h>
 #include <ztDesignTriMesh.h>
 #include <ztLiveEditUtil.h>
@@ -237,6 +239,9 @@ json MeshInfo(ZestManager& manager, void* listener)
 // 토폴로지는 프레임 간 고정이므로 최초 1회만 보내면 된다.
 // 프레임마다 필요한 건 positions뿐이다.
 //
+// 패턴 변환(transform)도 같은 이유로 topology 쪽에 붙는다 — 실측상 프레임마다
+// 바뀌지 않는다. 근거와 그 가정이 깨졌을 때의 증상은 아래 해당 블록의 주석에 있다.
+//
 // meshData 응답과 구독 중 frame 이벤트의 mesh 필드가 **같은 함수**를 쓴다.
 // zsVector3 재포장(아래)이 두 곳에 복사되면 언젠가 갈라지고, 그때 어긋난
 // 쪽은 화면이 깨져야만 드러난다.
@@ -290,6 +295,54 @@ json MeshData(ZestManager& manager, bool includeTopology)
 
         if (includeTopology)
         {
+            // ── 패턴 → 월드 변환 (ISSUE-011) ────────────────────────
+            //
+            // GetSimulationOutputMesh()의 정점은 **패턴 로컬 좌표**다.
+            // 월드 위치는 이 변환을 곱해야 정해진다 — 회사 저장소의
+            // ztDesignClothPattern::GetAABB()가 경계 상자를 구할 때
+            // transform * vertices[i]를 적용하는 것이 그 근거다.
+            //
+            // 출처는 glTF 익스포터와 **동일**하다: 익스포터도 옷 패턴 노드마다
+            // GetTransformIn3D()를 노드 변환으로 쓴다
+            // (zwGltfExporterImpl.cpp:392 → :1915-1921). 따라서 여기서 나가는
+            // 값과 익스포트 산출물의 노드 변환은 같아야 하고, 어긋나면
+            // 둘 중 하나가 잘못된 출처를 보고 있다는 뜻이다.
+            //
+            // 단위는 정점과 같은 cm다(엔진 전역 단위). 익스포터가 cm→m
+            // 스케일 0.01을 거는 곳은 glTF **루트 노드**이지 이 변환이 아니다.
+            //
+            // ★ 왜 topology:true일 때만 싣는가 — 프레임마다 바뀌지 않기 때문이다.
+            //   근거는 실측이다: sample.zls를 같은 세션에서 시뮬 전과 249프레임
+            //   후에 익스포트해 노드 변환 28개를 비교했고 전부 비트 단위로
+            //   동일했다(정점은 확실히 움직였다 — 파일 크기가 달라졌다).
+            //   **이는 씬 두 개를 249프레임 관측한 결과이지 엔진이 보장하는
+            //   불변식이 아니다.** 시뮬 중 패턴 변환을 움직이는 기능(3D
+            //   기즈모 이동/회전, SetTransform 계열 라이브 에디팅)이 붙으면
+            //   이 가정이 깨진다.
+            //
+            //   깨졌을 때 어떻게 드러나는가: 클라이언트는 최초 1회 받은 변환을
+            //   계속 쓰므로, **정점은 정상적으로 흔들리는데 옷 전체가 있어야 할
+            //   자리에서 벗어난 채 고정된다.** 크래시도 에러도 나지 않고 화면만
+            //   틀리므로 "솔버가 이상하다"로 오진하기 쉽다. 그때 할 일은 이
+            //   블록을 includeTopology 밖으로 꺼내는 것이다(프레임당 +40바이트).
+            const ZELUS::zsTransform  xform = pattern->GetTransformIn3D();
+            const ZELUS::zsVector3&   t     = xform.GetTranslation();
+            const ZELUS::zsQuaternion& r    = xform.GetRotation();
+            const ZELUS::zsVector3&   s     = xform.GetScale();
+
+            // TRS로 보낸다(4×4 행렬이 아니라). 익스포터가 glTF 노드에 쓰는 것과
+            // 같은 분해이고, three.js의 position/quaternion/scale에 그대로
+            // 꽂힌다. 쿼터니언은 glTF와 같은 [x, y, z, w] 순서다.
+            //
+            // 정점 버퍼와 달리 base64로 싸지 않는다 — 패턴당 10개 숫자뿐이라
+            // 압축 이득이 없고, 사람이 읽을 수 있어야 익스포트 산출물과
+            // 대조하기 쉽다.
+            p["transform"] = json{
+                { "translation", { t.x, t.y, t.z } },
+                { "rotation",    { r.GetX(), r.GetY(), r.GetZ(), r.GetW() } },
+                { "scale",       { s.x, s.y, s.z } },
+            };
+
             if (mesh.indices.size() > 0)
             {
                 p["indices"] = Base64(&mesh.indices[0],

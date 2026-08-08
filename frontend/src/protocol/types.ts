@@ -34,6 +34,7 @@ export type {
   Op,
   PatternData,
   PatternInfo,
+  PatternTransform,
   SetParamsResult,
   SimulationParams,
   StatusResult,

@@ -27,6 +27,23 @@
  *
  * ⚠️ `uvs` 는 텍스처 좌표가 아니라 **cm 단위 2D 패턴 좌표**다(앞판 20.5 × 96.4).
  *    0~1 로 정규화돼 있지 않다. #15 의 2D 펼침 뷰가 이 값을 위치로 쓴다.
+ *
+ * ── 정점은 로컬 좌표다 (ISSUE-011) ──────────────────────────
+ * `positions` 는 **패턴 로컬 좌표**이고, 월드 위치는 패턴마다 딸려 오는
+ * `transform`(TRS)을 곱해야 정해진다. 그래서 여기서 그것을 `Mesh` 에 건다.
+ *
+ * **왜 정점에 미리 곱하지 않는가** — 두 가지다.
+ *   ① #15 의 2D 펼침 뷰가 로컬 좌표를 원한다. 정점에 곱해 버리면 되돌릴
+ *      방법이 없다(변환을 따로 보관해도 부동소수 왕복이 남는다).
+ *   ② 매 프레임 정점 3,022~13,398개에 행렬 곱이 붙는다. `Mesh` 에 걸면
+ *      GPU 가 모델 행렬로 공짜로 처리한다 — 프레임 갱신 경로가 그대로 남는다.
+ *
+ * **왜 한 번만 받는가** — 워커가 `topology:true` 응답에만 싣기 때문이다.
+ * 실측상 프레임마다 바뀌지 않아서다(sample.zls 249프레임, 비트 단위 동일).
+ * 따라서 `updatePositions()` 는 변환을 다시 걸 필요가 없다 — `Mesh` 의
+ * position/quaternion/scale 은 우리가 건드리지 않는 한 그대로 남는다.
+ * 나중에 라이브 에디팅으로 이 가정이 깨지면 **정점은 흔들리는데 옷 전체가
+ * 엉뚱한 자리에 고정**되는 모습으로 드러난다.
  */
 
 import * as THREE from 'three';
@@ -151,6 +168,21 @@ export class ClothObject {
 
       const mesh = new THREE.Mesh(geometry, material);
       mesh.name = `pattern:${p.uuid}`;
+
+      // ★ 패턴 로컬 → 월드 (ISSUE-011). 지오메트리가 아니라 **여기**에 건다.
+      //   없으면(구버전 워커 / 프레임 이벤트에서 만든 패턴) identity 로 둔다 —
+      //   지금까지의 화면이 정확히 그 상태였고, 옷만 그리면 어긋날 상대가
+      //   없어서 드러나지 않았다.
+      if (p.transform) {
+        mesh.position.fromArray(p.transform.translation);
+        mesh.quaternion.fromArray(p.transform.rotation); // [x, y, z, w]
+        mesh.scale.fromArray(p.transform.scale);
+        // 렌더 루프가 돌기 전에도 월드 행렬이 맞아야 한다 — boundingBox() 와
+        // 레이캐스팅(#16)이 렌더보다 먼저 불릴 수 있다.
+        mesh.updateMatrix();
+        mesh.updateMatrixWorld(true);
+      }
+
       // 패턴 하나가 프러스텀에서 잘려 나가는 사고를 막는다. 5개짜리 씬에서
       // 컬링으로 얻을 것이 없다.
       mesh.frustumCulled = false;
@@ -178,6 +210,10 @@ export class ClothObject {
    * 조용히 어긋난 메시를 그리는 대신 `false` 를 돌려준다. 부르는 쪽은 그때
    * `setTopology()` 를 다시 해야 한다 — 재연결로 워커가 바뀌었거나 다른 씬을
    * 연 경우다.
+   *
+   * ⚠️ 여기서 패턴 변환을 다시 걸지 않는다(ISSUE-011). 프레임 이벤트의 mesh 에는
+   *    `transform` 이 애초에 오지 않고, `Mesh` 에 걸어 둔 값은 우리가 건드리지
+   *    않는 한 그대로 살아 있다. 정점만 갈아 끼우는 것이 맞다.
    */
   updatePositions(patterns: readonly DecodedPattern[]): boolean {
     if (patterns.length !== this.#byUuid.size) return false;
@@ -204,12 +240,32 @@ export class ClothObject {
     return true;
   }
 
-  /** 씬 경계. 카메라를 맞출 때 쓴다 */
+  /**
+   * 씬 경계 — **월드 좌표(= cm)** 다. 카메라를 맞출 때 쓴다.
+   *
+   * ★ 지오메트리의 경계 상자는 **로컬 좌표**라 그대로 합치면 안 된다
+   *   (ISSUE-011). 변환을 `Mesh` 에 걸어 놨으므로 각 상자에 그 메시의
+   *   `matrixWorld` 를 곱해야 카메라가 옷이 실제로 있는 자리를 본다. 이걸
+   *   빼면 옷은 y=55~113 에 서 있는데 카메라는 원점 근처를 겨눠서, 화면에
+   *   옷이 반쯤 걸리거나 통째로 벗어난다. `snapshotView.boundingBox()` 가
+   *   `setFromObject` 로 같은 일을 한다 — 두 뷰의 경계가 같은 공간에 있어야
+   *   서로 대조가 된다.
+   *
+   * `computeBoundingBox()` 를 매번 다시 부르는 이유: `updatePositions()` 는
+   * 경계 **구**만 갱신하므로(프러스텀 컬링이 그것을 쓴다) 상자는 로드 직후
+   * 값에 멎어 있다.
+   */
   boundingBox(): THREE.Box3 {
     const box = new THREE.Box3();
+    const local = new THREE.Box3();
+    // 렌더를 한 번도 안 돌렸을 때(로드 직후의 frameCamera) 자식 행렬이 낡아
+    // 있다. 그룹에서 한 번에 내려 갱신한다 — snapshotView 와 같은 이유다.
+    this.group.updateMatrixWorld(true);
     for (const p of this.#byUuid.values()) {
       p.geometry.computeBoundingBox();
-      if (p.geometry.boundingBox) box.union(p.geometry.boundingBox);
+      if (!p.geometry.boundingBox) continue;
+      // 빈 상자(정점 0개)에 applyMatrix4 를 걸어도 three 가 그대로 돌려준다.
+      box.union(local.copy(p.geometry.boundingBox).applyMatrix4(p.mesh.matrixWorld));
     }
     return box;
   }

@@ -20,7 +20,7 @@
  * 쓴다 — 네이티브라 3~5배 빠르다. 없으면 조용히 폴백한다.
  */
 
-import type { FrameMesh, PatternData } from './types.ts';
+import type { FrameMesh, PatternData, PatternTransform } from './types.ts';
 
 /** ES2025 `Uint8Array.fromBase64`. 아직 lib 에 없어서 직접 좁힌다 */
 type FromBase64 = (base64: string) => Uint8Array;
@@ -103,8 +103,61 @@ export interface DecodedPattern {
   indices?: Int32Array;
   /** topology:true 로 받았을 때만. 정점당 2 개 */
   uvs?: Float32Array;
+  /**
+   * 패턴 로컬 → 월드 변환 (ISSUE-011). **topology:true 로 받았을 때만.**
+   *
+   * `positions` 는 이 변환이 곱해지지 **않은** 로컬 좌표다. 그리는 쪽이
+   * `Mesh` 에 걸어야 옷이 제자리에 선다 (`cloth.ts` 의 `setTopology`).
+   * 프레임 이벤트에는 오지 않으므로 여기서 받은 것을 계속 쓴다.
+   */
+  transform?: PatternTransform;
   vertices: number;
   triangles: number;
+}
+
+/**
+ * `transform` 검증 — **길이와 유한성만 본다.**
+ *
+ * 값의 옳고 그름은 여기서 판정할 수 없지만(그건 씬이 정한다) 모양이 틀린 것은
+ * 확실히 안다. 모양이 틀린 채 통과시키면 `fromArray` 가 `undefined` 를 읽어
+ * 좌표가 `NaN` 이 되고, three 는 조용히 **아무것도 그리지 않는다** — 화면이
+ * 비었는데 정점 수는 정상으로 찍히므로 원인을 화면에서 읽을 방법이 없다.
+ *
+ * ⚠️ 없는 것(`undefined`)은 오류가 아니다. 프레임 이벤트의 mesh 와 이 필드를
+ *    싣기 전 워커가 그렇다 — 그 경우 변환 없이(= identity) 그린다.
+ */
+function decodeTransform(uuid: string, raw: unknown): PatternTransform | undefined {
+  if (raw === undefined || raw === null) return undefined;
+
+  if (typeof raw !== 'object') {
+    throw new Error(`패턴 ${uuid}: transform 이 객체가 아닙니다 (${typeof raw})`);
+  }
+
+  const src = raw as Record<string, unknown>;
+  const take = (key: string, len: number): number[] => {
+    const arr = src[key];
+    if (!Array.isArray(arr) || arr.length !== len) {
+      throw new Error(
+        `패턴 ${uuid}: transform.${key} 는 길이 ${len} 의 배열이어야 합니다`,
+      );
+    }
+    for (const v of arr) {
+      if (typeof v !== 'number' || !Number.isFinite(v)) {
+        throw new Error(`패턴 ${uuid}: transform.${key} 에 숫자가 아닌 값이 있습니다`);
+      }
+    }
+    return arr as number[];
+  };
+
+  const [tx, ty, tz] = take('translation', 3) as [number, number, number];
+  const [rx, ry, rz, rw] = take('rotation', 4) as [number, number, number, number];
+  const [sx, sy, sz] = take('scale', 3) as [number, number, number];
+
+  return {
+    translation: [tx, ty, tz],
+    rotation: [rx, ry, rz, rw],
+    scale: [sx, sy, sz],
+  };
 }
 
 /**
@@ -158,6 +211,11 @@ export function decodePattern(p: PatternData): DecodedPattern {
     }
     out.uvs = uvs;
   }
+
+  // base64 가 아니라 평문 숫자다 — 패턴당 10개뿐이라 압축 이득이 없고,
+  // 사람이 읽을 수 있어야 익스포트 산출물의 노드 변환과 대조할 수 있다.
+  const transform = decodeTransform(p.uuid, p.transform);
+  if (transform) out.transform = transform;
 
   return out;
 }
