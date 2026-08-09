@@ -57,6 +57,15 @@ import {
   type GatewayAddress,
   type GatewayOptions,
 } from '../../../backend/src/server/index.ts';
+import {
+  isTypingTarget,
+  PlaybackController,
+  shortcutFor,
+  SHORTCUT_HINT,
+  type PlaybackHooks,
+  type PlaybackPort,
+  type ShortcutAction,
+} from '../panels/index.ts';
 import { ClothObject } from '../viewer3d/cloth.ts';
 import {
   FrameStream,
@@ -105,6 +114,7 @@ import {
   type FrameMesh,
   type PatternData,
   type SceneSummary,
+  type StatusResult,
 } from './index.ts';
 // `PatternTransform` 만은 배럴(`index.ts`)이 재export 하지 않아 여기서 직접 꺼낸다.
 // (`types.ts` 가 `sdk/protocol.ts` 의 정의를 재export 하는 그 타입이다.)
@@ -4116,6 +4126,1167 @@ async function sectionSnapshotRealExport(): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────
+// §10. 재생 상태 기계 (#14) — 화면 없이 전이 전체를 돈다
+//
+// **이 절이 존재하는 이유가 곧 ISSUE-009 다.** 재생 상태가 `main.ts` 의 모듈
+// 스코프 불리언 두 개로 흩어져 있던 동안 자동 테스트가 한 줄도 덮지 못했고,
+// "버튼은 정지라고 쓰여 있는데 시뮬은 멈춰 있다" 를 사람이 브라우저에서 눈으로
+// 찾아야 했다. `panels/playback.ts` 가 DOM 을 안 만지므로 여기서 가짜 포트 하나로
+// 전이 전체를 돌린다.
+//
+// ── 무엇을 여기에 두고 무엇을 verify/ui.ts 에 두었는가 ───────
+// **상태 기계는 여기, 버튼·키·화면은 저기다.** 가르는 기준은 "실패했을 때
+// 원인이 어디에 남는가" 하나다:
+//
+//   여기(Node)  전이·파생·계측기·훅 순서·연타·끊김. 결정적이고 30ms 면 끝난다.
+//               브라우저로 하면 타이밍에 흔들리고 실패 원인이 화면에 안 남는다.
+//   ui.ts       버튼이 실제로 그 메서드에 붙어 있는가, 키가 실제로 먹는가,
+//               리셋 뒤 **화면의 옷이 돌아오는가**. 여기서는 원리상 볼 수 없다.
+//
+// 겹치는 것이 하나 있다 — **"재생 중 재로드 → 버튼이 정직해진다"** 는 양쪽에
+// 다 둔다. 여기서는 `sceneLoading()` 이 믿음을 내리는 것을 증명하고, 저기서는
+// **[로드] 버튼이 그 함수를 실제로 부르는지**를 증명한다. 배선이 끊기면 여기는
+// 초록인 채로 화면만 거짓말한다 — ISSUE-009 가 정확히 그 모양이었다.
+//
+// ── 가짜 포트는 워커를 **실측 그대로** 흉내낸다 ──────────────
+// 아래 `makePort()` 는 편한 대로 만든 모형이 아니라 워커의 실제 거동이다
+// (`backend/native/src/protocol.cpp` + Builder 실측). 모형이 실제와 갈라지면
+// 이 절 전체가 환상을 검증하게 되므로, §10-10 이 **실제 워커로 그 다섯 가지를
+// 다시 확인한다.**
+// ─────────────────────────────────────────────────────────────
+
+/** 가짜 포트가 받는 op. `PlaybackPort` 의 메서드 이름 그대로다 */
+type PortOp = 'start' | 'pause' | 'reset' | 'clear' | 'step' | 'subscribe' | 'status';
+
+/**
+ * 워커의 시뮬 상태 모형. **다섯 가지가 실측이고, 그게 이 절의 전제다:**
+ *
+ *   ① `start`/`pause` 가 mode 를 바꾼다
+ *   ② **시뮬이 서면 `curFrame` 이 -1 이 된다** (엔진 콜백이 그렇게 준다)
+ *   ③ **`reset` 은 `maxFrame` 만 -1 로 되돌리고 `curFrame` 은 옛 봉우리로 남긴다**
+ *   ④ `clear` 는 씬을 내린다. `reset` 은 남긴다
+ *   ⑤ **`step` 은 응답만 `{mode:"step"}` 이고 아무 일도 하지 않는다**
+ *
+ * ②③⑤ 가 이 단위의 함정 전부다. §10-10 이 실제 워커로 다섯 가지를 확인한다.
+ */
+interface WorkerModel {
+  loaded: boolean;
+  mode: StatusResult['mode'];
+  /** 워커의 `curFrame`. 시뮬이 서면 -1 로 보고된다 */
+  curFrame: number;
+  maxFrame: number;
+  subscribed: boolean;
+}
+
+interface FakePort extends PlaybackPort {
+  connected: boolean;
+  /** op 과 훅 호출이 **한 줄로** 쌓인다. 순서 단언이 여기서 나온다 */
+  trace: string[];
+  worker: WorkerModel;
+  /** 이 op 은 워커에 닿기 전에 실패한다 */
+  failing: Set<PortOp>;
+  /** 이 op 은 **워커에 반영된 뒤** 실패한다 (타임아웃의 모양이다) */
+  failAfter: Set<PortOp>;
+  /** 이 promise 가 풀릴 때까지 응답을 붙잡는다 — 왕복 중 상태를 관찰한다 */
+  held: Map<PortOp, Promise<void>>;
+  /** 워커에 씬이 올라갔다 (`load` op 은 이 포트를 지나지 않는다) */
+  putScene(): void;
+  /** 시뮬이 프레임 n 까지 갔다 */
+  advanceTo(n: number): void;
+  count(op: PortOp): number;
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+function makePort(trace: string[] = []): FakePort {
+  const worker: WorkerModel = {
+    loaded: false, mode: 'pause', curFrame: -1, maxFrame: -1, subscribed: false,
+  };
+  const failing = new Set<PortOp>();
+  const failAfter = new Set<PortOp>();
+  const held = new Map<PortOp, Promise<void>>();
+
+  async function call<T>(op: PortOp, effect: () => T): Promise<T> {
+    trace.push(op);
+    const hold = held.get(op);
+    if (hold) await hold;
+    if (failing.has(op)) throw new Error(`${op} 이 워커에 닿지 못했다(가짜)`);
+    const out = effect();
+    if (failAfter.has(op)) throw new Error(`${op} 은 됐는데 응답을 못 받았다(가짜)`);
+    return out;
+  }
+
+  return {
+    connected: true,
+    trace,
+    worker,
+    failing,
+    failAfter,
+    held,
+    putScene(): void {
+      // 워커의 `load` 는 시뮬을 초기화하고 maxFrame 을 -1 로 되돌린다.
+      worker.loaded = true;
+      worker.mode = 'pause';
+      worker.curFrame = -1;
+      worker.maxFrame = -1;
+    },
+    advanceTo(n: number): void {
+      worker.curFrame = n;
+      worker.maxFrame = n;
+    },
+    count(op: PortOp): number {
+      return trace.filter((t) => t === op).length;
+    },
+    start: () => call('start', () => {
+      worker.mode = 'play';
+      return { mode: 'play' };
+    }),
+    pause: () => call('pause', () => {
+      worker.mode = 'pause';
+      return { mode: 'pause' };
+    }),
+    // ★ 실측 ③ — maxFrame 만 되돌린다. curFrame 은 옛 봉우리로 남는다.
+    reset: () => call('reset', () => {
+      worker.mode = 'pause';
+      worker.maxFrame = -1;
+      return { mode: 'reset' };
+    }),
+    clear: () => call('clear', () => {
+      worker.loaded = false;
+      worker.mode = 'pause';
+      worker.maxFrame = -1;
+      return { cleared: true };
+    }),
+    // ★ 실측 ⑤ — 응답만 step 이고 워커는 아무것도 하지 않는다.
+    step: () => call('step', () => ({ mode: 'step' })),
+    subscribe: () => call('subscribe', () => {
+      worker.subscribed = true;
+      return { subscribed: true };
+    }),
+    status: () => call('status', () => ({
+      loaded: worker.loaded,
+      simInitialized: worker.loaded,
+      mode: worker.mode,
+      // ★ 실측 ② — 시뮬이 서 있으면 엔진 콜백이 -1 을 준다.
+      frame: worker.mode === 'play' ? worker.curFrame : -1,
+      maxFrame: worker.maxFrame,
+      subscribed: worker.subscribed,
+    })),
+  };
+}
+
+/** 훅 호출을 `port.trace` 에 같은 줄로 섞어 넣는다. 순서 단언이 여기서 나온다 */
+function tracingHooks(trace: string[], extra: PlaybackHooks = {}): PlaybackHooks {
+  return {
+    beforePlay: () => {
+      trace.push('hook:beforePlay');
+      extra.beforePlay?.();
+    },
+    afterReset: async () => {
+      trace.push('hook:afterReset');
+      await extra.afterReset?.();
+    },
+    afterClear: () => {
+      trace.push('hook:afterClear');
+      extra.afterClear?.();
+    },
+    onChange: (v) => {
+      extra.onChange?.(v);
+    },
+    log: (l) => {
+      extra.log?.(l);
+    },
+  };
+}
+
+/** 씬이 올라가 있고 정지 상태인 컨트롤러 하나. 대부분의 절이 여기서 시작한다 */
+async function ready(
+  extra: PlaybackHooks = {},
+): Promise<{ pb: PlaybackController; port: FakePort; trace: string[] }> {
+  const trace: string[] = [];
+  const port = makePort(trace);
+  const pb = new PlaybackController({ port, hooks: tracingHooks(trace, extra) });
+  port.putScene();
+  pb.sceneLoaded('scene-1');
+  await pb.syncFromWorker();
+  trace.length = 0;
+  return { pb, port, trace };
+}
+
+/** 두 글자 중 하나만 들어 있는가. `verify/ui.ts` 의 ensurePlaying 이 읽는 방식이다 */
+function readsAs(label: string, want: '재생' | '정지'): boolean {
+  const other = want === '재생' ? '정지' : '재생';
+  return label.includes(want) && !label.includes(other);
+}
+
+// ── §10-1. 상태는 파생이다 ───────────────────────────────────
+//
+// 필드로 들면 "끊겼는데 playing" 같은 조합이 **표현 가능해지고**, 그게 곧
+// ISSUE-009 의 형태다. 여기서 보는 것은 그 조합들이 하나도 만들어지지 않는가다.
+
+async function sectionPlaybackDerived(): Promise<void> {
+  section('§10-1. 재생 상태 기계 — 상태는 파생이다 (playback.ts, DOM 없이)');
+
+  {
+    const port = makePort();
+    const pb = new PlaybackController({ port });
+    check('붙었지만 씬이 없으면 noScene', pb.state === 'noScene', pb.state);
+    port.connected = false;
+    check('소켓이 없으면 disconnected', pb.state === 'disconnected', pb.state);
+  }
+
+  // ★ 이 절의 핵심. 재생 중에 소켓이 사라지면 **어느 경로로도** playing 이
+  //   남을 수 없어야 한다. 상태를 필드로 들면 여기가 뚫린다.
+  {
+    const { pb, port } = await ready();
+    await pb.play();
+    check('재생을 켜면 playing', pb.state === 'playing' && pb.view.playing, pb.state);
+    check(
+      '버튼 글자가 "정지" 쪽으로 읽힌다 (ui.ts 의 ensurePlaying 이 이 글자를 본다)',
+      readsAs(pb.view.playLabel, '정지'), pb.view.playLabel,
+    );
+
+    // 소켓만 사라뜨린다 — 컨트롤러에는 아무것도 알리지 않는다.
+    port.connected = false;
+    check(
+      '★★ 재생 중에 소켓이 사라지면 아무도 안 알려줘도 disconnected 다 (파생의 증거)',
+      pb.state === 'disconnected' && !pb.view.playing,
+      `${pb.state} / playing=${String(pb.view.playing)}`,
+    );
+    check(
+      '★★ 그때 버튼 글자도 "재생" 으로 읽힌다 ("끊겼는데 ⏸ 정지" 가 표현 불가능하다)',
+      readsAs(pb.view.playLabel, '재생'), pb.view.playLabel,
+    );
+    check(
+      '★ 그 상태에서는 어떤 버튼도 안 눌린다',
+      !pb.view.canPlay && !pb.view.canReset && !pb.view.canClear && !pb.view.canStep,
+      `play=${String(pb.view.canPlay)} reset=${String(pb.view.canReset)}`,
+    );
+
+    // 되붙이면 원래 상태가 그대로 돌아온다 — 파생이라 잃어버릴 것이 없다.
+    port.connected = true;
+    check('소켓이 돌아오면 상태도 돌아온다', pb.state === 'playing', pb.state);
+  }
+
+  // loading 은 scene 보다 앞선다 — 로드 중에 "씬 있음/재생 중" 이 보이면 안 된다.
+  {
+    const { pb } = await ready();
+    await pb.play();
+    pb.sceneLoading();
+    check(
+      '★ 씬이 있어도 로드 중이면 loading 이 이긴다',
+      pb.state === 'loading' && !pb.view.playing, pb.state,
+    );
+    pb.sceneLoadFailed();
+    check(
+      '로드 실패는 씬 유무를 스스로 정하지 않는다 (sync 에 맡긴다)',
+      pb.view.scene === 'scene-1', String(pb.view.scene),
+    );
+  }
+
+  // 진행 중 op(`pending`)은 상태가 아니다.
+  {
+    const { pb, port } = await ready();
+    const gate = deferred();
+    port.held.set('start', gate.promise);
+    const p = pb.play();
+    await sleep(10);
+    check(
+      '★ 왕복 중이어도 state 는 다섯 개 중 하나다 (pending 은 상태가 아니다)',
+      pb.state === 'paused', pb.state,
+    );
+    check('그동안 busy 가 서 있고 버튼은 잠긴다', pb.busy && !pb.view.canPlay,
+      `busy=${String(pb.busy)} canPlay=${String(pb.view.canPlay)}`);
+    check('view.pending 이 어떤 op 인지 말한다', pb.view.pending === 'play', String(pb.view.pending));
+    gate.resolve();
+    await p;
+    check('끝나면 pending 이 비고 상태가 넘어간다',
+      pb.view.pending === null && pb.state === 'playing', pb.state);
+  }
+
+  // 재연결은 복구가 아니라 빈 세션이다.
+  {
+    const { pb, port } = await ready();
+    await pb.play();
+    pb.connectionLost();
+    check('끊기면 재생 믿음과 구독이 함께 내려간다',
+      !pb.view.playing && !pb.view.subscribed,
+      `playing=${String(pb.view.playing)} subscribed=${String(pb.view.subscribed)}`);
+    pb.sessionStarted();
+    check(
+      '★ 새 세션은 빈 세션이다 (씬도 프레임도 초기값 — 화면에 옛 옷이 남지 않는다)',
+      pb.view.scene === null && pb.view.frame === null && pb.state === 'noScene',
+      `scene=${String(pb.view.scene)} frame=${String(pb.view.frame)} state=${pb.state}`,
+    );
+    check('워커의 mode 도 "아직 안 물었다" 로 되돌아간다',
+      pb.view.workerMode === null, String(pb.view.workerMode));
+    port.connected = false;
+    check('끊긴 뒤의 상태줄은 연결을 말한다', pb.view.text.includes('연결'), pb.view.text);
+  }
+}
+
+// ── §10-2. ★ ISSUE-009 ───────────────────────────────────────
+//
+// 증상: 재생 중에 씬을 다시 로드하면 워커는 멈추는데 버튼은 `⏸ 정지` 로 남는다.
+// 닫은 방법: 1안(로드 시작 자리에서 믿음을 내린다) + 3안(전이가 끝나는 자리마다
+// 워커에 되묻는다). `stats.corrections` 가 그 계측기다.
+//
+// **계측기만으로는 아무것도 증명하지 못한다** — 늘 0 인 죽은 카운터일 수도 있다.
+// 그래서 세 가지를 같이 본다: ⓐ 정상 경로에서 0 (대조군), ⓑ 믿음을 안 내리면
+// 1 (그게 ISSUE-009 다), ⓒ 워커가 혼자 멎으면 1 (계측기가 살아 있다).
+
+async function sectionPlaybackIssue009(): Promise<void> {
+  section('§10-2. ★ ISSUE-009 — 재생 중 재로드에서 화면이 거짓말하지 않는다');
+
+  // ── ⓐ 정상 경로: 재생 중 재로드 ────────────────────────────
+  {
+    const { pb, port } = await ready();
+    await pb.play();
+    port.advanceTo(120);
+    pb.noteFrame(120);
+    check('전제 — 재생 중이고 프레임이 흐른다',
+      pb.state === 'playing' && pb.view.frame === 120, `frame=${String(pb.view.frame)}`);
+
+    // ★ 로드가 시작된다. 아직 **아무것도 await 하지 않았다** — 103MB 면 1초쯤
+    //   걸리는 구간이고, ISSUE-009 는 그 1초 동안 화면이 거짓말하는 것이었다.
+    pb.sceneLoading();
+    check(
+      '★★★ 로드가 시작된 그 자리에서 즉시 재생 믿음이 내려간다 (성공을 기다리지 않는다)',
+      !pb.view.playing && pb.state === 'loading',
+      `state=${pb.state} playing=${String(pb.view.playing)}`,
+    );
+    check(
+      '★★★ 그 순간 버튼 글자가 "재생" 으로 읽힌다 — ISSUE-009 의 증상 그 자체',
+      readsAs(pb.view.playLabel, '재생'), pb.view.playLabel,
+    );
+    check('로드 중에는 프레임 번호도 비운다 (옛 런의 봉우리가 남지 않는다)',
+      pb.view.frame === null, String(pb.view.frame));
+
+    // 워커가 로드를 마쳤다 (시뮬 초기화 + maxFrame -1).
+    port.putScene();
+    pb.sceneLoaded('scene-1');
+    // ★ **되묻기 전**이다. `loading` 이 걷힌 이 한 칸에서 믿음이 되살아나면
+    //   버튼이 다시 `⏸ 정지` 로 깜빡인다 — `main.ts` 는 여기서 `setBusy(false)`
+    //   와 `paintSnap()` 을 지나 실제로 다시 그린다. 파생만으로는 못 막는
+    //   자리이고(로드 중에는 `loading` 이 가려 준다), `sceneLoading()` 이
+    //   믿음을 내려 뒀는지가 여기서만 드러난다.
+    check(
+      '★★★ 로드가 끝난 직후, 되묻기 전에도 여전히 "재생" 이다 (믿음이 되살아나지 않는다)',
+      !pb.view.playing && readsAs(pb.view.playLabel, '재생') && pb.state === 'paused',
+      `state=${pb.state} label=${pb.view.playLabel}`,
+    );
+    await pb.syncFromWorker();
+    check('로드가 끝나면 paused 로 선다', pb.state === 'paused', pb.state);
+    check(
+      '★★★ 대조군 — 이 경로 내내 corrections 가 0 이다 (믿음이 사실과 한 번도 갈라지지 않았다)',
+      pb.stats.corrections === 0, `corrections=${pb.stats.corrections}`,
+    );
+  }
+
+  // ── ⓑ 믿음을 안 내리면 어떻게 되는가 (= ISSUE-009) ──────────
+  //
+  // `sceneLoading()` 을 빼고 같은 일을 한다. 이것이 #14 이전의 동작이고,
+  // 계측기가 그것을 **잡아낸다**는 것이 이 절이 성립하는 근거다.
+  {
+    const { pb, port } = await ready();
+    await pb.play();
+    port.advanceTo(120);
+    // 로드 경로를 타지 않는다 — 워커만 씬을 다시 올린다.
+    port.putScene();
+    check(
+      '★ (재현) 믿음을 안 내리면 워커는 멈췄는데 화면은 "⏸ 정지" 다',
+      pb.view.playing && readsAs(pb.view.playLabel, '정지'), pb.view.playLabel,
+    );
+    await pb.syncFromWorker();
+    check(
+      '★★ 그때 되묻기가 그 거짓말을 잡아낸다 (corrections 가 오른다)',
+      pb.stats.corrections === 1 && !pb.view.playing,
+      `corrections=${pb.stats.corrections} playing=${String(pb.view.playing)}`,
+    );
+    check('되묻고 나면 화면이 사실을 말한다', readsAs(pb.view.playLabel, '재생'), pb.view.playLabel);
+  }
+
+  // ── ⓒ 워커가 혼자 멎었다 — 우리 손을 안 지나는 어긋남 ───────
+  {
+    const { pb, port } = await ready();
+    await pb.play();
+    port.worker.mode = 'pause'; // 워커만 멎었다. 우리는 모른다.
+    check('전제 — 우리 믿음은 아직 재생이다', pb.view.playing, pb.state);
+    await pb.syncFromWorker();
+    check(
+      '★★ 워커가 혼자 멎어도 다음 되묻기에서 화면이 따라간다',
+      !pb.view.playing && pb.stats.corrections === 1,
+      `corrections=${pb.stats.corrections}`,
+    );
+  }
+
+  // ── ⓓ 씬이 워커에서 사라진 경우도 같은 계측기에 걸린다 ──────
+  {
+    const { pb, port } = await ready();
+    port.worker.loaded = false;
+    await pb.syncFromWorker();
+    check(
+      '★ 씬이 워커에서 사라진 것도 되묻기가 잡는다 (noScene 으로 내려간다)',
+      pb.state === 'noScene' && pb.stats.corrections === 1,
+      `state=${pb.state} corrections=${pb.stats.corrections}`,
+    );
+  }
+
+  // ── ⓔ op 이 끝나는 자리마다 되묻는다 (폴링이 아니다) ────────
+  {
+    const { pb, port, trace } = await ready();
+    await pb.play();
+    check('★ op 뒤에는 반드시 status 가 따라온다',
+      trace[trace.length - 1] === 'status', trace.join(' → '));
+    const syncs0 = pb.stats.syncs;
+    const status0 = port.count('status');
+    await sleep(300);
+    check(
+      '★ 가만히 두면 되묻지 않는다 (폴링이 아니라 전이 자리에서만 묻는다)',
+      pb.stats.syncs === syncs0 && port.count('status') === status0,
+      `syncs ${syncs0} → ${pb.stats.syncs} · status ${status0} → ${port.count('status')}`,
+    );
+    await pb.pause();
+    check(
+      '★ op 하나에 되묻기가 정확히 하나 붙는다 (왕복이 op 당 두 번으로 늘지 않는다)',
+      pb.stats.syncs - syncs0 === 1 && port.count('status') - status0 === 1,
+      `syncs +${pb.stats.syncs - syncs0} / status +${port.count('status') - status0}`,
+    );
+  }
+
+  // ── ⓕ 실패한 op 이 워커에 닿아 있었던 경우 ──────────────────
+  //
+  // 타임아웃의 모양이다: 워커는 재생을 시작했는데 우리는 응답을 못 받았다.
+  // 여기서 화면이 "정지" 로 남으면 그것도 ISSUE-009 다.
+  {
+    const { pb, port } = await ready();
+    port.failAfter.add('start');
+    const ok = await pb.play();
+    check('응답을 못 받은 play 는 false 를 돌려준다 (던지지 않는다)', ok === false, String(ok));
+    check(
+      '★★ 그래도 화면은 워커를 따라 "재생 중" 이 된다 (실패했을 때가 더 중요하다)',
+      pb.view.playing && pb.stats.corrections === 1,
+      `playing=${String(pb.view.playing)} corrections=${pb.stats.corrections}`,
+    );
+    check('실패는 실패대로 남는다', pb.stats.failures === 1 && pb.lastError !== null,
+      `failures=${pb.stats.failures}`);
+  }
+}
+
+// ── §10-3. 프레임 번호 — 함정 두 개 ──────────────────────────
+//
+// 워커의 `status.frame` 은 화면에 쓸 수 없다. 함정이 **양쪽에** 있다:
+//   ① 멈추면 -1 이 온다 → 그대로 쓰면 화면이 "-1"
+//   ② "마지막 유효값 보관" 으로 가리면, `reset` 이 curFrame 을 안 건드리므로
+//      리셋한 뒤에도 옛 봉우리(249)가 남는다
+// 두 함정을 같은 절에서 덮는다. 한쪽만 덮으면 반대쪽으로 고치는 사람이 생긴다.
+
+async function sectionPlaybackFrames(): Promise<void> {
+  section('§10-3. 재생 상태 기계 — 프레임 번호의 함정 두 개');
+
+  const { pb, port } = await ready();
+  await pb.play();
+  port.advanceTo(249);
+  pb.noteFrame(249);
+  check('재생 중에는 frame 이벤트의 번호가 그대로 화면에 간다',
+    pb.view.frame === 249, String(pb.view.frame));
+  check('상태줄에 그 번호가 실린다', pb.view.text.includes('249'), pb.view.text);
+
+  // ── 함정 ①: 멈추면 status.frame 이 -1 ─────────────────────
+  await pb.pause();
+  const s1 = await pb.syncFromWorker();
+  note('워커가 말한 것(정지 직후)', `frame=${s1?.frame} maxFrame=${s1?.maxFrame}`);
+  check(
+    '★★ 정지 뒤에도 화면의 프레임은 249 다 (status.frame 을 썼다면 -1 이 찍힌다)',
+    pb.view.frame === 249, String(pb.view.frame),
+  );
+  check(
+    '★ 음수가 온 사실은 계측기에 남는다 (워커를 고치면 0 이 된다)',
+    pb.stats.negativeFrames > 0, `negativeFrames=${pb.stats.negativeFrames}`,
+  );
+
+  // ── 함정 ②: "마지막 유효값 보관" 의 반대쪽 함정 ────────────
+  //
+  // 함정 ①을 "음수가 오면 직전의 유효한 값을 그대로 들고 있기" 로 가리면,
+  // **리셋해도 그 값을 버릴 계기가 없다** — 워커는 maxFrame 만 -1 로 되돌리고
+  // 프레임 이벤트는 한 건도 안 오므로, 화면에는 옛 봉우리 249 가 남는다.
+  // 아래가 그 구현이 남겼을 값이고, 실제 값이 그것과 달라야 한다.
+  const wouldHold = pb.view.frame; // "마지막 유효값 보관" 구현이 들고 있었을 수
+  const before = pb.stats.negativeFrames;
+  await pb.reset();
+  const s2 = await pb.syncFromWorker();
+  note('워커가 말한 것(리셋 직후)', `frame=${s2?.frame} maxFrame=${s2?.maxFrame}`);
+  check(
+    '★★★ 리셋하면 화면의 프레임이 비워진다 ("마지막 유효값 보관" 이면 249 가 남는다)',
+    pb.view.frame === null && wouldHold === 249, `${String(wouldHold)} → ${String(pb.view.frame)}`,
+  );
+  check(
+    '★ 그때 상태줄에는 프레임 항목이 아예 없다 ("-" 를 읽을 이유가 없다)',
+    !pb.view.text.includes('프레임') && pb.view.text.includes('일시정지'), pb.view.text,
+  );
+  check('리셋에서도 음수 계측기는 계속 센다', pb.stats.negativeFrames > before,
+    `${before} → ${pb.stats.negativeFrames}`);
+
+  // ── frame 이벤트도 -1 을 실어 올 수 있다 ───────────────────
+  pb.noteFrame(-1);
+  check('★ frame 이벤트의 -1 은 버린다 (리셋 직후 한 건이 지나갈 수 있다)',
+    pb.view.frame === null, String(pb.view.frame));
+  pb.noteFrame(3);
+  pb.noteFrame(-1);
+  check('이미 숫자가 있어도 -1 로 덮어쓰지 않는다', pb.view.frame === 3, String(pb.view.frame));
+
+  // ── noteFrame 은 다시 그리라고 하지 않는다 (40/s) ──────────
+  {
+    let changes = 0;
+    const port2 = makePort();
+    const pb2 = new PlaybackController({
+      port: port2, hooks: { onChange: () => { changes += 1; } },
+    });
+    port2.putScene();
+    pb2.sceneLoaded('s');
+    await pb2.syncFromWorker();
+    const c0 = changes;
+    for (let i = 0; i < 40; i++) pb2.noteFrame(i);
+    check(
+      '★ noteFrame 은 onChange 를 부르지 않는다 (40/s 로 DOM 을 흔들지 않는다)',
+      changes === c0, `${c0} → ${changes} (40회 호출)`,
+    );
+    check('그래도 값은 반영돼 있다', pb2.view.frame === 39, String(pb2.view.frame));
+  }
+
+  // ── 화면 프레임의 출처는 maxFrame 하나다 ───────────────────
+  {
+    const { pb: pb3, port: port3 } = await ready();
+    await pb3.play();
+    port3.worker.curFrame = 999; // curFrame 만 크게. maxFrame 은 그대로.
+    port3.worker.maxFrame = 7;
+    await pb3.syncFromWorker();
+    check(
+      '★★ 화면의 프레임은 maxFrame 을 따른다 (curFrame 999 를 따라가지 않는다)',
+      pb3.view.frame === 7, String(pb3.view.frame),
+    );
+  }
+}
+
+// ── §10-4. 구독은 세션당 한 번 ───────────────────────────────
+
+async function sectionPlaybackSubscribe(): Promise<void> {
+  section('§10-4. 재생 상태 기계 — 구독은 세션당 한 번');
+
+  const { pb, port, trace } = await ready();
+  await pb.play();
+  check(
+    '★ subscribe 가 start 보다 먼저 나간다 (반대면 첫 몇 프레임이 mesh 없이 지나간다)',
+    trace.indexOf('subscribe') >= 0 && trace.indexOf('subscribe') < trace.indexOf('start'),
+    trace.join(' → '),
+  );
+
+  await pb.pause();
+  await pb.play();
+  await pb.reset();
+  await pb.play();
+  await pb.pause();
+  await pb.clear();
+  port.putScene();
+  pb.sceneLoaded('scene-1');
+  await pb.syncFromWorker();
+  await pb.play();
+  check(
+    '★★ 재생·정지·리셋·clear·재로드를 지나도 subscribe 는 1회다',
+    pb.stats.subscribes === 1 && port.count('subscribe') === 1,
+    `stats ${pb.stats.subscribes} / 실제 전송 ${port.count('subscribe')}`,
+  );
+
+  // 재연결 = 새 워커. 구독이 꺼진 채로 시작하므로 반드시 다시 보내야 한다.
+  pb.connectionLost();
+  pb.sessionStarted();
+  const port2Worker = port.worker;
+  port2Worker.subscribed = false; // 새 워커다
+  port.putScene();
+  pb.sceneLoaded('scene-1');
+  await pb.syncFromWorker();
+  await pb.play();
+  check(
+    '★★ 재연결 뒤에는 다시 보낸다 (새 워커라 구독이 꺼져 있다)',
+    pb.stats.subscribes === 2, `subscribes=${pb.stats.subscribes}`,
+  );
+
+  // 믿음이 아니라 사실을 따른다 — 워커가 아니라고 하면 다시 켠다.
+  port.worker.subscribed = false;
+  await pb.syncFromWorker();
+  check('되묻기가 구독 여부도 사실로 덮는다', !pb.view.subscribed, String(pb.view.subscribed));
+  await pb.pause();
+  await pb.play();
+  check(
+    '★ 그러면 다음 재생에서 다시 구독한다 (믿음이 아니라 사실을 따라간다)',
+    pb.stats.subscribes === 3, `subscribes=${pb.stats.subscribes}`,
+  );
+}
+
+// ── §10-5. 훅 — 순서와 격리 ──────────────────────────────────
+//
+// 훅은 화면이 끼워 넣는 것이라 **던질 수 있다.** 숫자를 찍는 코드가 시뮬 제어를
+// 죽이면 원인을 찾을 길이 없다. 어디까지 격리되는지를 여기서 못으로 박는다.
+
+async function sectionPlaybackHooks(): Promise<void> {
+  section('§10-5. 재생 상태 기계 — 훅의 순서와 격리');
+
+  // ── 순서 ───────────────────────────────────────────────────
+  {
+    const { pb, trace } = await ready();
+    await pb.play();
+    check(
+      '★ play: beforePlay → subscribe → start → status',
+      trace.join(' → ') === 'hook:beforePlay → subscribe → start → status', trace.join(' → '),
+    );
+    trace.length = 0;
+    await pb.reset();
+    check(
+      '★ reset: reset → afterReset → status (포즈를 다시 받은 뒤에 되묻는다)',
+      trace.join(' → ') === 'reset → hook:afterReset → status', trace.join(' → '),
+    );
+    trace.length = 0;
+    await pb.clear();
+    check('★ clear: clear → afterClear → status',
+      trace.join(' → ') === 'clear → hook:afterClear → status', trace.join(' → '));
+  }
+
+  // ── afterReset 은 리셋의 성패를 좌우하지 않는다 ─────────────
+  //
+  // 포즈를 다시 못 받은 것이 리셋 실패는 아니다. 리셋은 이미 됐다.
+  {
+    const logs: string[] = [];
+    const { pb } = await ready({
+      afterReset: () => {
+        throw new Error('포즈 재수신 실패(가짜)');
+      },
+      log: (l) => logs.push(l),
+    });
+    const ok = await pb.reset();
+    check(
+      '★★ afterReset 이 던져도 reset 은 성공이다 (리셋은 이미 워커에서 됐다)',
+      ok === true && pb.stats.resets === 1 && pb.stats.failures === 0,
+      `ok=${String(ok)} failures=${pb.stats.failures}`,
+    );
+    check('대신 이유가 로그에 남는다',
+      logs.some((l) => l.includes('포즈')), logs.join(' | ') || '(없음)');
+  }
+
+  // ── onChange 가 던져도 시뮬 제어는 산다 ────────────────────
+  {
+    const port = makePort();
+    const pb = new PlaybackController({
+      port,
+      hooks: { onChange: () => { throw new Error('그리다 죽었다(가짜)'); } },
+    });
+    port.putScene();
+    pb.sceneLoaded('s');
+    await pb.syncFromWorker();
+    const ok = await pb.play();
+    check(
+      '★★ onChange 가 던져도 재생은 된다 (숫자를 찍는 코드가 시뮬을 죽이지 않는다)',
+      ok === true && pb.state === 'playing', `ok=${String(ok)} state=${pb.state}`,
+    );
+  }
+
+  // ── beforePlay / afterClear 는 격리되지 않는다 ─────────────
+  //
+  // ⚠️ `PlaybackHooks` 머리말은 "전부 …던져도 op 을 실패시키지 않는다" 고
+  //    적었는데 이 둘은 그렇지 않다. 아래는 **지금 동작을 그대로 못으로 박지
+  //    않고**, 어느 쪽이든 성립해야 하는 것 — 즉 **상태가 정직한가** — 만 단언한다.
+  //    (반환값의 어긋남은 Tester 보고서에 적었다.)
+  {
+    const { pb, port } = await ready({
+      beforePlay: () => {
+        throw new Error('실시간 복귀 실패(가짜)');
+      },
+    });
+    await pb.play();
+    check(
+      '★ beforePlay 가 던지면 start 가 나가지 않고, 믿음도 재생이 되지 않는다',
+      port.count('start') === 0 && !pb.view.playing && pb.state === 'paused',
+      `start ${port.count('start')} / state ${pb.state}`,
+    );
+  }
+  {
+    const { pb, port } = await ready({
+      afterClear: () => {
+        throw new Error('화면 정리 실패(가짜)');
+      },
+    });
+    await pb.clear();
+    check(
+      '★★ afterClear 가 던져도 씬은 내려간 상태다 (화면 정리 실패가 상태를 되돌리지 않는다)',
+      pb.state === 'noScene' && port.worker.loaded === false,
+      `state=${pb.state} worker.loaded=${String(port.worker.loaded)}`,
+    );
+  }
+
+  // 훅이 하나도 없어도 돈다 (main.ts 말고 다른 화면이 붙을 수 있다).
+  {
+    const port = makePort();
+    const pb = new PlaybackController({ port });
+    port.putScene();
+    pb.sceneLoaded('s');
+    await pb.syncFromWorker();
+    check('훅 없이도 전이가 돈다', (await pb.play()) && pb.state === 'playing', pb.state);
+  }
+}
+
+// ── §10-6. 실패·연타·못 하는 조작 ────────────────────────────
+//
+// 전부 `Promise<boolean>` 이고 **던지지 않는다.** 버튼 핸들러에서 도는 함수라,
+// 던지면 `void` 로 삼켜져 unhandled rejection 만 남고 화면에는 단서가 안 생긴다.
+
+async function sectionPlaybackFailures(): Promise<void> {
+  section('§10-6. 재생 상태 기계 — 실패·연타·못 하는 조작');
+
+  // ── 던지지 않는다 ──────────────────────────────────────────
+  {
+    const { pb, port } = await ready();
+    for (const op of ['start', 'pause', 'reset', 'clear', 'step'] as const) port.failing.add(op);
+    port.failing.add('status');
+    const results = [
+      await pb.play(), await pb.pause(), await pb.reset(),
+      await pb.clear(), await pb.step(),
+    ];
+    check(
+      '★★ 조작 다섯 개가 전부 실패해도 하나도 던지지 않는다 (false 로 돌아온다)',
+      results.every((r) => r === false), results.map(String).join(','),
+    );
+    check('실패가 계측기에 남는다', pb.stats.failures === 5, `failures=${pb.stats.failures}`);
+    check('마지막 오류를 화면이 읽을 수 있다',
+      pb.lastError instanceof Error, pb.lastError?.message ?? '(없음)');
+    check(
+      '★ status 까지 실패해도 던지지 않는다 (되묻기 실패가 op 을 실패로 만들지 않는다)',
+      (await pb.syncFromWorker()) === null, '되묻기 실패는 null',
+    );
+  }
+
+  // ── 연타 ───────────────────────────────────────────────────
+  {
+    const { pb, port } = await ready();
+    const gate = deferred();
+    port.held.set('start', gate.promise);
+    const first = pb.play();
+    await sleep(5);
+    const second = await pb.pause();
+    const third = await pb.reset();
+    gate.resolve();
+    check(
+      '★★ 왕복 중인 op 이 있으면 다른 조작을 거절한다 (마지막 응답이 이기는 경합을 막는다)',
+      second === false && third === false, `pause=${String(second)} reset=${String(third)}`,
+    );
+    check('거절은 실패가 아니라 거절로 센다',
+      pb.stats.rejected === 2 && pb.stats.failures === 0,
+      `rejected=${pb.stats.rejected} failures=${pb.stats.failures}`);
+    check('첫 op 은 그대로 완주한다', (await first) === true && pb.state === 'playing', pb.state);
+    check('거절된 op 은 워커에 나가지도 않았다',
+      port.count('pause') === 0 && port.count('reset') === 0,
+      `pause ${port.count('pause')} / reset ${port.count('reset')}`);
+  }
+
+  // ── 못 하는 조작은 워커에 나가지 않는다 ────────────────────
+  {
+    const { pb, port } = await ready();
+    port.connected = false;
+    const n0 = port.trace.length;
+    const ok = await pb.play();
+    check(
+      '★ 연결이 없으면 아무것도 보내지 않는다',
+      ok === false && port.trace.length === n0, `${n0} → ${port.trace.length}`,
+    );
+    check('이유가 lastError 에 있다',
+      (pb.lastError?.message ?? '').includes('연결'), pb.lastError?.message ?? '');
+    port.connected = true;
+    await pb.clear();
+    const n1 = port.trace.length;
+    const ok2 = await pb.play();
+    check(
+      '★ 씬이 없으면 아무것도 보내지 않는다 (워커가 조용히 성공시키는 것을 막는다)',
+      ok2 === false && port.trace.length === n1,
+      `${pb.lastError?.message ?? ''}`,
+    );
+    pb.sceneLoading();
+    const n2 = port.trace.length;
+    await pb.play();
+    check('로드 중에도 마찬가지다', port.trace.length === n2, `${n2} → ${port.trace.length}`);
+  }
+
+  // 끊긴 상태에서는 되묻지도 않는다.
+  {
+    const { pb, port } = await ready();
+    port.connected = false;
+    const n = port.count('status');
+    check('★ 끊긴 상태에서 되묻기는 왕복을 만들지 않는다',
+      (await pb.syncFromWorker()) === null && port.count('status') === n, `status ${n}`);
+  }
+}
+
+// ── §10-7. reset 과 clear 는 다르다 ──────────────────────────
+
+async function sectionPlaybackResetClear(): Promise<void> {
+  section('§10-7. 재생 상태 기계 — reset 은 남기고 clear 는 내린다');
+
+  {
+    const { pb, port, trace } = await ready();
+    await pb.play();
+    const ok = await pb.reset();
+    check('★ reset 은 씬을 남긴다 (시뮬만 처음으로)',
+      ok && pb.state === 'paused' && pb.view.scene === 'scene-1' && port.worker.loaded,
+      `state=${pb.state} scene=${String(pb.view.scene)}`);
+    check('reset 은 재생도 멈춘다', !pb.view.playing, String(pb.view.playing));
+    check('reset 뒤에도 버튼이 전부 살아 있다',
+      pb.view.canPlay && pb.view.canReset && pb.view.canClear,
+      `play=${String(pb.view.canPlay)}`);
+    check('★ reset 뒤에 포즈를 다시 받는 훅이 불린다 (리셋은 frame 이벤트를 한 건도 안 낸다)',
+      trace.includes('hook:afterReset'), trace.join(' → '));
+  }
+
+  {
+    const { pb, port, trace } = await ready();
+    await pb.play();
+    const ok = await pb.clear();
+    check('★★ clear 는 씬을 내린다 (되돌리려면 다시 로드해야 한다)',
+      ok && pb.state === 'noScene' && pb.view.scene === null && !port.worker.loaded,
+      `state=${pb.state} worker.loaded=${String(port.worker.loaded)}`);
+    check('clear 뒤에는 재생·리셋 버튼이 잠긴다',
+      !pb.view.canPlay && !pb.view.canReset && !pb.view.canClear, 'canPlay=false');
+    check('★ 상태줄이 되돌리는 방법을 말한다',
+      pb.view.text.includes('.zls') || pb.view.text.includes('로드'), pb.view.text);
+    check('clear 는 프레임 번호도 비운다', pb.view.frame === null, String(pb.view.frame));
+    check('afterClear 훅이 불린다 (화면에서 옷을 내리는 자리)',
+      trace.includes('hook:afterClear'), trace.join(' → '));
+
+    // 다시 로드하면 그대로 돌아온다 — 잃은 것은 시뮬 진행뿐이다.
+    port.putScene();
+    pb.sceneLoaded('scene-1');
+    await pb.syncFromWorker();
+    check('★ 다시 로드하면 돌아온다 (확인창을 안 단 근거)',
+      pb.state === 'paused' && pb.view.canPlay, pb.state);
+  }
+
+  // toggle 은 지금 상태를 보고 정한다 — 눌린 횟수를 세지 않는다.
+  {
+    const { pb, port } = await ready();
+    await pb.toggle();
+    check('toggle: 정지 → 재생', pb.state === 'playing', pb.state);
+    await pb.toggle();
+    check('toggle: 재생 → 정지', pb.state === 'paused', pb.state);
+    // 워커만 몰래 재생으로 바꾼 뒤 되묻게 하면, toggle 은 **사실** 을 보고 정한다.
+    port.worker.mode = 'play';
+    await pb.syncFromWorker();
+    await pb.toggle();
+    check(
+      '★ toggle 은 눌린 횟수가 아니라 지금 상태를 본다 (워커가 재생 중이면 정지한다)',
+      pb.state === 'paused' && port.count('pause') === 2,
+      `state=${pb.state} pause ${port.count('pause')}`,
+    );
+  }
+}
+
+// ── §10-8. step — 워커가 아무 일도 안 하는 op ────────────────
+//
+// **[실측]** 응답은 `{mode:"step"}` 인데 곧바로 `status` 를 물으면 `mode:"pause"`
+// 이고 `maxFrame` 은 5초가 지나도 그대로다(정지 상태에서 3회 연속 14→14→14→14).
+//
+// ── 이 사실을 테스트에서 어떻게 다룰 것인가 ─────────────────
+// **워커의 no-op 을 단언하지 않는다.** 그건 제품 코드의 성질이 아니라 지금
+// 워커의 결함이고, 고쳐지는 날 이 절이 빨간불이 되면 고친 사람이 회귀를 먼저
+// 의심하게 된다. 대신 **no-op 이든 아니든 성립해야 하는 것** 을 단언한다:
+//   ① 컨트롤러의 믿음이 워커의 사실(`mode:"pause"`)과 어긋나지 않는다
+//   ② 화면 표면(버튼·단축키)에 올라가 있지 않다 — 눌러도 안 움직이는 컨트롤이
+//      없다는 것이 이 단위의 통과 기준 자체다
+// 워커의 no-op 자체는 §10-10 이 실제 워커로 **관찰만** 한다(note).
+
+async function sectionPlaybackStep(): Promise<void> {
+  section('§10-8. 재생 상태 기계 — step (워커가 no-op 인 동안)');
+
+  // ── 정지 상태에서의 step ───────────────────────────────────
+  {
+    const { pb, port } = await ready();
+    port.advanceTo(14);
+    pb.noteFrame(14);
+    const ok = await pb.step();
+    check('step 은 성공으로 돌아온다 (워커가 응답은 준다)', ok === true, String(ok));
+    check(
+      '★★ step 뒤 화면과 워커가 같은 것을 말한다 (믿음도 사실도 정지)',
+      !pb.view.playing && pb.view.workerMode === 'pause' && pb.stats.corrections === 0,
+      `playing=${String(pb.view.playing)} workerMode=${String(pb.view.workerMode)}`
+      + ` corrections=${pb.stats.corrections}`,
+    );
+    check('★ 워커가 아무 일도 안 한 것이 화면의 숫자를 흔들지 않는다',
+      pb.view.frame === 14 && pb.stats.steps === 1, String(pb.view.frame));
+    note(
+      'step 의 워커 거동(모형)',
+      `응답 mode=step / 되물으면 mode=${String(pb.view.workerMode)},`
+      + ` maxFrame 은 ${port.worker.maxFrame} 에서 그대로 — 실측과 같다`,
+    );
+  }
+
+  // ── 재생 중의 step ─────────────────────────────────────────
+  //
+  // 주석은 "워커의 SetAnimationMode(STEP) 이 PLAY 를 대체하므로 결과적으로
+  // '멈추고 한 칸' 이 된다" 고 적었는데, **step 이 no-op 인 지금은 그렇지 않다** —
+  // 워커는 계속 돈다. 그래서 여기서 단언하는 것은 "정지가 된다" 가 아니라
+  // **화면이 워커와 같은 것을 말한다** 다. 워커가 고쳐지든 아니든 성립한다.
+  {
+    const { pb } = await ready();
+    await pb.play();
+    await pb.step();
+    check(
+      '★★ 재생 중 step 을 불러도 화면은 워커를 따른다 (믿음을 내렸다가 사실로 되돌린다)',
+      pb.view.playing === (pb.view.workerMode === 'play'),
+      `화면 playing=${String(pb.view.playing)} / 워커 mode=${String(pb.view.workerMode)}`,
+    );
+    note(
+      '재생 중 step',
+      `믿음을 정지로 내렸다가 되묻기가 사실(mode=${String(pb.view.workerMode)})로 되돌린다`
+      + ` — corrections=${pb.stats.corrections}. 워커의 step 이 고쳐지면 0 이 된다`,
+    );
+  }
+
+  // ★ 화면 표면에 없다. 되살릴 때 고쳐야 할 자리가 정확히 두 줄이라는 것도 함께.
+  check(
+    '★★ SPACE 는 지금 아무 조작도 만들지 않는다 (눌러도 안 움직이는 컨트롤을 두지 않는다)',
+    shortcutFor({ key: ' ' }) === null && shortcutFor({ key: 'Spacebar' }) === null,
+    `' ' → ${String(shortcutFor({ key: ' ' }))}`,
+  );
+  check(
+    '★ 단축키 힌트도 SPACE 를 말하지 않는다 (표와 글자가 한 곳에서 나온다)',
+    !SHORTCUT_HINT.includes('SPACE') && !SHORTCUT_HINT.toLowerCase().includes('space'),
+    SHORTCUT_HINT,
+  );
+}
+
+// ── §10-9. 단축키 표 ─────────────────────────────────────────
+//
+// 데스크톱 기능 #60~#63 과 같은 배치다. 순수 함수라 표 전체를 한 번에 돈다.
+
+function sectionPlaybackShortcuts(): void {
+  section('§10-9. 단축키 표 (shortcuts.ts, DOM 없이)');
+
+  const table: [string, ShortcutAction][] = [
+    ['s', 'toggle'], ['S', 'toggle'],
+    ['r', 'reset'], ['R', 'reset'],
+    ['c', 'clear'], ['C', 'clear'],
+  ];
+  const wrong = table.filter(([key, want]) => shortcutFor({ key }) !== want);
+  check(
+    '★ S=토글 · R=리셋 · C=씬내림 (대소문자 무관 — 데스크톱 #60~#62 와 같다)',
+    wrong.length === 0,
+    wrong.map(([k, w]) => `${k}→${String(shortcutFor({ key: k }))}(≠${w})`).join(', ') || '6/6',
+  );
+  check('모르는 키는 null 이다 (그때 preventDefault 를 걸지 않는다)',
+    shortcutFor({ key: 'q' }) === null && shortcutFor({ key: 'Enter' }) === null, 'q/Enter → null');
+
+  // ── 수식키: 브라우저·OS 의 것을 빼앗지 않는다 ───────────────
+  const mods: [string, Record<string, boolean>][] = [
+    ['Ctrl+R', { ctrlKey: true }],
+    ['Cmd+R', { metaKey: true }],
+    ['Alt+R', { altKey: true }],
+    ['Shift+R', { shiftKey: true }],
+  ];
+  const leaked = mods.filter(([, m]) => shortcutFor({ key: 'r', ...m }) !== null);
+  check(
+    '★★ 수식키가 눌려 있으면 손대지 않는다 (Ctrl+R 이 새로고침으로 남는다)',
+    leaked.length === 0, leaked.map(([n]) => n).join(', ') || '4/4 양보',
+  );
+
+  check('★ IME 조합 중에는 손대지 않는다 (한글 입력의 ㄴ 을 조작으로 읽지 않는다)',
+    shortcutFor({ key: 's', isComposing: true }) === null, 'isComposing → null');
+  check('★ 누르고 있는 중(repeat)에는 op 을 초당 수십 번 보내지 않는다',
+    shortcutFor({ key: 's', repeat: true }) === null, 'repeat → null');
+
+  // ── 대상 요소에 양보 ───────────────────────────────────────
+  const yields = ['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON', 'OPTION', 'A'];
+  const stolen = yields.filter((tagName) => shortcutFor({ key: 's' }, { tagName }) !== null);
+  check(
+    '★★ 상호작용 요소가 대상이면 양보한다 (씬 선택 중 s 가 시뮬을 켜지 않는다)',
+    stolen.length === 0, stolen.join(', ') || `${yields.length}/${yields.length} 양보`,
+  );
+  check('소문자 태그 이름으로 와도 양보한다',
+    shortcutFor({ key: 's' }, { tagName: 'input' }) === null, 'input → null');
+  check('contentEditable 도 양보한다',
+    shortcutFor({ key: 's' }, { isContentEditable: true }) === null, 'null');
+  check('★ 캔버스·본문에서는 그대로 먹는다',
+    shortcutFor({ key: 's' }, { tagName: 'CANVAS' }) === 'toggle'
+    && shortcutFor({ key: 's' }, { tagName: 'BODY' }) === 'toggle', 'CANVAS/BODY → toggle');
+  check('대상이 없어도(null) 먹는다',
+    shortcutFor({ key: 's' }, null) === 'toggle', 'null → toggle');
+  check('isTypingTarget 이 같은 판단을 단독으로도 한다',
+    isTypingTarget({ tagName: 'INPUT' }) && !isTypingTarget({ tagName: 'DIV' })
+    && !isTypingTarget(null), 'INPUT=true / DIV=false / null=false');
+
+  check(
+    '단축키 힌트가 세 키를 전부 말한다 (표와 글자가 갈라지지 않는다)',
+    SHORTCUT_HINT.includes('S') && SHORTCUT_HINT.includes('R') && SHORTCUT_HINT.includes('C'),
+    SHORTCUT_HINT,
+  );
+}
+
+// ── §10-10. 실제 워커로 모형을 검증한다 ──────────────────────
+//
+// §10-1~§10-9 는 전부 `makePort()` 위에서 돈다. **모형이 실제와 갈라지면 그
+// 아홉 절이 통째로 환상을 검증하게 된다.** 그래서 실제 워커로 다섯 가지를
+// 확인한다 — 그리고 그 김에 `GatewayClient` 가 어댑터 없이 `PlaybackPort` 를
+// 만족한다는 것(구조적 타입)도 실행으로 확인된다.
+//
+// ⚠️ 여기서 워커의 거동이 달라지면 **모형을 고쳐야 한다는 신호**다. 그게 이
+//    절의 존재 이유이므로 note 가 아니라 check 로 둔다.
+
+async function sectionPlaybackRealWorker(): Promise<void> {
+  section('§10-10. 재생 상태 기계 — 실제 워커로 모형 검증 (#14)');
+
+  if (!existsSync(EXE) || !existsSync(ZLS)) {
+    note('생략', `exe=${existsSync(EXE)}, zls=${existsSync(ZLS)}`);
+    return;
+  }
+
+  await withGateway(async (_gw, addr) => {
+    const scene = await findOrUploadScene(addr.url);
+    if (!scene) {
+      check('씬 준비', false, 'sample.zls를 준비하지 못했다');
+      return;
+    }
+
+    const client = new GatewayClient({ url: addr.url, requestTimeoutMs: 120_000 });
+    // ★ 어댑터가 없다. `GatewayClient` 를 그대로 포트로 넣는다.
+    const pb = new PlaybackController({ port: client });
+    try {
+      await client.connect();
+      client.on('frame', (ev) => pb.noteFrame(ev.frame));
+
+      pb.sceneLoading();
+      await client.load(scene.id);
+      pb.sceneLoaded(scene.id);
+      const loaded = await pb.syncFromWorker();
+      check(
+        '★ GatewayClient 가 어댑터 없이 포트가 된다 (구조적 타입 — 실행으로 확인)',
+        loaded !== null && pb.state === 'paused',
+        `state=${pb.state}`,
+      );
+      check(
+        '모형 ④ — 로드 직후 워커의 maxFrame 은 -1 이다',
+        loaded?.maxFrame === -1, `maxFrame=${String(loaded?.maxFrame)}`,
+      );
+
+      // ── ① start / pause 가 mode 를 바꾼다 ───────────────────
+      await pb.play();
+      check('모형 ① — play 를 보내면 워커가 mode=play 라고 답한다',
+        pb.view.workerMode === 'play', String(pb.view.workerMode));
+      const ran = await until(() => (pb.view.frame ?? -1) >= 3, 30_000);
+      check('★ 실제로 프레임이 흐른다 (frame 이벤트의 번호가 화면 값이 된다)',
+        ran, `frame=${String(pb.view.frame)}`);
+      const peak = pb.view.frame ?? -1;
+
+      await pb.pause();
+      const paused = await pb.syncFromWorker();
+      check('모형 ① — pause 를 보내면 mode=pause 다',
+        paused?.mode === 'pause', String(paused?.mode));
+
+      // ── ② 멈추면 status.frame 이 프레임 번호가 아니다 ───────
+      note('정지 직후 워커', `frame=${String(paused?.frame)} maxFrame=${String(paused?.maxFrame)}`);
+      check(
+        '★★ 모형 ② — 정지 중 status.frame 은 음수다 (화면에 쓰면 "-1" 이 찍힌다)',
+        (paused?.frame ?? 0) < 0, `frame=${String(paused?.frame)}`,
+      );
+      check(
+        '★★ 그래서 화면은 maxFrame 을 쓴다 — 정지해도 봉우리가 그대로 남는다',
+        pb.view.frame !== null && pb.view.frame >= peak,
+        `화면 ${String(pb.view.frame)} / 봉우리 ${peak}`,
+      );
+      check('워커가 음수를 준 사실이 계측기에 남는다',
+        pb.stats.negativeFrames > 0, `negativeFrames=${pb.stats.negativeFrames}`);
+
+      // ── ③ reset 은 maxFrame 만 되돌린다 ────────────────────
+      await pb.reset();
+      const afterReset = await pb.syncFromWorker();
+      note('리셋 직후 워커', `frame=${String(afterReset?.frame)} maxFrame=${String(afterReset?.maxFrame)}`);
+      check(
+        '★★ 모형 ③ — reset 은 maxFrame 을 -1 로 되돌린다',
+        afterReset?.maxFrame === -1, `maxFrame=${String(afterReset?.maxFrame)}`,
+      );
+      check(
+        '★★★ 그래서 화면의 프레임이 비워진다 ("마지막 유효값 보관" 이면 봉우리가 남는다)',
+        pb.view.frame === null && !pb.view.text.includes('프레임'),
+        `frame=${String(pb.view.frame)} · "${pb.view.text}"`,
+      );
+
+      // ── ⑤ step 은 아무 일도 하지 않는다 (관찰) ──────────────
+      const before = (await pb.syncFromWorker())?.maxFrame ?? -1;
+      await pb.step();
+      await sleep(700);
+      const afterStep = await pb.syncFromWorker();
+      note(
+        'step 의 실제 거동',
+        `응답은 step / 되물으면 mode=${String(afterStep?.mode)},`
+        + ` maxFrame ${before} → ${String(afterStep?.maxFrame)}`
+        + `${before === afterStep?.maxFrame ? ' (변화 없음 — 실측과 같다)' : ' ★ 워커가 고쳐진 것 같다'}`,
+      );
+      check(
+        '★★ step 뒤에도 화면이 워커와 어긋나지 않는다 (no-op 이든 아니든)',
+        pb.view.playing === (afterStep?.mode === 'play'),
+        `화면 playing=${String(pb.view.playing)} / 워커 mode=${String(afterStep?.mode)}`,
+      );
+
+      // ── 씬은 남았다 / 내린다 ────────────────────────────────
+      check('모형 ④ — reset·step 을 지나도 씬은 워커에 남아 있다',
+        afterStep?.loaded === true, String(afterStep?.loaded));
+      await pb.clear();
+      const cleared = await pb.syncFromWorker();
+      check(
+        '★ clear 뒤 화면은 씬 없음이고 버튼이 잠긴다 (reset 과 다르다)',
+        pb.state === 'noScene' && !pb.view.canPlay && pb.view.frame === null,
+        `state=${pb.state} canPlay=${String(pb.view.canPlay)}`,
+      );
+      check(
+        '★★ 되묻기가 내려간 씬을 되살리지 않는다 (status.loaded 로 씬을 만들어내지 않는다)',
+        pb.view.scene === null, String(pb.view.scene),
+      );
+      // ⚠️ 실제 워커의 quirk — 아래 값은 `false` 가 아니다.
+      note(
+        '⚠ 워커 quirk',
+        `clear 를 보낸 뒤에도 status.loaded=${String(cleared?.loaded)} 다`
+        + ' — ZestManager::Clear() 가 IsLoadedZls() 를 되돌리지 않는다'
+        + ' (protocol.cpp:559-566 이 Clear 를 부르고 :604 가 그 플래그를 읽는다).'
+        + ' 화면은 clear op 의 성공으로 씬을 내리므로 지금은 영향이 없지만,'
+        + ' "워커에 씬이 있는가" 를 이 필드로 판정하는 코드를 새로 쓰면 안 된다',
+      );
+
+      // ── 대조군: 정상 경로 내내 믿음이 사실과 갈라지지 않았다 ─
+      check(
+        '★★★ 대조군 — 로드·재생·정지·리셋·스텝·clear 를 지나는 동안 corrections 가 0 이다',
+        pb.stats.corrections === 0, `corrections=${pb.stats.corrections}`,
+      );
+      check(
+        '★★ 그 전 구간에서 subscribe 는 1회다 (세션당 한 번)',
+        pb.stats.subscribes === 1, `subscribes=${pb.stats.subscribes}`,
+      );
+      check('op 이 하나도 실패하지 않았다',
+        pb.stats.failures === 0 && pb.stats.rejected === 0,
+        `failures=${pb.stats.failures} rejected=${pb.stats.rejected}`);
+      note(
+        '실제 워커 계측기',
+        `plays=${pb.stats.plays} pauses=${pb.stats.pauses} resets=${pb.stats.resets}`
+        + ` clears=${pb.stats.clears} steps=${pb.stats.steps} syncs=${pb.stats.syncs}`
+        + ` negativeFrames=${pb.stats.negativeFrames} corrections=${pb.stats.corrections}`,
+      );
+    } catch (err: unknown) {
+      check('실제 워커로 모형 검증', false, messageOf(err));
+    } finally {
+      await client.close().catch(() => {});
+    }
+  }, { sessions: { idleTimeout: 0, requestTimeoutMs: 120_000 } });
+}
+
+// ─────────────────────────────────────────────────────────────
 // §9. 좀비 프로세스
 // ─────────────────────────────────────────────────────────────
 
@@ -4179,6 +5350,18 @@ async function main(): Promise<void> {
   await sectionReconnectReload();
   await sectionRealFrames();
   await sectionSnapshotRealExport();
+  // #14 재생 상태 기계. §10-1~§10-9 는 가짜 포트라 즉시 끝나고, §10-10 만
+  // 실제 워커를 하나 띄운다 — 그 모형이 실제와 같은지 확인하는 절이다.
+  await sectionPlaybackDerived();
+  await sectionPlaybackIssue009();
+  await sectionPlaybackFrames();
+  await sectionPlaybackSubscribe();
+  await sectionPlaybackHooks();
+  await sectionPlaybackFailures();
+  await sectionPlaybackResetClear();
+  await sectionPlaybackStep();
+  sectionPlaybackShortcuts();
+  await sectionPlaybackRealWorker();
   await sectionZombies();
 
   clearInterval(keepAlive);

@@ -19,11 +19,18 @@
  * 실시간 옷과 스냅샷은 좌표계가 달라(ISSUE-011) 겹쳐 보이면 안 되는데, 그
  * 불변식을 지키는 유일한 방법이 "visible 을 정하는 자리를 하나로 두는 것" 이다.
  *
+ * ── 재생 컨트롤(#14)이 여기 남긴 것도 배선이다 ──────────────
+ * 상태(재생/정지/씬 없음/로드 중)와 전이는 전부 `panels/playback.ts` 에 있다.
+ * 그 파일은 DOM 을 안 만져서 Node 에서 전이 전체를 돌릴 수 있다 — **ISSUE-009
+ * 가 바로 그 반대편에서 났다.** 재생 상태가 이 파일의 불리언 두 개로 흩어져
+ * 있어서 자동 테스트가 한 줄도 덮지 못했고, "버튼은 정지인데 시뮬은 멈춰
+ * 있다" 를 사람이 눈으로 찾아야 했다. 여기 있는 것은 (a) 버튼·키 이벤트를
+ * 컨트롤러로 넘기고, (b) `view` 를 글자로 찍는 것, 둘뿐이다.
+ *
  * ── UI 를 여기서 더 늘리지 말 것 ────────────────────────────
- * 재생 컨트롤(#14), 2D 펼침 뷰(#15), 파라미터 패널(#16)은 각각 자기 단위가
- * 있다. #13 의 판정 기준은 "옷이 움직인다" 하나이고, 버튼이 늘어날수록 그
- * 판정이 무엇 때문에 실패했는지 흐려진다. 아래 재생 버튼은 시뮬을 켜기 위한
- * **최소 트리거**이고, 타임라인·프레임 스크럽은 #14 의 몫이다.
+ * 2D 펼침 뷰(#15), 파라미터 패널(#16)은 각각 자기 단위가 있다. 그리고 새 UI 를
+ * 붙일 때는 **상태를 `panels/` 아래 DOM-free 모듈로 먼저 빼고** 여기에는
+ * 배선만 남길 것. 이 파일에 로직이 들어오는 순간 그만큼 자동 테스트가 사라진다.
  *
  * ── 재연결은 복구가 아니다 ──────────────────────────────────
  * 끊겼다 붙으면 **새 워커 프로세스**다. 씬이 로드돼 있지 않고, 시뮬 상태도
@@ -33,6 +40,14 @@
  */
 
 import {
+  PlaybackController,
+  shortcutFor,
+  SHORTCUT_HINT,
+  type PlaybackView,
+  type ShortcutAction,
+} from './panels/index.ts';
+import {
+  decodePatterns,
   downloadExport,
   fetchHealth,
   GatewayClient,
@@ -66,14 +81,22 @@ const ui = {
   file: el<HTMLInputElement>('file'),
   upload: el<HTMLButtonElement>('upload'),
   play: el<HTMLButtonElement>('play'),
+  // ⛔ `#step` 은 없다 — 워커의 step op 이 no-op 이라 화면에 올리지 않았다
+  //    (`index.html` 의 주석에 실측이 있다).
+  reset: el<HTMLButtonElement>('reset'),
+  clear: el<HTMLButtonElement>('clear'),
   snap: el<HTMLButtonElement>('snap'),
   mode: el<HTMLButtonElement>('mode'),
   snapstat: el<HTMLElement>('snapstat'),
+  sim: el<HTMLElement>('sim'),
   frames: el<HTMLElement>('frames'),
   stat: el<HTMLElement>('stat'),
   status: el<HTMLElement>('status'),
+  hint: el<HTMLElement>('hint'),
   log: el<HTMLElement>('log'),
 };
+
+ui.hint.textContent = `${ui.hint.textContent ?? ''}  |  ${SHORTCUT_HINT}`;
 
 const LOG_LIMIT = 300;
 const lines: string[] = [];
@@ -110,28 +133,21 @@ const client = new GatewayClient({
   reconnect: { minDelayMs: 800, maxDelayMs: 8_000, maxAttempts: 6 },
 });
 
-/** 지금 화면에 떠 있어야 할 씬. 재연결 후 무엇을 다시 로드할지의 정본이다 */
+/**
+ * 지금 화면에 떠 있어야 할 씬. 재연결 후 무엇을 다시 로드할지의 정본이다.
+ *
+ * `playback.view.scene` 과는 다른 것이다 — 저쪽은 **워커에 로드돼 있다고
+ * 아는 것**이고, 이쪽은 **우리가 보고 싶은 것**이다. 재연결처럼 워커가 비어
+ * 있는데 다시 세워야 하는 순간에 둘이 갈라지고, 그 차이가 곧 재로드 지시다.
+ */
 let currentScene: string | null = null;
 let busy = false;
-/** 시뮬이 돌고 있다고 **우리가 믿는** 상태. 화면의 버튼 글자가 이걸 따른다 */
-let playing = false;
-/**
- * 이 워커 세션에서 subscribe 를 이미 보냈는가.
- *
- * ⚠️ 세션(=프로세스)마다 하나다. 재연결하면 **새 워커**라 구독이 꺼진 채로
- *    시작하므로 반드시 false 로 되돌려야 한다. 안 그러면 start 만 나가고
- *    mesh 없는 frame 이벤트만 흐른다 — 프레임 번호는 오르는데 옷은 안 움직이는,
- *    원인이 가장 안 보이는 상태다.
- */
-let subscribed = false;
 
 client.on('open', ({ reconnected, attempt }) => {
+  // 새 워커다. 시뮬도 구독도 씬도 초기값이므로 우리 쪽 믿음을 먼저 지운다.
+  playback.sessionStarted();
   if (!reconnected) return;
   log(`재연결됨 (${attempt}회) — 새 워커 세션이므로 씬을 다시 로드합니다`);
-  // 새 워커다. 시뮬도 구독도 초기값이므로 우리 쪽 믿음을 먼저 지운다.
-  playing = false;
-  subscribed = false;
-  paintPlay();
   paintSnap();
   if (currentScene) void show(currentScene, { refit: false });
 });
@@ -139,9 +155,7 @@ client.on('open', ({ reconnected, attempt }) => {
 client.on('close', ({ code, willReconnect }) => {
   // 소켓이 없으면 재생도 없다. 버튼이 살아 있으면 누를 때마다 "연결되어 있지
   // 않습니다" 만 나온다.
-  playing = false;
-  subscribed = false;
-  paintPlay();
+  playback.connectionLost();
   // 스냅샷은 **버리지 않는다.** 이미 화면에 서 있는 것은 소켓과 무관하게
   // 유효한 정지 화면이라, 끊겼다고 지우면 볼 수 있는 것까지 사라진다.
   // 새로 찍는 것만 막는다 (paintSnap 이 client.connected 를 본다).
@@ -192,9 +206,87 @@ const stream = new FrameStream({
   },
 });
 
+// ── 재생 컨트롤 (#14) ───────────────────────────────────────
+//
+// 상태와 전이는 `panels/playback.ts` 가 전부 정한다. 여기 있는 것은 (a) 포트로
+// `client` 를 그대로 넘기고, (b) 화면에만 할 수 있는 일 세 가지를 훅으로 끼우고,
+// (c) 상태가 바뀔 때 버튼 글자를 다시 찍는 것뿐이다.
+//
+// `client` 를 어댑터 없이 넘길 수 있는 이유는 `PlaybackPort` 가 구조적 타입이라
+// `GatewayClient` 가 이미 만족하기 때문이다 — Node 테스트는 같은 모양의 가짜를
+// 넣어 전이 전체를 화면 없이 돌린다.
+const playback = new PlaybackController({
+  port: client,
+  hooks: {
+    log,
+    onChange: paintPlayback,
+    // 정지 화면(스냅샷) 위에서 시뮬을 켜면 "재생을 눌렀는데 아무것도 안
+    // 움직인다" 가 된다. 원인이 화면 어디에도 안 남는 실패다.
+    beforePlay: returnToLiveForPlayback,
+    afterReset: refreshPose,
+    afterClear: clearScene,
+  },
+});
+
+/**
+ * 리셋 뒤에 **포즈를 다시 받아 온다.**
+ *
+ * 워커는 `maxFrame` 이 바뀔 때만 frame 이벤트를 낸다. 리셋은 그걸 -1 로
+ * 되돌리므로 다시 재생하기 전까지 이벤트가 한 건도 오지 않는다 — 즉 시뮬은
+ * 처음으로 돌아갔는데 **화면은 드레이프된 옷 그대로**다. ISSUE-009 와 정확히
+ * 같은 계열(화면이 거짓말한다)이라 여기서 막는다.
+ *
+ * 토폴로지는 리셋으로 바뀌지 않으므로 `meshData(false)`(위치만)면 충분하다 —
+ * 103MB 재로드가 아니라 프레임 한 장 값이다.
+ */
+async function refreshPose(): Promise<void> {
+  if (!currentScene || !client.connected) return;
+  // 칸에 남아 있는 옛 런의 프레임을 먼저 버린다. 안 그러면 방금 받은 리셋
+  // 포즈를 다음 rAF 가 드레이프된 프레임으로 덮어쓴다.
+  stream.resume();
+  const patterns = decodePatterns(await client.meshData(false));
+  if (!viewer.cloth.updatePositions(patterns)) {
+    log('리셋 후 포즈가 화면의 토폴로지와 다릅니다 — 씬을 다시 로드하세요');
+    return;
+  }
+  log(`리셋 — 포즈를 다시 받아 화면에 반영했습니다 (패턴 ${patterns.length})`);
+}
+
+/**
+ * `clear` 뒤에 화면을 비운다. **씬이 워커에서 내려갔으므로 화면에 남은 옷은
+ * 이미 아무것도 가리키지 않는다.**
+ *
+ * 잃는 것은 시뮬 진행뿐이다 — `.zls` 는 게이트웨이에 그대로 있고 [로드] 한
+ * 번이면 돌아온다. 상태줄이 그 방법을 말해 주는 이유가 그것이다.
+ */
+function clearScene(): void {
+  viewer.cloth.clear();
+  dropSnapshot();
+  stream.resume();
+  currentScene = null;
+  ui.stat.textContent = '-';
+  ui.frames.textContent = '-';
+  status('씬을 내렸습니다 — 다시 보려면 [로드] 를 누르세요');
+  setBusy(false);
+}
+
+/** 버튼 네 개의 글자와 활성 상태. **상태는 만들지 않는다 — 받은 것만 그린다** */
+function paintPlayback(view: PlaybackView = playback.view): void {
+  ui.play.textContent = view.playLabel;
+  ui.play.disabled = busy || !view.canPlay;
+  ui.reset.disabled = busy || !view.canReset;
+  ui.clear.disabled = busy || !view.canClear;
+  ui.sim.textContent = view.text;
+}
+
 // ① 이벤트 핸들러는 **얹기만 한다.** 여기서 디코딩하면 40/s × 47.8KB 를
 //    이벤트 루프에 태우게 되고, 그중 대부분은 다음 rAF 전에 덮어써진다.
-client.on('frame', (ev) => stream.push(ev));
+//    `noteFrame` 도 숫자 하나를 대입할 뿐이고 화면을 다시 그리지 않는다 —
+//    그리는 것은 아래 rAF 가 4/s 로 눌러서 한다.
+client.on('frame', (ev) => {
+  stream.push(ev);
+  playback.noteFrame(ev.frame);
+});
 
 // ② rAF 에서 최신 하나만 푼다. **DOM 에 닿는 유일한 프레임 경로가 이 콜백이다.**
 let statPaintedAt = 0;
@@ -213,6 +305,9 @@ viewer.onBeforeRender(() => {
   if (now - statPaintedAt < 250) return;
   statPaintedAt = now;
   paintFrames();
+  // 재생 중에는 프레임 번호가 40/s 로 오른다. 컨트롤러는 그때 다시 그리라고
+  // 부르지 않으므로(그러면 초당 40번 DOM 을 흔든다) 여기서 같이 눌러 찍는다.
+  ui.sim.textContent = playback.view.text;
 });
 
 function paintFrames(): void {
@@ -284,7 +379,7 @@ const snapshots = new SnapshotLoader<ParsedSnapshot>({
 async function takeSnapshot(): Promise<void> {
   if (!currentScene || !client.connected) return;
   ui.snap.disabled = true;
-  if (playing) {
+  if (playback.playing) {
     log('재생 중 스냅샷 — 파일에 담기는 포즈는 버튼을 누른 시점보다 몇 프레임 뒤입니다');
   }
   status('스냅샷을 만드는 중… (아바타·머티리얼이 들어간 glTF 를 받습니다)');
@@ -319,13 +414,29 @@ async function takeSnapshot(): Promise<void> {
  * 실시간 ↔ 스냅샷. **뷰어의 `setMode` 하나만 부른다** — 두 그룹의 visible 을
  * 여기서 만지기 시작하면 "둘 다 보이는" 상태가 만들어질 수 있게 된다.
  */
-function setMode(mode: 'live' | 'snapshot', opts: { refit?: boolean } = {}): void {
+function setMode(
+  mode: 'live' | 'snapshot',
+  opts: { refit?: boolean; quiet?: boolean } = {},
+): void {
   if (mode === 'snapshot' && !snapshots.present) return;
   viewer.setMode(mode);
   // 스냅샷은 아바타까지 있어 경계가 옷보다 훨씬 크다. 처음 세울 때는 맞춰
   // 주고, 되돌아올 때는 사용자가 잡아 둔 시점을 빼앗지 않는다.
   if (opts.refit) viewer.frameCamera();
   paintSnap();
+  // ★ 화면이 바뀌면 상태줄도 같이 바뀌어야 한다 (#14 에서 함께 고침).
+  //   실시간으로 돌아왔는데 "스냅샷 표시 중" 이 남아 있으면 ISSUE-009 와 같은
+  //   계열의 거짓말이다 — 화면과 글자가 서로 다른 것을 말한다. 여기 쓰는 문구를
+  //   **시뮬 상태로 채우지 않는 이유**는 그 값이 곧 낡기 때문이다. 시뮬의 지금
+  //   상태는 `#sim` 이 4/s 로 계속 갱신하므로 상태줄은 "무엇을 보고 있는가" 만
+  //   말한다.
+  if (!opts.quiet) {
+    status(
+      mode === 'snapshot'
+        ? '스냅샷 표시 중'
+        : '실시간 뷰 — 시뮬레이션 결과를 그립니다',
+    );
+  }
 }
 
 /** 스냅샷이 사라져야 할 때. **씬이 바뀌면 이전 씬의 아바타는 거짓이다** */
@@ -389,8 +500,10 @@ function setBusy(on: boolean): void {
   ui.load.disabled = on || ui.scene.value === '';
   ui.upload.disabled = on || !ui.file.files?.length;
   ui.scene.disabled = on;
-  ui.play.disabled = on || currentScene === null;
   ui.snap.disabled = on || currentScene === null || !client.connected || snapshots.busy;
+  // 재생 컨트롤 네 개의 활성 조건은 `playback.view` 가 정한다. 여기서 따로
+  // 계산하면 조건이 두 곳에 생기고, 둘이 갈라지는 날 버튼이 거짓말을 한다.
+  paintPlayback();
 }
 
 async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<void> {
@@ -400,6 +513,11 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
   //   재연결로 **같은 씬**을 다시 로드하는 경우(refit:false)에는 유지한다.
   if (sceneId !== currentScene) dropSnapshot();
   setBusy(true);
+  // ★ ISSUE-009 를 닫는 자리다. 워커의 `load` 는 시뮬 상태를 초기화하고
+  //   `maxFrame` 을 -1 로 되돌린다 — **로드가 시작된 순간 "재생 중" 이라는
+  //   믿음은 이미 거짓이다.** 성공을 기다렸다가 내리면 103MB 면 1초쯤 되는
+  //   그 사이 내내 버튼이 `⏸ 정지` 라고 거짓말을 한다.
+  playback.sceneLoading();
   // 로드 중에 프레임이 들이닥치는 것을 막는다. `setTopology()` 가 지오메트리를
   // 통째로 갈아 끼우는 동안 옛 프레임을 적용하면 어긋난 메시를 그린다.
   stream.resume();
@@ -410,20 +528,25 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
       frameCamera: opts.refit !== false,
     });
     currentScene = sceneId;
+    playback.sceneLoaded(sceneId);
     // 새 토폴로지가 섰다. 칸에 남아 있던 옛 프레임을 버리고 정지 상태를 푼다.
     stream.resume();
     ui.stat.textContent = `패턴 ${shown.patterns} · 정점 ${shown.vertices} · 삼각형 ${shown.triangles}`;
     status(`로드 완료 (${shown.elapsedMs}ms)`);
   } catch (err: unknown) {
+    playback.sceneLoadFailed();
     status(`로드 실패: ${message(err)}`, true);
   } finally {
     setBusy(false);
-    paintPlay();
     paintSnap();
+    // 믿음을 사실로 덮어쓴다. 로드 성공/실패 어느 쪽이든 워커가 지금 무엇을
+    // 들고 있는지는 물어봐야 안다 — 실패했을 때가 특히 그렇다(요청이 워커에
+    // 닿기는 했는지 우리는 모른다).
+    await playback.syncFromWorker();
   }
 }
 
-// ── 재생 (#13 의 최소 트리거) ───────────────────────────────
+// ── 재생 컨트롤의 배선 (#14) ────────────────────────────────
 //
 // ── 구독은 켜면 세션이 끝날 때까지 켜 둔다 ──────────────────
 // "정지할 때 unsubscribe 를 보낼 것인가" 를 코드를 보고 정했다. 워커는
@@ -435,49 +558,52 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
 // 세션이 끝날 때의 정리는 게이트웨이가 이미 한다 — `sessions.ts` 의 `#detach`
 // 가 반납 직전에 워커로 unsubscribe 를 보내서, 구독이 다음 클라이언트에게
 // 물려지지 않는다. 그래서 여기서는 **한 워커 세션에 subscribe 한 번**이다.
-async function setPlaying(on: boolean): Promise<void> {
-  if (!currentScene || !client.connected) return;
-  ui.play.disabled = true;
-  try {
-    if (on) {
-      returnToLiveForPlayback();
-      // subscribe 를 start 보다 **먼저** 보낸다. 반대로 하면 그 사이에 진행한
-      // 프레임들이 mesh 없이 지나가고, 옷은 몇 프레임 늦게 움직이기 시작한다.
-      if (!subscribed) {
-        await client.subscribe();
-        subscribed = true;
-        log('구독 켜짐 — 프레임당 약 48KB 가 흐르기 시작합니다');
-      }
-      await client.start();
-      playing = true;
-      status('시뮬레이션 실행 중');
-    } else {
-      await client.pause();
-      playing = false;
-      status('일시정지');
-    }
-  } catch (err: unknown) {
-    // 믿음을 고치지 않는다 — 실패했으니 상태는 그대로다.
-    status(`${on ? '재생' : '정지'} 실패: ${message(err)}`, true);
-  } finally {
-    ui.play.disabled = busy || currentScene === null;
-    paintPlay();
-    paintSnap();
-  }
-}
-
-function paintPlay(): void {
-  ui.play.textContent = playing ? '⏸ 정지' : '▶ 재생';
-  ui.play.disabled = busy || currentScene === null || !client.connected;
-}
+// (`playback.ts` 의 `#subscribed` 주석에 reset·clear 를 지나서도 성립하는
+//  근거가 코드 위치와 함께 적혀 있다.)
 
 /**
- * 재생을 누르면 **실시간으로 돌아온다.**
+ * 조작 하나를 실행하고, 실패했으면 **상태줄에 이유를 남긴다.**
+ *
+ * 컨트롤러는 던지지 않고 `false` + `lastError` 로 실패를 알린다(버튼 핸들러에서
+ * 도는 함수라 던지면 삼켜진다). 그 값을 화면 글자로 바꾸는 것이 이 함수의 전부다.
+ */
+async function act(action: PlaybackCommand): Promise<void> {
+  const ok = await RUN[action]();
+  paintSnap();
+  if (ok) return;
+  const err = playback.lastError;
+  // 실패가 아니라 "지금은 할 수 없다"(다른 op 왕복 중 등)면 조용히 넘긴다 —
+  // 버튼이 이미 잠겨 있으므로 사용자가 볼 이유가 없다.
+  if (err) status(`${LABEL[action]} 실패: ${err.message}`, true);
+}
+
+/** 화면이 부를 수 있는 조작. 단축키의 것에 `play`/`pause` 를 더한 것이다 */
+type PlaybackCommand = ShortcutAction | 'play' | 'pause';
+
+const RUN: Record<PlaybackCommand, () => Promise<boolean>> = {
+  toggle: () => playback.toggle(),
+  play: () => playback.play(),
+  pause: () => playback.pause(),
+  reset: () => playback.reset(),
+  clear: () => playback.clear(),
+  step: () => playback.step(),
+};
+
+const LABEL: Record<PlaybackCommand, string> = {
+  toggle: '재생/정지',
+  play: '재생',
+  pause: '정지',
+  reset: '리셋',
+  clear: '씬 내림',
+  step: '스텝',
+};
+
+/**
+ * 재생을 누르면 **실시간으로 돌아온다.** (`PlaybackHooks.beforePlay`)
  *
  * 스냅샷은 정지 화면이라, 스냅샷을 보는 채로 시뮬을 켜면 "재생을 눌렀는데
- * 아무것도 안 움직인다" 가 된다. 원인이 화면 어디에도 안 남는 실패라
- * `setPlaying(true)` 가 모드를 되돌린다. 스냅샷 자체는 버리지 않으므로
- * `#mode` 버튼으로 언제든 다시 볼 수 있다.
+ * 아무것도 안 움직인다" 가 된다. 원인이 화면 어디에도 안 남는 실패다.
+ * 스냅샷 자체는 버리지 않으므로 `#mode` 버튼으로 언제든 다시 볼 수 있다.
  */
 function returnToLiveForPlayback(): void {
   if (viewer.mode !== 'snapshot') return;
@@ -485,8 +611,25 @@ function returnToLiveForPlayback(): void {
   setMode('live');
 }
 
-ui.play.addEventListener('click', () => {
-  void setPlaying(!playing);
+ui.play.addEventListener('click', () => void act('toggle'));
+ui.reset.addEventListener('click', () => void act('reset'));
+ui.clear.addEventListener('click', () => void act('clear'));
+
+// ── 키보드 (#60~#63) ────────────────────────────────────────
+//
+// 어떤 키가 어떤 조작인지는 `panels/shortcuts.ts` 가 정한다 (수식키·입력
+// 포커스·IME·반복 입력을 거르는 근거가 거기 있다). 여기 있는 것은 이벤트를
+// 듣고 넘기는 것뿐이다.
+//
+// `preventDefault()` 는 **우리가 처리한 키에만** 건다. SPACE 는 브라우저에서
+// 스크롤이고 포커스된 버튼의 재클릭이라, 안 막으면 한 번 누른 것이 두 가지
+// 동작이 된다.
+window.addEventListener('keydown', (ev: KeyboardEvent) => {
+  const target = ev.target instanceof HTMLElement ? ev.target : null;
+  const action = shortcutFor(ev, target);
+  if (!action) return;
+  ev.preventDefault();
+  void act(action);
 });
 
 ui.load.addEventListener('click', () => {
@@ -554,6 +697,12 @@ void (async (): Promise<void> => {
 // `stats` 가 #13 의 진단 표면이다: `received` 는 오르는데 `applied` 가 안 오르면
 // 그리는 쪽이고, `withMesh` 가 0 이면 구독이 안 켜진 것이고, `dropped` 가 크면
 // 브라우저가 디코딩을 못 따라가는 것이다.
+//
+// #14 가 여기 더한 것은 `playback` 하나다. `playback.view` 가 화면이 무엇을
+// 말하고 있어야 하는지의 정본이고, `playback.stats` 는 어긋남의 계측기다:
+// `corrections` 가 0 이 아니면 우리 믿음이 워커와 갈라진 적이 있다는 뜻이고
+// (ISSUE-009 의 그 갈라짐이다), `negativeFrames` 는 워커의 `status.frame` 이
+// 음수로 온 횟수다 — 화면에는 안 쓰지만 세어 둔다.
 declare global {
   // eslint-disable-next-line no-var
   var cobalt: {
@@ -561,13 +710,15 @@ declare global {
     viewer: Viewer3D;
     stream: FrameStream;
     snapshots: SnapshotLoader<ParsedSnapshot>;
+    playback: PlaybackController;
     show: typeof show;
-    play: typeof setPlaying;
+    play: (on: boolean) => Promise<boolean>;
     snap: typeof takeSnapshot;
     mode: typeof setMode;
     get frames(): number;
     get stats(): FrameStreamStats;
     get snapStats(): SnapshotLoaderStats;
+    get playbackView(): PlaybackView;
   };
 }
 globalThis.cobalt = {
@@ -575,8 +726,9 @@ globalThis.cobalt = {
   viewer,
   stream,
   snapshots,
+  playback,
   show,
-  play: setPlaying,
+  play: (on: boolean) => (on ? playback.play() : playback.pause()),
   snap: takeSnapshot,
   mode: setMode,
   get frames(): number {
@@ -584,6 +736,9 @@ globalThis.cobalt = {
   },
   get stats(): FrameStreamStats {
     return stream.stats;
+  },
+  get playbackView(): PlaybackView {
+    return playback.view;
   },
   // 스냅샷이 안 보일 때의 진단 표면: `phase` 가 'ready' 인데 화면이 비었으면
   // 모드(`cobalt.viewer.mode`)나 카메라이고, 'error' 면 `lastError` 가 이유다.

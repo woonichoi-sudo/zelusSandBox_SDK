@@ -648,6 +648,7 @@ async function main(): Promise<void> {
     await sectionPauseResume(page);
     const colors = await sectionSnapshot(page);
     await sectionExclusive(page, colors);
+    await sectionPlaybackControls(page);
     await sectionConsole(page, logs);
     await sectionOpenIssues(page);
   } finally {
@@ -1299,6 +1300,440 @@ async function sectionExclusive(page: Page, colors: SnapshotColors): Promise<voi
 }
 
 // ─────────────────────────────────────────────────────────────
+// §10. 재생 컨트롤 (#14) — 버튼·키가 실제로 화면을 움직인다
+//
+// ── 왜 여기에도 절이 필요한가 (스모크 §10 과의 분담) ─────────
+// `protocol/smoke.ts` 의 §10-1~§10-10 이 상태 기계 전체를 가짜 포트로 돌린다.
+// 그것으로 **덮이지 않는 것이 정확히 세 가지**이고, 셋 다 여기서만 보인다:
+//
+//   ① **배선.** `PlaybackController` 가 아무리 옳아도 `#load` 버튼이
+//      `sceneLoading()` 을 안 부르면 화면은 그대로 거짓말한다 — ISSUE-009 가
+//      정확히 그 모양이었다. 스모크는 초록인 채로 화면만 틀린다
+//   ② **키가 실제로 먹는가.** `shortcutFor()` 의 표가 맞는 것과, `keydown` 이
+//      그 표를 지나 시뮬을 켜는 것은 다른 명제다. IME·포커스 양보도 마찬가지다
+//   ③ **리셋 뒤에 화면의 옷이 돌아오는가.** 리셋은 frame 이벤트를 한 건도 안
+//      내므로(`maxFrame` 이 -1 로 돌아간다) 훅이 포즈를 다시 받지 않으면
+//      **시뮬은 처음인데 화면은 드레이프된 옷 그대로**다. 경계 상자로만 보인다
+//
+// ── 무엇을 단언하지 않는가 ──────────────────────────────────
+// 버튼 글자('▶ 재생')·상태 문구는 바뀔 수 있다. 그래서 문자열을 못으로 박지
+// 않고 **관계**로 본다: '재생'/'정지' 중 하나만 들어 있는가, 리셋한 상자가
+// 처음 로드한 상자에 가까운가, 드레이프된 상자와는 먼가. 유일하게 두 글자를
+// 보는 이유는 `ensurePlaying` 이 그 글자로 상태를 읽기 때문이고, 그 사실 자체를
+// 첫 단언이 명시한다.
+// ─────────────────────────────────────────────────────────────
+
+interface PlaybackProbe {
+  state: string;
+  playLabel: string;
+  playing: boolean;
+  frame: number | null;
+  workerMode: string | null;
+  scene: string | null;
+  subscribed: boolean;
+  canPlay: boolean;
+  canReset: boolean;
+  canClear: boolean;
+  text: string;
+  corrections: number;
+  negativeFrames: number;
+  subscribes: number;
+  rejected: number;
+  failures: number;
+  syncs: number;
+  /** DOM 쪽 — 컨트롤러의 view 와 **갈라질 수 있는** 값들이다 */
+  playText: string;
+  playDisabled: boolean;
+  resetDisabled: boolean;
+  clearDisabled: boolean;
+  simText: string;
+  framesText: string;
+  statusText: string;
+  hasStepButton: boolean;
+  patternCount: number;
+  clothBox: { min: number[]; max: number[]; empty: boolean };
+}
+
+function readPlayback(page: Page): Promise<PlaybackProbe> {
+  return page.evaluate((): PlaybackProbe => {
+    const c = globalThis.cobalt;
+    const v = c.playbackView;
+    const st = c.playback.stats;
+    const box = c.viewer.cloth.boundingBox();
+    const text = (id: string): string => document.getElementById(id)?.textContent ?? '';
+    const dis = (id: string): boolean =>
+      (document.getElementById(id) as HTMLButtonElement | null)?.disabled ?? true;
+    return {
+      state: v.state,
+      playLabel: v.playLabel,
+      playing: v.playing,
+      frame: v.frame,
+      workerMode: v.workerMode,
+      scene: v.scene,
+      subscribed: v.subscribed,
+      canPlay: v.canPlay,
+      canReset: v.canReset,
+      canClear: v.canClear,
+      text: v.text,
+      corrections: st.corrections,
+      negativeFrames: st.negativeFrames,
+      subscribes: st.subscribes,
+      rejected: st.rejected,
+      failures: st.failures,
+      syncs: st.syncs,
+      playText: text('play'),
+      playDisabled: dis('play'),
+      resetDisabled: dis('reset'),
+      clearDisabled: dis('clear'),
+      simText: text('sim'),
+      framesText: text('frames'),
+      statusText: text('status'),
+      hasStepButton: document.getElementById('step') !== null,
+      patternCount: c.viewer.cloth.patternCount,
+      clothBox: {
+        min: box.min.toArray(), max: box.max.toArray(), empty: box.isEmpty(),
+      },
+    };
+  });
+}
+
+/** 두 글자 중 하나만 들어 있는가. `ensurePlaying` 이 글자를 읽는 그 방식이다 */
+function readsAs(label: string, want: '재생' | '정지'): boolean {
+  const other = want === '재생' ? '정지' : '재생';
+  return label.includes(want) && !label.includes(other);
+}
+
+/** 경계 상자 두 개의 min·max 최대 거리. 포즈가 얼마나 달라졌는지의 척도다 */
+function boxGap(
+  a: { min: number[]; max: number[] },
+  b: { min: number[]; max: number[] },
+): number {
+  const d = (p: number[], q: number[]): number =>
+    Math.hypot((p[0] ?? 0) - (q[0] ?? 0), (p[1] ?? 0) - (q[1] ?? 0), (p[2] ?? 0) - (q[2] ?? 0));
+  return Math.max(d(a.min, b.min), d(a.max, b.max));
+}
+
+function boxText(b: { min: number[]; max: number[] }): string {
+  return `y ${(b.min[1] ?? 0).toFixed(2)}~${(b.max[1] ?? 0).toFixed(2)}`;
+}
+
+/** 포커스를 아무 데도 두지 않는다. 버튼에 포커스가 남아 있으면 단축키가 양보한다 */
+async function blur(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const a = document.activeElement;
+    if (a instanceof HTMLElement) a.blur();
+  });
+}
+
+async function sectionPlaybackControls(page: Page): Promise<void> {
+  section('§10. 재생 컨트롤 (#14) — 버튼·키가 실제로 화면을 움직인다');
+
+  // 확인창이 뜨면 여기에 쌓인다. **clear 에 confirm() 을 달지 않은 것이 판단이고**
+  // (Playwright 는 대화상자를 기본으로 취소해서 자동 검증이 "clear 가 아무 일도
+  // 안 함" 으로 보인다), 그 판단이 지켜지는지 여기서 본다.
+  const dialogs: string[] = [];
+  page.on('dialog', (d) => {
+    dialogs.push(`${d.type()}: ${d.message()}`);
+    void d.dismiss();
+  });
+
+  await timed('§10 재생 컨트롤', async () => {
+    await ensurePlaying(page, false);
+    await blur(page);
+
+    // ── ① 화면에 있는 컨트롤 ─────────────────────────────────
+    {
+      const p = await readPlayback(page);
+      check(
+        '★ 재생 버튼 글자가 "재생"/"정지" 중 하나로만 읽힌다 (ensurePlaying 이 이걸 본다)',
+        readsAs(p.playText, '재생') || readsAs(p.playText, '정지'),
+        `"${p.playText.trim()}"`,
+      );
+      check(
+        '★ 컨트롤러의 view 와 실제 버튼 글자가 같다 (paintPlayback 배선이 살아 있다)',
+        p.playText.trim() === p.playLabel.trim(),
+        `DOM "${p.playText.trim()}" vs view "${p.playLabel}"`,
+      );
+      check(
+        '★ 씬이 있으면 재생·리셋·씬내림이 전부 눌린다',
+        !p.playDisabled && !p.resetDisabled && !p.clearDisabled,
+        `play=${String(!p.playDisabled)} reset=${String(!p.resetDisabled)} clear=${String(!p.clearDisabled)}`,
+      );
+      check(
+        '★★ 눌러도 아무 일이 없는 컨트롤은 화면에 없다 (워커의 step 이 no-op 인 동안 #step 을 안 올렸다)',
+        !p.hasStepButton, p.hasStepButton ? '#step 이 생겼다' : '#step 없음',
+      );
+      // `#sim`(워커가 말하는 것)과 `#frames`(브라우저가 그린 것)는 출처가 다르다.
+      // 둘 다 있어야 "프레임은 오는데 안 그려진다" 를 화면에서 가를 수 있다.
+      check(
+        '★ 워커 상태(#sim)와 브라우저가 그린 것(#frames)이 둘 다 찍혀 있다',
+        p.simText.trim().length > 1 && p.framesText.trim().length > 1,
+        `sim "${p.simText}" · frames "${p.framesText}"`,
+      );
+      check('상태줄이 컨트롤러의 문구를 그대로 쓴다', p.simText === p.text,
+        `"${p.simText}" vs "${p.text}"`);
+      note('진입 상태', `${p.state} · ${p.text} · 워커 mode=${String(p.workerMode)}`);
+    }
+
+    // ── ② 단축키 S — 실제 keydown 이 시뮬을 켠다 ─────────────
+    {
+      const before = await readStats(page);
+      await page.keyboard.press('s');
+      const on = await untilPage(
+        page,
+        () => (document.getElementById('play')?.textContent ?? '').includes('정지'),
+        15_000,
+      );
+      check('★★ S 키가 재생을 켠다 (keydown → shortcutFor → toggle 배선)', on, 'play → 정지');
+      const flowed = await page.waitForFunction(
+        (n: number) => globalThis.cobalt.stats.applied > n,
+        before.applied,
+        { timeout: 30_000 },
+      ).then(() => true, () => false);
+      check('★ 그리고 실제로 프레임이 흐른다 (버튼과 같은 경로다)', flowed, '프레임 적용 증가');
+
+      await page.keyboard.press('s');
+      const off = await untilPage(
+        page,
+        () => (document.getElementById('play')?.textContent ?? '').includes('재생'),
+        15_000,
+      );
+      check('★ 한 번 더 누르면 멈춘다 (토글이다 — 누른 횟수가 아니라 상태를 본다)', off, 'play → 재생');
+    }
+
+    // ── ③ 양보 — 키를 가로채면 안 되는 순간 ──────────────────
+    {
+      const b = await readPlayback(page);
+      // 입력 요소에 포커스가 있으면 양보한다.
+      await page.focus('#file');
+      await page.keyboard.press('s');
+      await sleep(300);
+      const afterInput = await readPlayback(page);
+      check(
+        '★★ 입력 요소에 포커스가 있으면 단축키가 양보한다',
+        afterInput.playing === b.playing && afterInput.state === b.state,
+        `${b.state} → ${afterInput.state}`,
+      );
+
+      // ⚠️ 버튼에 포커스가 있을 때도 양보한다. 재생 버튼을 누른 직후가 그
+      //    상태이고, 양보하지 않으면 한 번의 입력이 두 가지 동작이 된다.
+      await page.focus('#play');
+      await page.keyboard.press('s');
+      await sleep(300);
+      const afterButton = await readPlayback(page);
+      check(
+        '★★ 버튼에 포커스가 있어도 양보한다 (한 번 누른 것이 두 동작이 되지 않는다)',
+        afterButton.playing === b.playing, `playing=${String(afterButton.playing)}`,
+      );
+
+      // 수식키가 눌려 있으면 브라우저/OS 의 것이다. Shift 로 확인한다 —
+      // Ctrl+R 은 실제로 페이지를 새로고침해 버려서 하네스가 못 쓴다.
+      await blur(page);
+      await page.keyboard.press('Shift+S');
+      await sleep(300);
+      const afterShift = await readPlayback(page);
+      check(
+        '★ 수식키가 눌려 있으면 손대지 않는다 (Shift+S 로 확인 — Ctrl+R 은 새로고침이라 못 쓴다)',
+        afterShift.playing === b.playing, `playing=${String(afterShift.playing)}`,
+      );
+    }
+
+    // ── ④ ★★★ ISSUE-009 — 재생 중 재로드에서 버튼이 정직해진다 ──
+    //
+    // 스모크 §10-2 가 `sceneLoading()` 이 믿음을 내리는 것을 증명한다. 여기서
+    // 증명하는 것은 **[로드] 버튼이 그 함수를 실제로 부르는가**다. 배선이
+    // 끊기면 스모크는 초록인 채로 화면만 거짓말한다 — 그게 ISSUE-009 였다.
+    {
+      await ensurePlaying(page, true);
+      await page.waitForFunction(() => globalThis.cobalt.stats.applied > 3, null, {
+        timeout: 30_000,
+      }).then(() => true, () => false);
+      const playingNow = await readPlayback(page);
+      check('전제 — 재생 중이고 버튼이 "정지" 다',
+        playingNow.playing && readsAs(playingNow.playText, '정지'),
+        `"${playingNow.playText.trim()}" · frame=${String(playingNow.frame)}`);
+      const corr0 = playingNow.corrections;
+
+      // 로드를 누른다. **로드가 끝나기를 기다리지 않고 곧바로 읽는다** —
+      // 103MB 면 1초쯤이고, ISSUE-009 는 그 1초 동안의 거짓말이었다.
+      await blur(page);
+      await page.click('#load');
+      const during = await readPlayback(page);
+      check(
+        '★★★ 로드가 끝나기 전에 이미 버튼이 "재생" 이다 (ISSUE-009 의 통과 기준)',
+        readsAs(during.playText, '재생') && !during.playing,
+        `"${during.playText.trim()}" · state=${during.state} · 상태줄 "${during.statusText}"`,
+      );
+      check(
+        '★ 그때 화면은 아직 로드 중이라고 말한다 (완료된 뒤를 본 것이 아니다)',
+        during.state === 'loading' || during.statusText.includes('로드'),
+        `state=${during.state} · "${during.statusText}"`,
+      );
+      check('★ 로드 중에는 재생 버튼이 잠긴다 (누를 수 있으면 워커에 헛 op 이 간다)',
+        during.playDisabled, `disabled=${String(during.playDisabled)}`);
+
+      const done = await page.waitForFunction(
+        () => (document.getElementById('status')?.textContent ?? '').includes('로드 완료'),
+        null,
+        { timeout: LOAD_TIMEOUT },
+      ).then(() => true, () => false);
+      // ⚠️ '로드 완료' 는 `show()` 의 try 안에서 찍히고, **되묻기는 finally 에서**
+      //    일어난다. 곧바로 읽으면 `workerMode` 가 로드 **이전** 값(재생 중이었으니
+      //    'play')이라 실측이 아니라 잔상을 보게 된다 — 실제로 그 잔상 때문에
+      //    아래 단언이 간헐적으로 빨간불이 났다. 되묻기가 한 번 더 돌 때까지 기다린다.
+      const synced = await page.waitForFunction(
+        (n: number) => globalThis.cobalt.playback.stats.syncs > n,
+        during.syncs,
+        { timeout: 20_000 },
+      ).then(() => true, () => false);
+      const after = await readPlayback(page);
+      check('★ 로드가 끝난 뒤 워커에 한 번 되묻는다 (믿음이 아니라 사실로 마무리한다)',
+        synced && after.syncs > during.syncs, `syncs ${during.syncs} → ${after.syncs}`);
+      check('★ 재로드가 완료된다', done && after.patternCount > 0,
+        `패턴 ${after.patternCount} · "${after.statusText}"`);
+      check(
+        '★★ 로드가 끝나도 버튼은 "재생" 이다 (워커는 멈춰 있다 — 마음대로 다시 켜지 않는다)',
+        readsAs(after.playText, '재생') && after.state === 'paused'
+        && after.workerMode !== 'play',
+        `"${after.playText.trim()}" · state=${after.state} · 워커 mode=${String(after.workerMode)}`,
+      );
+      check(
+        '★★★ 대조군 — 이 경로에서 corrections 가 오르지 않았다 (믿음이 사실과 갈라진 적이 없다)',
+        after.corrections === corr0, `${corr0} → ${after.corrections}`,
+      );
+      note('되묻기', `syncs=${after.syncs} · negativeFrames=${after.negativeFrames}`
+        + ` · corrections=${after.corrections}`);
+    }
+
+    // ── ⑤ R 키 = 리셋. **화면의 포즈가 돌아온다** ────────────
+    //
+    // 리셋은 `maxFrame` 을 -1 로 되돌리므로 frame 이벤트가 한 건도 오지 않는다.
+    // `afterReset` 훅이 포즈를 다시 받지 않으면 **시뮬은 처음인데 화면은
+    // 드레이프된 옷 그대로**다. 경계 상자 세 장으로 그것을 가른다:
+    //   fresh(방금 로드) → draped(재생 뒤) → reset(리셋 뒤)
+    // 대조군이 안에 들어 있다 — draped 가 fresh 와 충분히 달라야 이 판정에
+    // 이빨이 있고, reset 이 fresh 로 돌아와야 훅이 일한 것이다.
+    {
+      const fresh = (await readPlayback(page)).clothBox;
+      await blur(page);
+      await page.keyboard.press('s');
+      const ran = await untilPage(page, () => globalThis.cobalt.stats.fps > 0, 20_000);
+      await sleep(2_500); // 옷이 눈에 띄게 드레이프될 만큼
+      await ensurePlaying(page, false);
+      const draped = await readPlayback(page);
+      const drapeGap = boxGap(fresh, draped.clothBox);
+      check(
+        '★ 전제 — 재생하면 옷의 형태가 실제로 달라진다 (아래 판정에 이빨이 생긴다)',
+        ran && drapeGap > 1, `${boxText(fresh)} → ${boxText(draped.clothBox)} (Δ${drapeGap.toFixed(2)}cm)`,
+      );
+      check('전제 — 프레임 번호가 화면에 올라와 있다',
+        draped.frame !== null && draped.simText.includes('프레임'),
+        `frame=${String(draped.frame)} · "${draped.simText}"`);
+
+      await blur(page);
+      await page.keyboard.press('r');
+      const reset = await untilPage(
+        page,
+        () => globalThis.cobalt.playbackView.frame === null,
+        20_000,
+      );
+      await sleep(700); // afterReset 의 meshData(false) 왕복
+      const afterReset = await readPlayback(page);
+      const backGap = boxGap(fresh, afterReset.clothBox);
+      check('★★ R 키가 리셋을 보낸다 (프레임 번호가 비워진다)', reset,
+        `frame=${String(afterReset.frame)}`);
+      check(
+        '★★ 리셋하면 상태줄에서 프레임 항목이 사라진다 (옛 봉우리가 남지 않는다)',
+        !afterReset.simText.includes('프레임') && afterReset.frame === null,
+        `"${afterReset.simText}"`,
+      );
+      check(
+        '★★★ 리셋하면 **화면의 옷도** 처음 자세로 돌아온다 (afterReset 이 포즈를 다시 받는다)',
+        backGap < drapeGap * 0.5 && backGap < 2,
+        `리셋 후 ${boxText(afterReset.clothBox)} — 첫 로드와 차이 ${backGap.toFixed(2)}cm`
+        + ` vs 드레이프 차이 ${drapeGap.toFixed(2)}cm`,
+      );
+      check('★ 리셋은 씬을 남긴다 (패턴이 그대로 서 있다)',
+        afterReset.patternCount > 0 && afterReset.state === 'paused',
+        `패턴 ${afterReset.patternCount} · ${afterReset.state}`);
+      note('포즈', `fresh ${boxText(fresh)} · draped ${boxText(draped.clothBox)}`
+        + ` · reset ${boxText(afterReset.clothBox)}`);
+    }
+
+    // ── ⑥ C 키 = 씬 내림. 확인창은 없고, 로드 한 번이면 돌아온다 ──
+    {
+      const before = await readPlayback(page);
+      await blur(page);
+      await page.keyboard.press('c');
+      const gone = await untilPage(
+        page,
+        () => globalThis.cobalt.viewer.cloth.patternCount === 0,
+        20_000,
+      );
+      const cleared = await readPlayback(page);
+      check('★★ C 키가 씬을 내린다 (화면에서 옷이 사라진다)', gone && cleared.patternCount === 0,
+        `패턴 ${before.patternCount} → ${cleared.patternCount}`);
+      check(
+        '★★ 확인창이 뜨지 않는다 (Playwright 가 기본 취소해서 자동 검증이 눈멀지 않게 한 판단)',
+        dialogs.length === 0, dialogs.join(' | ') || '0건',
+      );
+      check(
+        '★ 씬을 내리면 재생 컨트롤이 전부 잠긴다 (누를 곳이 없다)',
+        cleared.playDisabled && cleared.resetDisabled && cleared.clearDisabled
+        && cleared.state === 'noScene',
+        `state=${cleared.state}`,
+      );
+      check('★ 상태줄이 되돌리는 방법을 말한다',
+        cleared.statusText.includes('로드') || cleared.text.includes('로드'),
+        `"${cleared.statusText}" / "${cleared.text}"`);
+
+      // 되돌린다 — 잃은 것은 시뮬 진행뿐이라는 것이 확인창을 안 단 근거다.
+      await page.click('#load');
+      const back = await page.waitForFunction(
+        () => globalThis.cobalt.viewer.cloth.patternCount > 0,
+        null,
+        { timeout: LOAD_TIMEOUT },
+      ).then(() => true, () => false);
+      const restored = await readPlayback(page);
+      check(
+        '★★ [로드] 한 번이면 돌아온다 (.zls 는 게이트웨이에 남아 있다 — 확인창을 안 단 근거)',
+        back && restored.patternCount > 0 && restored.state === 'paused',
+        `패턴 ${restored.patternCount} · ${restored.state}`,
+      );
+    }
+
+    // ── ⑦ 대조군과 계측기 ────────────────────────────────────
+    {
+      const p = await readPlayback(page);
+      check(
+        '★★★ 이 절 전체에서 corrections 가 0 이다 — 화면이 워커와 갈라진 적이 없다 (ISSUE-009)',
+        p.corrections === 0, `corrections=${p.corrections}`,
+      );
+      check(
+        '★★ 재생·리셋·clear·재로드를 지나도 subscribe 는 세션당 한 번이다',
+        p.subscribes === 1, `subscribes=${p.subscribes}`,
+      );
+      check('실패한 조작이 없다', p.failures === 0, `failures=${p.failures} rejected=${p.rejected}`);
+      check('★ 화면이 그린 프레임(#frames)과 워커가 말한 프레임(#sim)이 둘 다 살아 있다',
+        p.framesText.length > 1 && p.simText.length > 1,
+        `sim "${p.simText}" · frames "${p.framesText}"`);
+      note(
+        '계측기',
+        `corrections=${p.corrections} · negativeFrames=${p.negativeFrames}`
+        + ` (워커의 status.frame 이 음수로 온 횟수 — 화면에는 안 쓴다)`
+        + ` · syncs=${p.syncs} · subscribes=${p.subscribes}`,
+      );
+
+      const sh = await shot(page, 'playback-controls');
+      check(
+        '★ 이 절이 끝난 뒤에도 화면에 옷이 서 있다',
+        sh.colors.saturated > sh.colors.total * 0.01, describe(sh.colors),
+      );
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
 // §8. 콘솔 오류 0건
 // ─────────────────────────────────────────────────────────────
 
@@ -1374,14 +1809,29 @@ async function sectionOpenIssues(page: Page): Promise<void> {
       `로그 ${log.total}줄 중 [엔진] ${log.engine}줄 (${(log.engine / Math.max(1, log.total) * 100).toFixed(0)}%)`
       + ` — 300줄 상한이라 40/s 면 7.5초 뒤 나머지가 밀려난다`,
     );
+    // ISSUE-009 는 #14 에서 닫혔다. **여기 있던 note 를 §10 의 단언으로 승격했다** —
+    // 이 절의 머리말이 말한 "고쳐지면 위 §들 중 하나로 승격한다" 가 그것이다.
+    // 재생 중 재로드는 §10-④ 가 실제로 눌러 보고, 그 판정의 계측기가
+    // `playback.stats.corrections` 다.
+    const pv = await page.evaluate(() => {
+      const s = globalThis.cobalt.playback.stats;
+      return { corrections: s.corrections, negativeFrames: s.negativeFrames };
+    });
     note(
-      'ISSUE-009 (재생 상태 어긋남)',
-      '재현하지 않는다 — 재생 중 씬 재로드가 필요한데, 지금 동작(버튼이 "정지"로 남는다)을'
-      + ' 단언으로 박으면 #14 가 고치는 날 이 하네스가 깨진다',
+      'ISSUE-009 (재생 상태 어긋남) — #14 에서 닫혔다',
+      `§10-④ 가 재생 중 재로드를 실제로 눌러 판정한다. 이번 실행의 계측기:`
+      + ` corrections=${pv.corrections} (믿음이 워커와 갈라진 횟수)`,
+    );
+    note(
+      '워커 쪽 미해결 (판정하지 않음)',
+      `① status.frame 이 정지 중 음수로 온다 — 이번 실행 ${pv.negativeFrames}회.`
+      + ' 화면은 maxFrame 만 쓰므로 영향이 없다.'
+      + ' ② step op 이 no-op 이라 버튼·SPACE 를 화면에 올리지 않았다'
+      + ' (스모크 §10-8·§10-10 이 관찰한다)',
     );
     note(
       '덮지 못하는 것',
-      '2D 펼침(#15) · 파라미터(#16) · 업로드 경로 · 재연결. 화면이 생기면 절을 추가할 것',
+      '2D 펼침(#15) · 파라미터(#16) · 업로드 경로 · 재연결(끊겼다 붙는 것). 화면이 생기면 절을 추가할 것',
     );
   });
 }
