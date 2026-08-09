@@ -1,0 +1,11 @@
+{
+  // tools/ 는 dist에 넣지 않는다 — 빌드 산출물이 아니라 측정 도구다.
+  // 그래도 타입체크는 받아야 한다. 최상위 tsconfig는 rootDir가 src라
+  // tools/를 include에 넣을 수 없어(rootDir 밖 파일 오류), 여기서 따로 잡는다.
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".."
+  },
+  "include": ["**/*.ts", "../src/**/*.ts"]
+}

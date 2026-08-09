@@ -9,10 +9,11 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tools/tsconfig.json",
     "smoke": "node --experimental-strip-types src/sdk/smoke.ts",
     "smoke:server": "node --experimental-strip-types src/server/smoke.ts",
-    "serve": "node --experimental-strip-types src/server/index.ts"
+    "serve": "node --experimental-strip-types src/server/index.ts",
+    "sweep:params": "node --experimental-strip-types tools/param-sweep.ts"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
