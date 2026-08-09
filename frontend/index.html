@@ -46,6 +46,71 @@
         opacity: 0.35; pointer-events: none;
       }
 
+      /*
+        파라미터 패널 (#16). `#logWrap` 과 **같은 패턴**이다 — 바닥에 고정해
+        `<details>` 로 접고, 펼치면 위로 자란다. 상단 `.bar` 를 건드리지 않은
+        이유는 거기가 `src/verify/ui.ts` 의 판정면(버튼 위치·상태 글자)이라서다.
+        왼쪽 아래에 두어 오른쪽 아래의 로그와 겹치지 않는다
+        (1280px 에서 416px + 588px < 1280px).
+      */
+      #paramsWrap {
+        position: fixed; left: 0.75rem; bottom: 2.4rem; z-index: 2;
+        width: min(26rem, 34vw);
+      }
+      #paramsWrap summary { cursor: pointer; opacity: 0.45; }
+      #paramsWrap[open] summary { opacity: 0.75; }
+      #paramsBadge { opacity: 0.75; }
+      #params {
+        margin-top: 0.4rem; padding: 0.5rem;
+        max-height: 64vh; overflow-y: auto;
+        background: rgba(20, 23, 28, 0.94);
+        border: 1px solid #2c333f; border-radius: 4px;
+        font-size: 12px;
+      }
+      /* 위젯 스타일은 전부 `#params` 안으로 가둔다 — 바깥 규칙을 바꾸지 않는다 */
+      #params input[type="number"] {
+        font: inherit; color: inherit; width: 6.5rem;
+        background: #262b34; border: 1px solid #3a424f; border-radius: 4px;
+        padding: 0.1rem 0.3rem;
+      }
+      #params input[type="range"] { flex: 1 1 auto; min-width: 4rem; accent-color: #6d8cff; }
+      #params select { max-width: none; flex: 1 1 auto; padding: 0.1rem 0.3rem; }
+      #params button { padding: 0.15rem 0.5rem; }
+      #params input:disabled, #params select:disabled { opacity: 0.45; cursor: default; }
+
+      .pbar {
+        position: sticky; top: -0.5rem; z-index: 1;
+        display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap;
+        margin: -0.5rem -0.5rem 0.45rem; padding: 0.5rem;
+        background: #1a1e25; border-bottom: 1px solid #2c333f;
+      }
+      .pbanner {
+        margin-bottom: 0.45rem; padding: 0.35rem 0.45rem; border-radius: 3px;
+        background: rgba(255, 200, 120, 0.09); border: 1px solid #4b4030; color: #ffd9a0;
+      }
+      .phint { margin-bottom: 0.45rem; opacity: 0.55; }
+      .pgroup { margin-top: 0.6rem; }
+      .pgroup > h4 {
+        margin: 0 0 0.25rem; font-size: 12px; font-weight: 600; opacity: 0.5;
+        padding-bottom: 0.15rem; border-bottom: 1px solid #2c333f;
+      }
+      .prow { padding: 0.35rem 0; border-bottom: 1px solid rgba(44, 51, 63, 0.55); }
+      /* 비활성은 흐리게 **하되**, 아래 `.pwhy` 가 이유를 글자로 남긴다 */
+      .prow.off { opacity: 0.75; }
+      .phead { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
+      .phead label { opacity: 0.9; }
+      .pinputs { display: flex; align-items: center; gap: 0.4rem; margin: 0.2rem 0; }
+      .pbadge {
+        font-size: 10px; padding: 0 0.25rem; border-radius: 3px;
+        border: 1px solid #3a424f; opacity: 0.85;
+      }
+      .pbadge.dead { color: #ff9a9a; border-color: #5a3238; }
+      .pbadge.conditional { color: #ffd9a0; border-color: #5a4a30; }
+      .pbadge.guess { opacity: 0.45; }
+      .phelp, .pnote { opacity: 0.45; }
+      .pwhy { color: #ffb0b0; }
+      .pfix, .psrc { color: #ffd9a0; }
+
       #logWrap {
         position: fixed; right: 0.75rem; bottom: 0.6rem; z-index: 2;
         width: min(38rem, 46vw);
@@ -120,6 +185,21 @@
 
     <!-- 단축키 문구는 `src/panels/shortcuts.ts` 의 SHORTCUT_HINT 가 채운다 -->
     <div id="hint">좌드래그 회전 · 우드래그 팬 · 휠 줌 &nbsp;|&nbsp; 격자 한 칸 = 10cm</div>
+
+    <!--
+      파라미터 패널 (#16). 위젯 22개의 **스키마·검증·비활성 판정은
+      `src/panels/params.ts`** 에 있고(DOM 없음, Node 테스트 109건이 그 위에
+      선다), 그리는 것만 `src/ui/paramsPanel.ts` 가 한다. 그래서 여기 있는 것은
+      빈 자리 두 개뿐이다 — 행 22개는 스키마에서 나온다.
+
+      ⚠️ 비활성 필드는 **회색만 되지 않는다.** 사유(엔진 미지원 / 시뮬 초기화 /
+         종속 미충족)가 `.pwhy` 로 화면에 글자로 남는다. 툴팁에만 넣으면
+         마우스를 올려야 보이는데, 그건 "보인다" 가 아니다.
+    -->
+    <details id="paramsWrap">
+      <summary>⚙ 파라미터 <span id="paramsBadge"></span></summary>
+      <div id="params"></div>
+    </details>
 
     <details id="logWrap">
       <summary>로그</summary>

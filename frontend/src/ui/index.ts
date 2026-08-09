@@ -1,0 +1,20 @@
+/**
+ * DOM 위젯 계층의 공개 표면. **여기만 import 한다** —
+ * `protocol/index.ts` · `panels/index.ts` · `viewer3d/index.ts` 와 같은 규약이다.
+ *
+ *   import { ParamsPanel } from './ui/index.ts';
+ *
+ * 이 디렉토리의 규칙은 `panels/` 의 정확한 반대다: **DOM 만 만진다.** 판단은
+ * 한 줄도 두지 않는다 — 어느 필드가 비활성인지, 값이 유효한지, 무엇을 보낼지는
+ * 전부 `panels/` 가 이미 답하고 여기서는 그 답을 그리기만 한다. 그래서 이
+ * 디렉토리에는 Node 테스트가 붙지 않고, 붙을 필요도 없다(판단이 없으므로
+ * 검증할 규칙이 없다). 반대로 여기에 판단이 새면 그만큼 자동 테스트가 사라진다.
+ */
+
+export {
+  ParamsPanel,
+  type ParamsPanelHooks,
+  type ParamsPanelOptions,
+  type ParamsPhase,
+  type ParamsPort,
+} from './paramsPanel.ts';

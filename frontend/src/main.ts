@@ -55,6 +55,7 @@ import {
   uploadScene,
   type SceneSummary,
 } from './protocol/index.ts';
+import { ParamsPanel } from './ui/index.ts';
 import {
   FrameStream,
   showScene,
@@ -94,6 +95,11 @@ const ui = {
   status: el<HTMLElement>('status'),
   hint: el<HTMLElement>('hint'),
   log: el<HTMLElement>('log'),
+  // 파라미터 패널 (#16). 안의 위젯 22개는 `ui/paramsPanel.ts` 가 만든다 —
+  // 여기 잡는 것은 접이 상자와 그 안의 빈 자리뿐이다.
+  paramsWrap: el<HTMLDetailsElement>('paramsWrap'),
+  params: el<HTMLElement>('params'),
+  paramsBadge: el<HTMLElement>('paramsBadge'),
 };
 
 ui.hint.textContent = `${ui.hint.textContent ?? ''}  |  ${SHORTCUT_HINT}`;
@@ -146,6 +152,8 @@ let busy = false;
 client.on('open', ({ reconnected, attempt }) => {
   // 새 워커다. 시뮬도 구독도 씬도 초기값이므로 우리 쪽 믿음을 먼저 지운다.
   playback.sessionStarted();
+  // 새 워커는 씬도 파라미터도 초기값이다. 화면에 남은 값은 이미 죽은 세션의 것이다.
+  refreshParams();
   if (!reconnected) return;
   log(`재연결됨 (${attempt}회) — 새 워커 세션이므로 씬을 다시 로드합니다`);
   paintSnap();
@@ -156,6 +164,8 @@ client.on('close', ({ code, willReconnect }) => {
   // 소켓이 없으면 재생도 없다. 버튼이 살아 있으면 누를 때마다 "연결되어 있지
   // 않습니다" 만 나온다.
   playback.connectionLost();
+  // 소켓이 없으면 파라미터를 읽을 수도 보낼 수도 없다. 패널이 그렇게 말해야 한다.
+  refreshParams();
   // 스냅샷은 **버리지 않는다.** 이미 화면에 서 있는 것은 소켓과 무관하게
   // 유효한 정지 화면이라, 끊겼다고 지우면 볼 수 있는 것까지 사라진다.
   // 새로 찍는 것만 막는다 (paintSnap 이 client.connected 를 본다).
@@ -204,6 +214,46 @@ const stream = new FrameStream({
     status(`토폴로지를 다시 받습니다 (${topologyRecoveries}/${MAX_TOPOLOGY_RECOVERIES})`);
     void show(currentScene, { refit: false });
   },
+});
+
+// ── 파라미터 패널 (#16) ─────────────────────────────────────
+//
+// 여기 있는 것도 배선뿐이다. **스키마·검증·비활성 판정은 `panels/params.ts`**
+// (DOM 없음, Node 테스트가 그 위에 선다)이고, **위젯을 그리는 것은
+// `ui/paramsPanel.ts`** 다. 이 파일에 남은 것은 (a) 클라이언트를 포트로
+// 넘기고, (b) 값이 낡는 순간마다 다시 읽으라고 알리고, (c) 재생 중이라는
+// 사실을 밀어 넣는 것, 셋뿐이다.
+//
+// `client` 를 어댑터 없이 넘길 수 있는 이유는 `PlaybackPort` 와 같다 —
+// `ParamsPort` 가 구조적 타입이라 `GatewayClient` 가 이미 만족한다.
+//
+// ⚠️ 패널이 `client.status()` 를 **직접** 부른다. `PlaybackController` 가
+//    `status` 를 이미 물고 있지만 `loaded`·`simInitialized` 를 밖으로 내주지
+//    않고(`PlaybackView` 에 없다), `solverType` 잠금 조건이 바로
+//    `simInitialized` 다. 왕복 하나를 아끼려고 `playback.ts` 의 공개 표면을
+//    넓히면 스모크 573건이 서 있는 파일을 이 단위에서 건드리게 된다. 폴링이
+//    아니라 **패널을 펼치거나 씬이 바뀔 때만** 부르므로 비용은 무시할 만하다.
+const params = new ParamsPanel({
+  root: ui.params,
+  badge: ui.paramsBadge,
+  port: client,
+  hooks: { log, status },
+});
+
+/**
+ * 워커의 파라미터가 낡았을 수 있는 자리에서 부른다.
+ *
+ * **접혀 있으면 왕복을 만들지 않는다.** 씬을 로드할 때마다 안 보이는 패널을
+ * 위해 `status`+`getParams` 를 보낼 이유가 없다. 대신 낡았다고 표시해 두고,
+ * 펼치는 순간 아래 `toggle` 이 읽는다.
+ */
+function refreshParams(): void {
+  if (ui.paramsWrap.open) void params.refresh();
+  else params.markStale();
+}
+
+ui.paramsWrap.addEventListener('toggle', () => {
+  if (ui.paramsWrap.open && params.stale) void params.refresh();
 });
 
 // ── 재생 컨트롤 (#14) ───────────────────────────────────────
@@ -266,6 +316,9 @@ function clearScene(): void {
   currentScene = null;
   ui.stat.textContent = '-';
   ui.frames.textContent = '-';
+  // 파라미터는 씬에 딸려 있다. 씬이 내려갔으면 화면의 값은 더 이상 아무것도
+  // 가리키지 않는다.
+  refreshParams();
   status('씬을 내렸습니다 — 다시 보려면 [로드] 를 누르세요');
   setBusy(false);
 }
@@ -277,6 +330,52 @@ function paintPlayback(view: PlaybackView = playback.view): void {
   ui.reset.disabled = busy || !view.canReset;
   ui.clear.disabled = busy || !view.canClear;
   ui.sim.textContent = view.text;
+  // ★ 재생 중에는 파라미터 [적용] 을 잠근다. **위젯은 열어 둔다** — 값을 미리
+  //   맞춰 두고 정지한 뒤 한 번에 보낼 수 있다. 잠그는 이유는 시뮬이 도는
+  //   도중의 변경이 어떻게 반영되는지 **측정한 적이 없어서**다. 한 런의
+  //   프레임들이 서로 다른 파라미터로 계산되면 그 결과를 무엇으로 만들었다고
+  //   말할 수 없게 된다. 사용자가 [⏸ 정지] 로 스스로 풀 수 있고, 잠긴 이유는
+  //   패널에 글자로 뜬다 (`ui/paramsPanel.ts` 머리말 참고).
+  params.setBlocked(
+    view.playing
+      ? '재생 중에는 적용하지 않습니다 — [⏸ 정지] 후 누르세요 (시뮬 도중 변경의 반영 방식은 측정되지 않았습니다)'
+      : null,
+  );
+  syncParamLock(view);
+}
+
+/**
+ * 잠금 조건(`status.simInitialized`)을 **전이가 끝난 순간에만** 되묻는다.
+ *
+ * ── 왜 필요한가 ────────────────────────────────────────────
+ * `simInitialized` 는 **재생을 시작하면 워커에서 켜진다.** 패널은 값을 읽을
+ * 때만 그 사실을 다시 봤으므로, 재생 뒤에도 [워커에서 읽기]·씬 로드 전까지
+ * `solverType` 이 열려 있었다 — 화면이 "만질 수 있다" 고 말하는데 실제로는
+ * 만지면 안 되는 상태다. 이 단위가 없애려던 바로 그 거짓말이라 여기서 막는다.
+ *
+ * ── 폴링이 되지 않게 하는 두 겹 ─────────────────────────────
+ * ① `pending !== null` 이면 건너뛴다. `paintPlayback` 은 op 하나마다 최소 두
+ *    번 불린다(왕복 시작 / 끝). **끝난 것만** 본다.
+ * ② `(state, workerMode)` 서명이 그대로면 건너뛴다. `workerMode` 는
+ *    `syncFromWorker` 가 채우는 **워커의 사실**이라, 재생·정지·리셋·clear·로드
+ *    가 전부 여기서 갈린다. 결과적으로 **사용자 조작 하나당 status 한 번**이고
+ *    프레임 이벤트로는 한 번도 불리지 않는다(rAF 경로는 `ui.sim` 글자만 만진다).
+ *
+ * ⚠️ 패널이 접혀 있으면 왕복 대신 낡음 표시만 남긴다 — 펼치는 순간
+ *    `refresh()` 가 `simInitialized` 까지 같이 읽어 온다. `refreshParams()` 를
+ *    그대로 쓰지 않는 이유는 그쪽이 `getParams()` 까지 읽어 **사용자가 맞춰 둔
+ *    값을 되덮기** 때문이다 — 재생 중에는 [적용] 이 잠기므로 값을 미리 맞춰
+ *    두는 것이 정상 사용 경로다.
+ */
+let lockSignature: string | null = null;
+
+function syncParamLock(view: PlaybackView): void {
+  if (view.pending !== null) return;
+  const sig = `${view.state}/${view.workerMode ?? '-'}`;
+  if (sig === lockSignature) return;
+  lockSignature = sig;
+  if (ui.paramsWrap.open) void params.syncLock();
+  else params.markStale();
 }
 
 // ① 이벤트 핸들러는 **얹기만 한다.** 여기서 디코딩하면 40/s × 47.8KB 를
@@ -543,6 +642,10 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
     // 들고 있는지는 물어봐야 안다 — 실패했을 때가 특히 그렇다(요청이 워커에
     // 닿기는 했는지 우리는 모른다).
     await playback.syncFromWorker();
+    // ★ **씬마다 파라미터 값이 다르다** (실측: `W_Bra top & Leggings.zls` 의
+    //   timeStep 45 vs `sample.zls` 30). 로드했으면 반드시 다시 읽어야 한다 —
+    //   안 그러면 이전 씬의 값을 이 씬의 값인 것처럼 보여준다.
+    refreshParams();
   }
 }
 
@@ -711,6 +814,12 @@ declare global {
     stream: FrameStream;
     snapshots: SnapshotLoader<ParsedSnapshot>;
     playback: PlaybackController;
+    /**
+     * #16 의 진단 표면. `params.phase` 가 'ready' 가 아니면 화면의 값은
+     * **자리채움이다**(워커의 값이 아니다). `params.workerValues` 가 워커가
+     * 마지막으로 말한 사실이고, `params.dirty` 가 아직 안 보낸 변경 수다.
+     */
+    params: ParamsPanel;
     show: typeof show;
     play: (on: boolean) => Promise<boolean>;
     snap: typeof takeSnapshot;
@@ -727,6 +836,7 @@ globalThis.cobalt = {
   stream,
   snapshots,
   playback,
+  params,
   show,
   play: (on: boolean) => (on ? playback.play() : playback.pause()),
   snap: takeSnapshot,

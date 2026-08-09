@@ -74,6 +74,21 @@ import path from 'node:path';
 
 import { chromium, type Browser, type ConsoleMessage, type Page } from 'playwright';
 
+// ★ 제품 코드에서 **스키마만** 가져온다 (`panels/params.ts` — DOM 이 없어 Node 에서
+//   돈다). 화면에 떠 있어야 할 필드 목록과 비활성 사유 문구를 하네스가 손으로
+//   베끼지 않기 위해서다. 베끼면 문장이 바뀌는 날 하네스가 빨간불이 되고, 그때
+//   고치는 사람이 "회귀인가?" 를 먼저 의심하게 된다. 스키마를 정본으로 두면
+//   **문구가 바뀌어도 계약(어느 필드에 어느 종류의 사유가 붙는가)만 지켜지면
+//   초록**이고, 화면이 그 문구를 안 보여주는 순간에만 빨간불이 된다.
+import {
+  paramDisabledReason,
+  paramField,
+  paramGroups,
+  PARAM_FIELDS,
+  type ParamContext,
+  type ParamKey,
+} from '../panels/index.ts';
+
 // ── 설정 ────────────────────────────────────────────────────
 
 const HERE = import.meta.dirname;
@@ -554,6 +569,47 @@ function collect(page: Page): Collected {
   return c;
 }
 
+// ── 워커로 나간 것 (WebSocket 프레임) ───────────────────────
+//
+// **왜 화면이 아니라 선을 보는가.** 스모크 §11-6 은 `buildSetParamsPayload` 가
+// 죽은 필드를 빼는 것까지 증명한다. 그런데 그건 **그 함수를 지났을 때**의 이야기다.
+// 화면이 위젯 상태 맵을 `client.setParams()` 에 곧바로 넘기면 스키마를 통째로
+// 우회하게 되고, 그때 스모크 573건은 **하나도 안 깨진다** — 죽은 필드가 조용히
+// 워커로 나가고 워커는 `applied` 로 답하며 물리는 그 값을 보지 않는다. 화면에는
+// "적용됨" 이라고 뜬다. 그 거짓말은 오직 **선 위에서만** 보인다.
+//
+// 텍스트 프레임만 본다. 워커가 내려보내는 메시(frame 이벤트)는 바이너리이고
+// 우리가 보내는 op 은 전부 JSON 한 줄이다 (`client.ts` 의 `ws.send(JSON.stringify)`).
+
+interface SentOp {
+  op: string;
+  /** `setParams` 만 채워진다 */
+  params: Record<string, unknown> | null;
+  raw: string;
+}
+
+function collectWsFrames(page: Page): SentOp[] {
+  const sent: SentOp[] = [];
+  page.on('websocket', (ws) => {
+    ws.on('framesent', (f: { payload: string | Buffer }) => {
+      if (typeof f.payload !== 'string') return;
+      const text = f.payload;
+      if (!text.startsWith('{')) return;
+      try {
+        const msg = JSON.parse(text) as { op?: unknown; params?: unknown };
+        const params =
+          typeof msg.params === 'object' && msg.params !== null
+            ? (msg.params as Record<string, unknown>)
+            : null;
+        sent.push({ op: String(msg.op ?? ''), params, raw: text });
+      } catch {
+        // JSON 이 아니면 우리 op 이 아니다. 판정에 넣을 것이 없다.
+      }
+    });
+  });
+  return sent;
+}
+
 // ── 사전 점검 ───────────────────────────────────────────────
 //
 // 판단 ①의 뒷감당이 전부 여기 있다. 이게 없으면 서버가 안 떠 있을 때
@@ -640,6 +696,8 @@ async function main(): Promise<void> {
     browser = await chromium.launch({ headless: !HEADED, channel: CHANNEL });
     const page = await browser.newPage({ viewport: { ...VIEWPORT } });
     const logs = collect(page);
+    // 첫 소켓이 열리기 전에 붙여야 한다 — 페이지가 뜨는 순간 이미 붙는다.
+    const sent = collectWsFrames(page);
 
     await sectionFirstPaint(page, logs);
     await sectionCoordinates(page);
@@ -649,6 +707,7 @@ async function main(): Promise<void> {
     const colors = await sectionSnapshot(page);
     await sectionExclusive(page, colors);
     await sectionPlaybackControls(page);
+    await sectionParams(page, sent);
     await sectionConsole(page, logs);
     await sectionOpenIssues(page);
   } finally {
@@ -1734,6 +1793,1150 @@ async function sectionPlaybackControls(page: Page): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────
+// §11. 파라미터 패널 (#16) — 값을 바꾸면 시뮬이 달라진다
+//
+// ── 스모크 §11(109건)과의 분담 ──────────────────────────────
+// `protocol/smoke.ts` 가 스키마·검증·비활성 판정·페이로드 변환을 전부 덮는다.
+// **그것으로 덮이지 않는 것이 정확히 셋**이고, 셋 다 여기서만 보인다:
+//
+//   ① **배선.** `buildSetParamsPayload` 가 아무리 옳아도 화면이 그 함수를 안
+//      지나면 죽은 필드가 그대로 워커로 나간다. 스모크는 초록인 채로 화면만
+//      거짓말한다 — #14 에서 실증된 그 모양이다 (배선 한 줄을 지우면 스모크
+//      464건이 전부 통과하고 UI 하네스만 잡았다)
+//   ② **사유가 화면에 글자로 있는가.** `ParamDisabled.text` 가 존재한다는 것과
+//      그 글자가 화면에 떠 있다는 것은 다른 명제다. `title`(툴팁)에만 넣으면
+//      스모크는 아무것도 눈치채지 못하고, 사용자는 회색 위젯만 본다
+//   ③ **★ 값을 바꾸면 시뮬이 실제로 달라지는가.** #16 의 통과 기준이고,
+//      정점이 움직이는 것은 오직 화면에서만 확인된다
+//
+// ── ③ 을 어떻게 재는가 ──────────────────────────────────────
+// **[실측]** 솔버는 결정적이다. **씬을 다시 로드하고** 같은 파라미터로 돌리면
+// 프레임마다 정점이 **비트 단위로 같다**(아래 대조군이 매 실행 그것을 확인한다:
+// 61프레임 전부 최대 오차 0.000000000cm). 그래서 "달라졌다"에 지터 여유를 줄
+// 이유가 전혀 없다 — **0 이 아니면 달라진 것**이다.
+//
+// ⚠️ **리셋으로는 이 날카로움이 안 나온다.** 같은 워커에서 `reset` 뒤에 다시
+//    돌리면 같은 파라미터인데도 평균 0.50cm / 최대 2.26cm 어긋난다(실측).
+//    §10-⑤ 가 리셋 판정에 2cm 를 허용한 것과 같은 결이다. 그래서 이 절은
+//    비교하는 세 번의 실행을 **매번 [로드] 로 시작한다.**
+//
+// 표본은 프레임 번호를 열쇠로 모은다. `stats.lastApplied` 가 f 인 순간의
+// 정점은 **정확히 프레임 f 의 포즈**다(다음 프레임은 아직 안 왔다). 두 실행에서
+// 같은 f 끼리만 맞대므로 프레임이 밀려도 비교가 흔들리지 않는다.
+// ─────────────────────────────────────────────────────────────
+
+/** 한 실행에서 모은 프레임별 정점 표본. `[프레임 번호, 좌표들]` */
+type Poses = [number, number[]][];
+
+/**
+ * 몇 프레임까지 돌릴 것인가. **ISSUE-014 측정 도구는 100프레임을 썼다** —
+ * 여기서는 실행 시간 때문에 60으로 줄였다. 그래도 판정이 서는 이유는 이 절이
+ * 평균 변위의 절대값을 못으로 박지 않고 **대조군(0cm)과의 관계**로 보기 때문이다.
+ */
+const RUN_FRAMES = 60;
+
+/** 정점을 몇 개마다 하나씩 뽑는가. 24패턴 × 전 정점이면 프레임마다 수 MB 다 */
+const POSE_STRIDE = 37;
+
+interface RowProbe {
+  /** 'checkbox' | 'select' | 'number' | '' */
+  widget: string;
+  /** 체크박스는 'true'/'false', 나머지는 위젯의 문자열 값 */
+  value: string;
+  disabled: boolean;
+  hasSlider: boolean;
+  sliderValue: string | null;
+  sliderDisabled: boolean | null;
+  /** 비활성 사유가 **화면에 떠 있는가** (hidden 이면 false) */
+  whyShown: boolean;
+  whyText: string;
+  noteText: string;
+  helpText: string;
+  badges: string[];
+  /**
+   * ★ 이 행에서 **눈에 보이는 글자 전부.** `innerText` 는 `hidden` 인 것을 빼고
+   *   `title` 속성을 포함하지 않는다 — 그래서 "툴팁에만 있다"를 정확히 가른다.
+   */
+  visibleText: string;
+  title: string;
+  options: { value: string; label: string }[] | null;
+}
+
+function readParamRows(page: Page): Promise<Record<string, RowProbe>> {
+  return page.evaluate((): Record<string, RowProbe> => {
+    const out: Record<string, RowProbe> = {};
+    for (const el of document.querySelectorAll('#params .prow')) {
+      const row = el as HTMLElement;
+      const key = row.dataset['key'] ?? '';
+      const ctrl = row.querySelector(
+        'input:not([type="range"]), select',
+      ) as HTMLInputElement | HTMLSelectElement | null;
+      const slider = row.querySelector('input[type="range"]') as HTMLInputElement | null;
+      const why = row.querySelector('.pwhy') as HTMLElement | null;
+      const note = row.querySelector('.pnote') as HTMLElement | null;
+      const help = row.querySelector('.phelp') as HTMLElement | null;
+      let widget = '';
+      let value = '';
+      if (ctrl instanceof HTMLSelectElement) {
+        widget = 'select';
+        value = ctrl.value;
+      } else if (ctrl !== null) {
+        widget = ctrl.type;
+        value = ctrl.type === 'checkbox' ? String(ctrl.checked) : ctrl.value;
+      }
+      out[key] = {
+        widget,
+        value,
+        disabled: ctrl?.disabled ?? true,
+        hasSlider: slider !== null,
+        sliderValue: slider?.value ?? null,
+        sliderDisabled: slider === null ? null : slider.disabled,
+        whyShown: why !== null && !why.hidden,
+        whyText: why?.textContent ?? '',
+        noteText: note?.textContent ?? '',
+        helpText: help?.textContent ?? '',
+        badges: [...row.querySelectorAll('.pbadge')].map((b) => b.textContent ?? ''),
+        visibleText: row.innerText,
+        title: row.title,
+        options:
+          ctrl instanceof HTMLSelectElement
+            ? [...ctrl.options].map((o) => ({ value: o.value, label: o.textContent ?? '' }))
+            : null,
+      };
+    }
+    return out;
+  });
+}
+
+interface PanelProbe {
+  open: boolean;
+  phase: string;
+  stale: boolean;
+  dirty: number;
+  badge: string;
+  bannerShown: boolean;
+  bannerText: string;
+  hintShown: boolean;
+  hintText: string;
+  applyDisabled: boolean;
+  applyText: string;
+  readDisabled: boolean;
+  rowKeys: string[];
+  groups: string[];
+  worker: Record<string, number | boolean>;
+}
+
+function readPanel(page: Page): Promise<PanelProbe> {
+  return page.evaluate((): PanelProbe => {
+    const wrap = document.getElementById('paramsWrap') as HTMLDetailsElement | null;
+    const banner = document.querySelector('#params .pbanner') as HTMLElement | null;
+    const hint = document.querySelector('#params .phint') as HTMLElement | null;
+    const apply = document.getElementById('paramsApply') as HTMLButtonElement | null;
+    const read = document.getElementById('paramsRead') as HTMLButtonElement | null;
+    const p = globalThis.cobalt.params;
+    return {
+      open: wrap?.open ?? false,
+      phase: p.phase,
+      stale: p.stale,
+      dirty: p.dirty,
+      badge: document.getElementById('paramsBadge')?.textContent ?? '',
+      bannerShown: banner !== null && !banner.hidden,
+      bannerText: banner?.textContent ?? '',
+      hintShown: hint !== null && !hint.hidden,
+      hintText: hint?.textContent ?? '',
+      applyDisabled: apply?.disabled ?? true,
+      applyText: apply?.textContent ?? '',
+      readDisabled: read?.disabled ?? true,
+      rowKeys: [...document.querySelectorAll('#params .prow')].map(
+        (r) => (r as HTMLElement).dataset['key'] ?? '',
+      ),
+      groups: [...document.querySelectorAll('#params .pgroup > h4')].map(
+        (h) => h.textContent ?? '',
+      ),
+      worker: p.workerValues as unknown as Record<string, number | boolean>,
+    };
+  });
+}
+
+/**
+ * 지금 고른 씬을 **다시 로드한다.** 로드가 끝나는 것뿐 아니라 **되묻기까지**
+ * 기다린다 — `show()` 는 `finally` 에서 `syncFromWorker()` 와 `refreshParams()`
+ * 를 하고, 그 전에 값을 읽으면 이전 씬의 잔상을 본다 (§10-④ 가 같은 이유로
+ * `syncs` 를 기다린다).
+ */
+async function loadScene(page: Page): Promise<void> {
+  const syncs = await page.evaluate(() => globalThis.cobalt.playback.stats.syncs);
+  await blur(page);
+  await page.click('#load');
+  await page.waitForFunction(
+    (n: number) =>
+      globalThis.cobalt.playback.stats.syncs > n
+      && (document.getElementById('status')?.textContent ?? '').includes('로드 완료'),
+    syncs,
+    { timeout: LOAD_TIMEOUT },
+  );
+  // 패널이 열려 있으면 `refreshParams()` 가 워커에 다시 묻는다. 그 왕복이 끝나야
+  // 화면의 값이 이 씬의 값이다.
+  await page.waitForFunction(
+    () => globalThis.cobalt.params.phase === 'ready' && !globalThis.cobalt.params.stale,
+    null,
+    { timeout: 20_000 },
+  );
+  await sleep(300);
+}
+
+/**
+ * 재생을 켜고 `target` 프레임까지 프레임마다 정점 표본을 남긴 뒤 정지한다.
+ *
+ * ⚠️ `stats.lastApplied` 는 **리셋·재로드로 되돌아가지 않는다**(FrameStream 의
+ *    누적 계측기다). 그래서 시작 전 값을 `stale` 로 들고 있다가 그 번호는 아예
+ *    기록하지 않는다 — 안 그러면 이전 실행의 마지막 프레임(예: 85)이 곧바로
+ *    `>= target` 을 만족해 **한 프레임도 안 돌고 끝난다.** 실제로 그렇게 재다가
+ *    공통 프레임 0개가 나왔다.
+ */
+async function runFrames(page: Page, target: number): Promise<Poses> {
+  const stale = await page.evaluate(() => globalThis.cobalt.stats.lastApplied);
+  await page.evaluate(() => globalThis.cobalt.play(true));
+  const poses = await page.evaluate(
+    ({ target, stride, stale }: { target: number; stride: number; stale: number | null }) =>
+      new Promise<Poses>((resolve, reject) => {
+        const c = globalThis.cobalt;
+        const rec = new Map<number, number[]>();
+        const t0 = Date.now();
+        const sample = (): number[] => {
+          const out: number[] = [];
+          for (const p of c.viewer.cloth.patterns) {
+            const a = p.position.array as Float32Array;
+            for (let i = 0; i + 2 < a.length; i += stride * 3) {
+              out.push(a[i] ?? 0, a[i + 1] ?? 0, a[i + 2] ?? 0);
+            }
+          }
+          return out;
+        };
+        const tick = (): void => {
+          const f = c.stats.lastApplied;
+          if (f !== null && f !== stale) {
+            // 이 순간의 정점이 곧 프레임 f 의 포즈다 — 다음 프레임은 아직 안 왔다.
+            if (!rec.has(f)) rec.set(f, sample());
+            if (f >= target) {
+              resolve([...rec.entries()]);
+              return;
+            }
+          }
+          if (Date.now() - t0 > 90_000) {
+            reject(new Error(`프레임이 흐르지 않습니다 — lastApplied=${String(f)}`));
+            return;
+          }
+          requestAnimationFrame(tick);
+        };
+        tick();
+      }),
+    { target, stride: POSE_STRIDE, stale },
+  );
+  await page.evaluate(() => globalThis.cobalt.play(false));
+  await sleep(400);
+  return poses;
+}
+
+interface PoseDiff {
+  /** 두 실행에 공통으로 있는 프레임 수 */
+  frames: number;
+  /** 공통 프레임 전체의 정점 평균 변위 (cm) */
+  mean: number;
+  max: number;
+  /** 정점이 **하나도 안 다른** 프레임 수 */
+  identical: number;
+  /** 처음으로 갈라진 프레임. 끝까지 같으면 null */
+  firstDiff: number | null;
+}
+
+function poseDiff(a: Poses, b: Poses): PoseDiff {
+  const ma = new Map(a);
+  const mb = new Map(b);
+  const frames = [...ma.keys()].filter((f) => mb.has(f)).sort((x, y) => x - y);
+  let sum = 0;
+  let n = 0;
+  let max = 0;
+  let identical = 0;
+  let firstDiff: number | null = null;
+  for (const f of frames) {
+    const pa = ma.get(f) ?? [];
+    const pb = mb.get(f) ?? [];
+    let same = true;
+    for (let i = 0; i + 2 < Math.min(pa.length, pb.length); i += 3) {
+      const d = Math.hypot(
+        (pa[i] ?? 0) - (pb[i] ?? 0),
+        (pa[i + 1] ?? 0) - (pb[i + 1] ?? 0),
+        (pa[i + 2] ?? 0) - (pb[i + 2] ?? 0),
+      );
+      sum += d;
+      n++;
+      if (d > max) max = d;
+      if (d !== 0) same = false;
+    }
+    if (same) identical++;
+    else if (firstDiff === null) firstDiff = f;
+  }
+  return { frames: frames.length, mean: n === 0 ? Number.NaN : sum / n, max, identical, firstDiff };
+}
+
+function diffText(d: PoseDiff): string {
+  return (
+    `공통 ${d.frames}프레임 · 평균 ${d.mean.toFixed(6)}cm · 최대 ${d.max.toFixed(6)}cm`
+    + ` · 완전히 같은 프레임 ${d.identical}개`
+    + ` · 처음 갈라진 프레임 ${d.firstDiff === null ? '없음' : String(d.firstDiff)}`
+  );
+}
+
+/**
+ * [적용] 을 누른다. **잠겨 있으면 누르지 않고 false 를 돌려준다.**
+ *
+ * `page.click()` 은 비활성 버튼을 30초 기다리다 **던지고**, 그러면 §11 이 통째로
+ * 중단되면서 §8(콘솔)·§9 까지 잃는다 — 실측으로 한 번 그렇게 잃었다. §7 이
+ * `#mode` 가 숨겨졌을 때 절을 접는 것과 같은 판단이다. 잠긴 사실 자체는 부르는
+ * 쪽이 단언한다.
+ */
+async function clickApply(page: Page): Promise<boolean> {
+  const on = await page.evaluate(
+    () => !((document.getElementById('paramsApply') as HTMLButtonElement | null)?.disabled ?? true),
+  );
+  if (!on) return false;
+  await page.click('#paramsApply');
+  return true;
+}
+
+/** 스키마가 정한 사유 문구. **하네스가 문장을 베끼지 않는다** — `params.ts` 가 정본이다 */
+function reasonText(key: ParamKey, ctx: ParamContext): string {
+  const f = paramField(key);
+  return f === null ? '' : (paramDisabledReason(f, ctx)?.text ?? '');
+}
+
+/** 위젯 종류의 계약. 스키마의 `kind` 가 화면에서 무엇이 되어야 하는가 */
+const WIDGET_OF: Readonly<Record<string, string>> = {
+  bool: 'checkbox',
+  enum: 'select',
+  int: 'number',
+  float: 'number',
+};
+
+async function sectionParams(page: Page, sent: SentOp[]): Promise<void> {
+  section('§11. 파라미터 패널 (#16) — 값을 바꾸면 시뮬이 달라진다');
+
+  /**
+   * [적용] 을 누른 자리마다 **무엇이 나가야 하는가**를 적어 둔다. ⑦ 이 실제 WS
+   * 프레임과 하나씩 맞댄다 — "바뀐 것만 보낸다" 를 개수가 아니라 **이름**으로
+   * 보기 위해서다. 개수만 세면 되돌린 값이 다른 값과 바꿔치기돼도 통과한다.
+   */
+  const expectedApplies: { label: string; keys: string[] }[] = [];
+
+  await timed('§11 파라미터', async () => {
+    // ── ① 접혀 있는 동안은 워커에 묻지 않는다 ────────────────
+    //
+    // 접힌 패널을 위해 씬을 로드할 때마다 `status`+`getParams` 를 보내는 것은
+    // 보이지도 않는 화면을 위한 왕복이다. `main.ts` 는 대신 **낡았다고 표시만**
+    // 하고 펼치는 순간 읽는다. 그 판단이 실제로 지켜지는지 본다.
+    {
+      const before = await readPanel(page);
+      check(
+        '★ 파라미터 패널이 화면에 있고 **기본은 접혀 있다** (첫 화면을 가리지 않는다)',
+        (await page.locator('#paramsWrap').count()) === 1 && !before.open,
+        `open=${String(before.open)}`,
+      );
+      check(
+        '★★ 접혀 있는 동안에는 워커에 묻지 않았다 (§1~§10 을 다 지나도 idle 이다 — 안 보이는 화면을 위한 왕복이 없다)',
+        before.phase === 'idle' && before.stale,
+        `phase=${before.phase} · stale=${String(before.stale)}`,
+      );
+
+      // ⚠️ **토글하지 않고 "펼친 상태로 만든다."** 기본값이 열림으로 바뀌면
+      //    무턱대고 누르는 코드는 패널을 **닫아 버리고**, 그 뒤의 절이 전부
+      //    "버튼이 안 보인다"로 무너진다 (실측으로 한 번 그렇게 됐다).
+      //    기본이 접혀 있는지는 위 단언이 이미 따로 지킨다.
+      if (!before.open) await page.click('#paramsWrap > summary');
+      const ready = await page
+        .waitForFunction(() => globalThis.cobalt.params.phase === 'ready', null, { timeout: 20_000 })
+        .then(() => true, () => false);
+      const after = await readPanel(page);
+      check(
+        '★★ 펼치는 순간 워커에서 값을 읽는다 (idle → ready)',
+        ready && after.phase === 'ready' && !after.stale,
+        `phase=${after.phase} · badge "${after.badge}"`,
+      );
+      check(
+        '읽고 나면 배너가 사라진다 (자리채움이라는 경고가 남아 있지 않다)',
+        !after.bannerShown,
+        after.bannerShown ? `"${after.bannerText}"` : '배너 없음',
+      );
+      check(
+        '갓 읽은 직후에는 보낼 것이 없다 ([적용] 이 잠겨 있다)',
+        after.dirty === 0 && after.applyDisabled,
+        `dirty=${after.dirty} · "${after.applyText.trim()}"`,
+      );
+    }
+
+    // ── ② 스키마가 그대로 화면이 된다 ────────────────────────
+    //
+    // 손으로 22개를 적은 화면이면 "스키마에는 있는데 화면에 없는 필드" 가
+    // 생길 수 있다. 목록을 맞대어 그것이 불가능함을 확인한다.
+    {
+      const panel = await readPanel(page);
+      const rows = await readParamRows(page);
+      const want = PARAM_FIELDS.map((f) => String(f.key));
+      check(
+        `★★ 스키마의 필드 ${want.length}개가 그대로 화면의 행이다 (빠진 것도 남는 것도 없다)`,
+        panel.rowKeys.join(',') === want.join(','),
+        `화면 ${panel.rowKeys.length}행 / 스키마 ${want.length}개`,
+      );
+      check(
+        '그룹 헤더가 스키마의 그룹·순서와 같다',
+        panel.groups.join(',') === paramGroups().map((g) => g.label).join(','),
+        `[${panel.groups.join(' · ')}]`,
+      );
+
+      const wrongWidget = PARAM_FIELDS.filter(
+        (f) => rows[String(f.key)]?.widget !== WIDGET_OF[f.kind],
+      ).map((f) => `${String(f.key)}:${rows[String(f.key)]?.widget ?? '없음'}≠${WIDGET_OF[f.kind]}`);
+      check(
+        '★ 위젯 종류가 스키마의 kind 와 맞는다 (bool→체크박스 · enum→콤보 · 숫자→number)',
+        wrongWidget.length === 0,
+        wrongWidget.join(', ') || `${PARAM_FIELDS.length}개 일치`,
+      );
+
+      // 열거형 라벨은 **코드 근거가 있는 값**이다(`MainGUI.cpp` 의 배열 +
+      // `zsSimulation.h` 의 enum). 한 칸이라도 밀리면 사용자가 고른 것과 다른
+      // 솔버가 걸린다 — 화면만 봐서는 절대 안 보이는 종류의 실패다.
+      const badEnum = PARAM_FIELDS.filter((f) => f.kind === 'enum').filter((f) => {
+        const got = rows[String(f.key)]?.options ?? [];
+        const wantOpts = f.options ?? [];
+        return (
+          got.length !== wantOpts.length
+          || wantOpts.some((o, i) => got[i]?.value !== String(o.value) || got[i]?.label !== o.label)
+        );
+      }).map((f) => String(f.key));
+      check(
+        '★★ 콤보의 선택지가 스키마의 값·라벨·순서와 정확히 같다 (한 칸 밀리면 다른 솔버가 걸린다)',
+        badEnum.length === 0,
+        badEnum.join(', ') || '적분기 3 · 전처리기 3 · 커플링 5×2',
+      );
+
+      // 슬라이더는 **범위와 스텝이 다 있을 때만** 만든다. `solverTolerance` 는
+      // 1e-10..1 이라 선형 슬라이더로 훑는 것이 무의미하다(스키마의 판단).
+      const wantSlider = PARAM_FIELDS.filter(
+        (f) => f.kind !== 'bool' && f.kind !== 'enum' && f.step !== null && f.min !== null && f.max !== null,
+      ).map((f) => String(f.key));
+      const gotSlider = Object.entries(rows).filter(([, r]) => r.hasSlider).map(([k]) => k);
+      check(
+        '★ 슬라이더는 범위·스텝이 다 있는 숫자 필드에만 붙는다 (허용 오차 1e-10..1 은 숫자 입력이다)',
+        gotSlider.sort().join(',') === wantSlider.sort().join(','),
+        `슬라이더 ${gotSlider.length}개 · 없는 것 [${PARAM_FIELDS.filter((f) => !gotSlider.includes(String(f.key)) && f.kind !== 'bool' && f.kind !== 'enum').map((f) => String(f.key)).join(',')}]`,
+      );
+
+      const noHelp = PARAM_FIELDS.filter((f) => (rows[String(f.key)]?.helpText ?? '') !== f.description);
+      check(
+        '모든 행에 스키마의 설명이 글자로 붙어 있다',
+        noHelp.length === 0,
+        noHelp.map((f) => String(f.key)).join(', ') || `${PARAM_FIELDS.length}개`,
+      );
+    }
+
+    // ── ③ 비활성에는 **이유가 화면에 글자로** 남는다 ─────────
+    //
+    // ★ 이 절이 §11 의 두 번째 이유다. 회색으로만 만들고 이유를 안 적으면
+    //   그게 #14 가 없애려던 거짓말이고, `title`(툴팁)에만 넣는 것은 "보인다"
+    //   가 아니다 — 마우스를 올려야 보이는 것은 화면에 없는 것과 같다.
+    //
+    // 문구를 하네스에 베껴 넣지 않는다. 스키마(`params.ts`)가 정본이고 여기서는
+    // **그 문자열이 화면에 있는지**만 본다. 그래서 문장이 바뀌어도 안 깨진다.
+    {
+      // ⚠️ §10 이 마지막에 씬을 다시 로드하므로 **지금은 시뮬이 초기화 전이다**
+      //    (워커의 `load` 가 `simInitialized` 를 false 로 되돌린다 — 실측).
+      //    적분기 잠금은 상태를 만들어야 보이므로 아래에서 따로 다룬다.
+      const st = await page.evaluate(() => globalThis.cobalt.client.status());
+      check(
+        '전제 — 지금은 시뮬이 초기화 전이다 (§10 이 마지막에 재로드했다)',
+        !st.simInitialized,
+        `simInitialized=${String(st.simInitialized)}`,
+      );
+      const ctx: ParamContext = { values: { useWind: false }, simInitialized: st.simInitialized };
+      const rows = await readParamRows(page);
+
+      // (a) 어느 필드에 어느 종류의 사유가 붙는가 — **계약**
+      const cases: [ParamKey, string][] = [
+        ['subStep', '엔진 미지원'],
+        ['meshingEdgeLength', '엔진 미지원'],
+        ['windMagnitude', '종속 미충족'],
+      ];
+      for (const [key, kind] of cases) {
+        const r = rows[String(key)];
+        const want = reasonText(key, ctx);
+        check(
+          `★★ ${key} (${kind}) — 위젯이 잠기고 **이유가 화면 글자로** 있다`,
+          r !== undefined && r.disabled && r.whyShown && r.whyText.includes(want),
+          r === undefined ? '행이 없다' : `disabled=${String(r.disabled)} · 보임=${String(r.whyShown)} · "${r.whyText}"`,
+        );
+        check(
+          `★★★ ${key} — 그 이유가 **title 이 아니라 화면에 렌더된 글자**다 (마우스를 올려야 보이는 건 보이는 게 아니다)`,
+          r !== undefined && want.length > 8 && r.visibleText.includes(want),
+          r === undefined ? '행이 없다' : `innerText 안에 있음=${String(r.visibleText.includes(want))} · title="${r.title.slice(0, 24)}…"`,
+        );
+      }
+      // 슬라이더가 있는 죽은 필드는 슬라이더까지 잠겨야 한다 — 숫자 칸만 잠그면
+      // 슬라이더로 값을 바꿀 수 있게 된다.
+      const dead = rows['meshingEdgeLength'];
+      check(
+        '★ 죽은 필드는 슬라이더까지 잠긴다 (숫자 칸만 잠그면 옆의 슬라이더로 만질 수 있다)',
+        dead?.sliderDisabled === true,
+        `slider disabled=${String(dead?.sliderDisabled)}`,
+      );
+
+      // (b) 죽은 것과 조건부는 **배지로도** 갈린다
+      check(
+        '★ 죽은 필드 2개에 "엔진 미지원" 배지가 붙어 있다',
+        ['subStep', 'meshingEdgeLength'].every((k) => (rows[k]?.badges ?? []).includes('엔진 미지원')),
+        `subStep [${(rows['subStep']?.badges ?? []).join('|')}] · meshingEdgeLength [${(rows['meshingEdgeLength']?.badges ?? []).join('|')}]`,
+      );
+      check(
+        '★★ 조건부 2개(바닥면·바닥 마찰)는 **끄지 않고** 배지와 근거만 붙인다 (조건을 프런트가 알 수 없다 — 모르면서 끄면 만질 수 있는 걸 못 만지게 된다)',
+        ['groundPlane', 'groundFriction'].every((k) => {
+          const r = rows[k];
+          return r !== undefined && !r.disabled && r.badges.includes('조건부') && !r.whyShown;
+        }),
+        ['groundPlane', 'groundFriction'].map((k) => `${k}: 잠김=${String(rows[k]?.disabled)} 배지[${(rows[k]?.badges ?? []).join('|')}]`).join(' · '),
+      );
+      const noteMissing = PARAM_FIELDS.filter((f) => f.note !== null)
+        .filter((f) => !(rows[String(f.key)]?.visibleText ?? '').includes(f.note ?? ''))
+        .map((f) => String(f.key));
+      check(
+        '★ 실측 단서(note)가 있는 필드는 그 단서가 화면 글자로 보인다 ("이 씬에서 미검증 — 9.27cm 떠 있다"가 여기 있다)',
+        noteMissing.length === 0,
+        noteMissing.join(', ') || `${PARAM_FIELDS.filter((f) => f.note !== null).length}개`,
+      );
+
+      // (c) ★ 대조군 — 전부 회색으로 만드는 구현이 아니다
+      const shouldBeFree = PARAM_FIELDS.filter(
+        (f) => !cases.some(([k]) => k === f.key),
+      ).map((f) => String(f.key));
+      const wronglyOff = shouldBeFree.filter((k) => {
+        const r = rows[k];
+        return r === undefined || r.disabled || r.whyShown;
+      });
+      check(
+        `★★ 대조군 — 나머지 ${shouldBeFree.length}개는 전부 열려 있고 사유가 없다 (모두 잠그는 구현이면 위 판정이 무의미하다)`,
+        wronglyOff.length === 0,
+        wronglyOff.join(', ') || `${shouldBeFree.length}개 활성`,
+      );
+
+    }
+
+    // ── ③-b 🔒 잠금이 **워커의 전이를 따라간다** ──────────────
+    //
+    // 위 셋과 달리 이 사유는 워커의 `status.simInitialized` 에서만 온다. 그리고
+    // 그 값은 **정적이 아니다.** [실측] load false · start **true** · pause
+    // true(유지) · reset **false** · clear false.
+    //
+    // ★ 그래서 잠기는 것만 보면 절반이다. **리셋에서 풀리는 것까지** 봐야 한다 —
+    //   잠기고 안 풀리면 반대 방향의 거짓말이고, 그건 잠금을 아예 안 하는 것만큼
+    //   나쁘다(만질 수 있는 것을 못 만지게 만든다).
+    //
+    // ── ★ 그리고 잠그는 것만으로는 결함이 한 칸 뒤로 밀릴 뿐이다 ──
+    //
+    // 재생 **전에** 적분기를 바꿔 뒀다면 위젯이 회색이 되어도 `#pending` 에 값이
+    // 남아 `dirty` 가 서 있고, [적용] 이 그 값을 워커로 보낸다. `params.ts` 가
+    // "잠긴 필드도 보낸다" 고 정한 근거가 **"화면이 못 만들게 막은 값은 애초에
+    // 이 맵에 들어오지 않는다"** 인데, 그 전제를 화면이 안 지키면 스키마의 판단이
+    // 통째로 무너진다. 그래서 **되돌리는지**까지 여기서 본다.
+    //
+    // ⚠️ **대조군을 같이 안 보면 "전부 되돌린다" 는 구현이 통과한다.** 되돌려야
+    //    하는 것은 `simInitialized` 로 잠긴 것뿐이고, **`dependency` 로 잠긴
+    //    `windMagnitude` 는 되돌리면 안 된다**(스키마가 "빼면 바람을 켠 순간 옛
+    //    세기가 살아난다" 고 명시했다). 둘 다 "회색인데 편집이 남아 있는" 같은
+    //    모양이라, 원인을 안 보고 잠긴 것을 전부 쓸어 담으면 대조군이 무너진다.
+    {
+      const lockCtx: ParamContext = { values: {}, simInitialized: true };
+      const lockText = reasonText('solverType', lockCtx);
+      const enter = await readParamRows(page);
+      const enterPanel = await readPanel(page);
+      check(
+        '전제 — 로드 직후라 적분기가 열려 있고 보낼 변경이 없다',
+        enter['solverType']?.disabled === false && enterPanel.dirty === 0,
+        `solverType 잠김=${String(enter['solverType']?.disabled)} · dirty=${enterPanel.dirty}`,
+      );
+
+      // ① 대조군을 만든다 — **종속으로 잠긴 채 편집이 남아 있는 필드.**
+      //    바람을 켜서 세기를 만진 뒤 다시 끄면, 세기는 회색인데 `#pending` 에는
+      //    77 이 남는다. 잠긴 원인이 `dependency` 라 되돌아오면 안 되는 값이다.
+      await page.check('#p-useWind');
+      await page.locator('#params .prow[data-key="windMagnitude"] input[type="number"]').fill('77');
+      await page.keyboard.press('Tab');
+      await page.uncheck('#p-useWind');
+      const armed = await readParamRows(page);
+      const armedPanel = await readPanel(page);
+      check(
+        '전제(대조군) — 종속으로 잠긴 바람 세기에 **아직 안 보낸 편집**이 남아 있다',
+        armed['windMagnitude']?.disabled === true && armed['windMagnitude'].value === '77'
+        && armedPanel.dirty === 1,
+        `windMagnitude 잠김=${String(armed['windMagnitude']?.disabled)} 값=${armed['windMagnitude']?.value ?? '-'} · dirty=${armedPanel.dirty}`,
+      );
+
+      // ② 재생 전에 적분기를 바꿔 둔다 — 이 값이 워커로 나가면 안 된다.
+      const wasSolver = String(enterPanel.worker['solverType']);
+      const other = (paramField('solverType')?.options ?? [])
+        .map((o) => String(o.value)).find((v) => v !== wasSolver) ?? '1';
+      await page.selectOption('#p-solverType', other);
+      const edited = await readParamRows(page);
+      const editedPanel = await readPanel(page);
+      check(
+        '전제 — 재생 전에는 적분기를 만질 수 있고 그 편집이 화면에 남는다',
+        edited['solverType']?.disabled === false && edited['solverType'].value === other
+        && editedPanel.dirty === 2,
+        `solverType ${wasSolver} → ${edited['solverType']?.value ?? '-'} · dirty=${editedPanel.dirty}`,
+      );
+
+      // ③ [▶ 재생] — **아무 것도 대신 눌러 주지 않는다.** 예전에는 [워커에서
+      //    읽기] 를 눌러야 잠겼고, 그것이 결함이었다.
+      await ensurePlaying(page, true);
+      const gotLocked = await page
+        .waitForFunction(
+          () => (document.getElementById('p-solverType') as HTMLSelectElement | null)?.disabled === true,
+          null,
+          { timeout: 20_000 },
+        )
+        .then(() => true, () => false);
+      const said = await page.evaluate(() => ({
+        status: document.getElementById('status')?.textContent ?? '',
+        log: (document.getElementById('log')?.textContent ?? '').split('\n').slice(-12).join(' | '),
+      }));
+      const playing = await readParamRows(page);
+      const playingPanel = await readPanel(page);
+      const ran = await page.evaluate(() => globalThis.cobalt.client.status());
+      check(
+        '전제 — 재생하면 워커의 시뮬이 초기화 상태가 된다',
+        ran.simInitialized,
+        `simInitialized=${String(ran.simInitialized)}`,
+      );
+      check(
+        '★★★★ [▶ 재생] 하나로 적분기가 잠긴다 — 아무 버튼도 대신 누르지 않았다 (예전에는 [워커에서 읽기] 를 눌러야 잠겼고 그게 결함이었다)',
+        gotLocked && playing['solverType']?.disabled === true,
+        `잠김=${String(playing['solverType']?.disabled)} · ${gotLocked ? '재생 직후' : '20초 안에 안 잠김'}`,
+      );
+      check(
+        '★★ 그 이유가 화면 글자로 뜬다 (title 이 아니다)',
+        playing['solverType']?.whyShown === true
+        && (playing['solverType'].whyText.includes(lockText))
+        && playing['solverType'].visibleText.includes(lockText),
+        `"${playing['solverType']?.whyText ?? ''}"`,
+      );
+      check(
+        '★★★★ 잠긴 필드의 **아직 안 보낸 편집이 워커 값으로 되돌아온다** (회색인데 [적용] 이 그 값을 보내면 잠금이 결함을 한 칸 미룬 것에 지나지 않는다)',
+        playing['solverType']?.value === wasSolver && playingPanel.dirty === 1,
+        `solverType ${other} → ${playing['solverType']?.value ?? '-'} (워커 ${wasSolver}) · dirty ${editedPanel.dirty} → ${playingPanel.dirty}`,
+      );
+      check(
+        '★★★ 되돌린 사실을 화면이 말한다 (사용자가 맞춰 둔 값이 조용히 사라지면 그게 또 하나의 거짓말이다)',
+        said.status.includes('되돌') || said.log.includes('되돌'),
+        `상태줄 "${said.status}"`,
+      );
+      check(
+        '★★★★ 대조군 — **종속으로** 잠긴 바람 세기의 편집은 되돌리지 않는다 (되돌리면 바람을 켠 순간 옛 세기가 살아난다 — 잠긴 것을 전부 쓸어 담는 구현을 여기서 가른다)',
+        playing['windMagnitude']?.value === '77' && playing['windMagnitude'].disabled === true,
+        `windMagnitude=${playing['windMagnitude']?.value ?? '-'} (잠김=${String(playing['windMagnitude']?.disabled)})`,
+      );
+
+      // ④ ★ 폴링이 생기지 않았는가 — **프레임이 흐르는 동안 왕복이 없어야 한다.**
+      //    잠금을 되묻는 코드가 `paintPlayback` 에 붙었는데, 그 함수는 프레임
+      //    경로에서도 불린다. 조건을 잘못 잡으면 40/s 마다 `status` 왕복이 하나씩
+      //    생기고, 그건 새 결함이다. 선 위에서 직접 센다.
+      const statusBefore = sent.filter((s) => s.op === 'status').length;
+      const appliedBefore = (await readStats(page)).applied;
+      await sleep(3_000);
+      const statusAfter = sent.filter((s) => s.op === 'status').length;
+      const appliedAfter = (await readStats(page)).applied;
+      const frames = appliedAfter - appliedBefore;
+      check(
+        '전제 — 그 3초 동안 프레임이 실제로 흘렀다 (아무 일도 없는 구간을 잰 것이 아니다)',
+        frames >= 20,
+        `프레임 ${frames}건`,
+      );
+      check(
+        '★★★★ 재생 중에 status 왕복이 늘지 않는다 (잠금 되묻기가 프레임 경로로 새면 40/s 마다 왕복이 하나씩 생긴다)',
+        statusAfter - statusBefore === 0,
+        `3초 · 프레임 ${frames}건 · status op ${statusAfter - statusBefore}건`,
+      );
+
+      // ⑤ [⏸ 정지] — 시뮬은 여전히 초기화된 상태다. 잠금이 풀리면 안 된다.
+      await ensurePlaying(page, false);
+      await sleep(500);
+      const paused = await readParamRows(page);
+      const pausedStatus = await page.evaluate(() => globalThis.cobalt.client.status());
+      check(
+        '★★ [⏸ 정지] 해도 잠금은 유지된다 (시뮬은 여전히 초기화 상태다 — 워커가 그렇게 답한다)',
+        paused['solverType']?.disabled === true && pausedStatus.simInitialized,
+        `잠김=${String(paused['solverType']?.disabled)} · simInitialized=${String(pausedStatus.simInitialized)}`,
+      );
+
+      // ⑥ [적용] — 되돌린 값이 **선 위에** 없는지는 ⑦ 이 프레임을 열어 본다.
+      const pressed = await clickApply(page);
+      if (pressed) {
+        await page
+          .waitForFunction(() => globalThis.cobalt.params.dirty === 0, null, { timeout: 30_000 })
+          .then(() => true, () => false);
+      }
+      expectedApplies.push({ label: '잠금 뒤 적용 (되돌린 적분기는 빠진다)', keys: ['windMagnitude'] });
+      const sentPanel = await readPanel(page);
+      check(
+        '★★ 되돌린 뒤 남은 것만 보내진다 (바람 세기 1건 — 적분기는 보낼 것이 없다)',
+        pressed && sentPanel.dirty === 0 && sentPanel.worker['windMagnitude'] === 77,
+        `눌림=${String(pressed)} · dirty=${sentPanel.dirty} · 워커 windMagnitude=${String(sentPanel.worker['windMagnitude'])}`,
+      );
+
+      // ⑦ [↺ 리셋] — **풀리는 방향.** 워커가 `simInitialized` 를 false 로 되돌린다.
+      await blur(page);
+      await page.click('#reset');
+      const unlocked = await page
+        .waitForFunction(
+          () => (document.getElementById('p-solverType') as HTMLSelectElement | null)?.disabled === false,
+          null,
+          { timeout: 20_000 },
+        )
+        .then(() => true, () => false);
+      const afterReset = await readParamRows(page);
+      const resetStatus = await page.evaluate(() => globalThis.cobalt.client.status());
+      check(
+        '★★★★ [↺ 리셋] 하면 잠금이 **풀린다** (잠기고 안 풀리면 반대 방향의 거짓말이다 — 만질 수 있는 것을 못 만지게 만든다)',
+        unlocked && afterReset['solverType']?.disabled === false
+        && !afterReset['solverType'].whyShown,
+        `잠김=${String(afterReset['solverType']?.disabled)} · 사유 보임=${String(afterReset['solverType']?.whyShown)}`,
+      );
+      check(
+        '★★ 그리고 그것이 워커의 사실과 같다 (화면이 혼자 판단한 것이 아니다)',
+        !resetStatus.simInitialized,
+        `워커 simInitialized=${String(resetStatus.simInitialized)}`,
+      );
+    }
+
+    // ── ④ 종속이 **그 자리에서** 풀린다 ──────────────────────
+    //
+    // 배선 검증이다. `disabledParams()` 를 편집할 때마다 다시 돌리지 않으면
+    // 바람을 켜도 세기가 회색인 채로 남는다 — 사용자는 무엇을 더 해야 하는지
+    // 알 수 없고, 워커 왕복 한 번 없이 화면 안에서 끝나야 하는 일이다.
+    {
+      const before = (await readParamRows(page))['windMagnitude'];
+      await page.check('#p-useWind');
+      const on = (await readParamRows(page))['windMagnitude'];
+      check(
+        '★★★ [바람 사용] 을 켜면 **그 자리에서** 바람 세기의 잠금이 풀리고 사유가 사라진다 (워커 왕복 없이)',
+        before?.disabled === true && on?.disabled === false && !on.whyShown,
+        `잠김 ${String(before?.disabled)} → ${String(on?.disabled)} · 사유 보임 ${String(before?.whyShown)} → ${String(on?.whyShown)}`,
+      );
+      await page.uncheck('#p-useWind');
+      const off = (await readParamRows(page))['windMagnitude'];
+      check(
+        '★ 다시 끄면 도로 잠기고 이유가 돌아온다 (한 방향만 되는 구현이 아니다)',
+        off?.disabled === true && off.whyShown,
+        `잠김=${String(off?.disabled)} · "${off?.whyText ?? ''}"`,
+      );
+      const panel = await readPanel(page);
+      check(
+        '체크박스를 원래대로 돌려놓으면 보낼 변경도 없어진다',
+        panel.dirty === 0,
+        `dirty=${panel.dirty}`,
+      );
+    }
+
+    // ── ④-b 값을 고쳤으면 **고쳤다고 화면이 말한다** ─────────
+    //
+    // `coerceParamValue` 가 사용자 입력을 조용히 바꾸는 것이 가장 나쁜 거짓말이
+    // 될 수 있는 자리다. 스모크 §11-4 가 그 함수의 `reason` 을 22×적대적 입력으로
+    // 덮지만, **그 문자열이 화면에 뜨는가**는 여기서만 보인다.
+    // 사유가 둘 겹치는 입력을 쓴다(반올림 + 클램프) — 하나만 남기면 사용자가
+    // 넣은 소수가 어디로 갔는지 화면 어디에도 안 남는다.
+    {
+      await page.locator('#params .prow[data-key="nonlinearIterations"] input[type="number"]').fill('400.6');
+      await page.keyboard.press('Tab');
+      const r = (await readParamRows(page))['nonlinearIterations'];
+      const fixed = await page.evaluate(() => {
+        const el = document.querySelector('.prow[data-key="nonlinearIterations"] .pfix') as HTMLElement | null;
+        return { hidden: el?.hidden ?? true, text: el?.textContent ?? '' };
+      });
+      check(
+        '★★ 범위 밖 입력은 화면에서 곧바로 고쳐지고 **무엇을 어떻게 고쳤는지 글자로** 남는다 (반올림·클램프 두 사유가 다 남는다)',
+        r?.value === '200' && !fixed.hidden
+        && fixed.text.includes('반올림') && fixed.text.includes('200'),
+        `400.6 → ${r?.value ?? '-'} · "${fixed.text}"`,
+      );
+      check(
+        '★ 그 글자도 title 이 아니라 화면에 렌더돼 있다',
+        r !== undefined && fixed.text.length > 0 && r.visibleText.includes(fixed.text),
+        `innerText 안에 있음=${String(r?.visibleText.includes(fixed.text))}`,
+      );
+      await page.click('#paramsRead');
+      await page.waitForFunction(() => globalThis.cobalt.params.dirty === 0, null, { timeout: 20_000 });
+    }
+
+    // ── ⑤ 값의 출처가 워커다 ────────────────────────────────
+    //
+    // **씬마다 값이 다르다**는 것이 이 판정의 이빨이다. `timeStep` 의 자리채움은
+    // 45(=`W_Bra top & Leggings.zls` 의 실측치)이므로, 자리채움을 그리는
+    // 구현이라도 이 씬에서는 45 가 나와 통과한다. `sample.zls` 는 30 이다 —
+    // **씬을 바꿔야만** 자리채움과 워커의 값이 갈린다.
+    {
+      const live = await page.evaluate(() => globalThis.cobalt.client.getParams());
+      const rows = await readParamRows(page);
+      const off = PARAM_FIELDS.filter((f) => {
+        const r = rows[String(f.key)];
+        if (r === undefined) return true;
+        const w = (live as unknown as Record<string, unknown>)[String(f.key)];
+        return f.kind === 'bool' ? r.value !== String(w) : Number(r.value) !== Number(w);
+      }).map((f) => String(f.key));
+      check(
+        '★★ 화면의 22개 값이 **지금 워커에 물어본 값**과 하나도 다르지 않다 (패널의 믿음이 아니라 독립적인 왕복으로 확인한다)',
+        off.length === 0,
+        off.join(', ') || `${PARAM_FIELDS.length}개 일치`,
+      );
+
+      const scenes = await page.evaluate(() =>
+        [...document.querySelectorAll('#scene option')].map((o) => ({
+          value: (o as HTMLOptionElement).value,
+          text: o.textContent ?? '',
+        })),
+      );
+      const here = await page.evaluate(() => (document.getElementById('scene') as HTMLSelectElement).value);
+      const other = scenes.find((s) => s.value !== here && s.value !== '');
+      if (other === undefined) {
+        note('씬 전환 판정', '씬이 하나뿐이라 건너뛴다 — 자리채움과 워커 값이 갈리려면 씬이 둘 이상이어야 한다');
+      } else {
+        const fallback = paramField('timeStep')?.fallback;
+        const hereValue = rows['timeStep']?.value ?? '';
+        await page.selectOption('#scene', other.value);
+        await loadScene(page);
+        const swapped = await readParamRows(page);
+        const shown = Number(swapped['timeStep']?.value ?? Number.NaN);
+        const worker = (await page.evaluate(() => globalThis.cobalt.client.getParams())).timeStep;
+        check(
+          '★★★ 씬을 바꾸면 화면의 값이 **그 씬의 워커 값**으로 갈아 끼워진다 (자리채움을 씬의 값인 척 보여주지 않는다)',
+          shown === Number(worker) && shown !== Number(fallback),
+          `${other.text.split(' ')[0] ?? ''} timeStep — 화면 ${shown} · 워커 ${String(worker)} · 자리채움 ${String(fallback)}`,
+        );
+        // 새로 로드한 씬은 아직 시뮬이 초기화되지 않았다 → 적분기 잠금이 풀린다.
+        // ③ 의 잠금 판정이 "항상 잠긴 위젯" 을 본 것이 아님을 여기서 확인한다.
+        const st = await page.evaluate(() => globalThis.cobalt.client.status());
+        check(
+          '★★ 대조군 — 갓 로드한 씬은 시뮬이 초기화 전이라 **적분기 잠금이 풀린다** (③ 의 🔒 는 항상 잠긴 위젯이 아니다)',
+          !st.simInitialized && swapped['solverType']?.disabled === false && !swapped['solverType'].whyShown,
+          `simInitialized=${String(st.simInitialized)} · solverType 잠김=${String(swapped['solverType']?.disabled)}`,
+        );
+        await page.selectOption('#scene', here);
+        await loadScene(page);
+        const back = await readParamRows(page);
+        check(
+          '★ 원래 씬으로 돌아오면 값도 원래대로 돌아온다 (한 방향만 따라가는 구현이 아니다)',
+          back['timeStep']?.value === hereValue && hereValue !== String(shown),
+          `timeStep ${hereValue} → ${shown} → ${back['timeStep']?.value ?? '-'}`,
+        );
+      }
+    }
+
+    // ── ⑥ ★★★ 통과 기준 — 슬라이더가 시뮬을 바꾼다 ──────────
+    let sliderApplied = 0;
+    {
+      // A. 방금 로드한 상태 그대로 60프레임
+      const A = await runFrames(page, RUN_FRAMES);
+      note('기준선 A', `${A.length}프레임 · 프레임마다 정점 표본 ${(A[0]?.[1].length ?? 0) / 3}개`);
+
+      // B. 다시 로드해서 **같은 파라미터로** 한 번 더 — 이 측정에 이빨이 있는가
+      await loadScene(page);
+      const B = await runFrames(page, RUN_FRAMES);
+      const ctrl = poseDiff(A, B);
+      check(
+        '★★★ 대조군 — 같은 파라미터로 다시 돌리면 정점이 **비트 단위로** 같다 (그래서 아래 판정에 지터 여유가 필요 없다)',
+        ctrl.frames > RUN_FRAMES / 2 && ctrl.max === 0,
+        diffText(ctrl),
+      );
+
+      // C. 다시 로드하고 **슬라이더로** 드레이핑 시간을 끝까지 민다
+      await loadScene(page);
+      const fresh = await readParamRows(page);
+      const slider = page.locator('#params .prow[data-key="drapingTime"] input[type="range"]');
+      await slider.focus();
+      // End = 최댓값. 진짜 키 입력이라 `input` 이벤트가 위젯에서 그대로 난다.
+      await page.keyboard.press('End');
+      const slid = await readParamRows(page);
+      const panelAfterSlide = await readPanel(page);
+      check(
+        '★★ 슬라이더를 움직이면 옆의 숫자 칸이 따라온다 (한 값을 가리키는 두 위젯이 갈라지지 않는다)',
+        slid['drapingTime']?.value === slid['drapingTime']?.sliderValue
+        && slid['drapingTime']?.value !== fresh['drapingTime']?.value,
+        `${fresh['drapingTime']?.value ?? '-'} → 숫자 ${slid['drapingTime']?.value ?? '-'} / 슬라이더 ${slid['drapingTime']?.sliderValue ?? '-'}`,
+      );
+      check(
+        '★ 아직 보내기 전이라는 것이 화면에 있다 ([적용 (1)] 이 열리고 변경 수가 뜬다)',
+        panelAfterSlide.dirty === 1 && !panelAfterSlide.applyDisabled
+        && panelAfterSlide.applyText.includes('1'),
+        `dirty=${panelAfterSlide.dirty} · "${panelAfterSlide.applyText.trim()}" · badge "${panelAfterSlide.badge}"`,
+      );
+
+      const pressed = await clickApply(page);
+      const settled = pressed && await page
+        .waitForFunction(
+          () => globalThis.cobalt.params.dirty === 0 && globalThis.cobalt.params.phase === 'ready',
+          null,
+          { timeout: 30_000 },
+        )
+        .then(() => true, () => false);
+      expectedApplies.push({ label: '슬라이더로 바꾼 드레이핑 시간', keys: ['drapingTime'] });
+      const applied = await readPanel(page);
+      const appliedRows = await readParamRows(page);
+      const wantValue = Number(slid['drapingTime']?.value ?? Number.NaN);
+      check(
+        '★★ [적용] 뒤 화면이 **워커에서 되읽은 값**으로 덮인다 (#14 의 규칙 — 믿음이 아니라 사실을 보여준다)',
+        settled && applied.worker['drapingTime'] === wantValue
+        && Number(appliedRows['drapingTime']?.value ?? Number.NaN) === wantValue,
+        `보냄 ${wantValue} · 워커 ${String(applied.worker['drapingTime'])} · 화면 ${appliedRows['drapingTime']?.value ?? '-'}`,
+      );
+      sliderApplied = wantValue;
+
+      const C = await runFrames(page, RUN_FRAMES);
+      const eff = poseDiff(A, C);
+      check(
+        '★★★★ #16 의 통과 기준 — **슬라이더로 바꾼 값이 시뮬을 실제로 바꾼다** (대조군이 0cm 인 같은 측정에서 정점이 움직였다)',
+        eff.frames > RUN_FRAMES / 2 && eff.max > 0 && eff.mean > 0.1,
+        diffText(eff),
+      );
+      check(
+        '★★ 그 변화가 물리적으로 말이 된다 — 초기 몇 프레임은 **그대로 같다가** 도중에 갈라진다 (전 프레임이 어긋나면 씬이나 초기 포즈가 달라진 것이다)',
+        eff.identical > 0 && eff.firstDiff !== null && eff.firstDiff > 0,
+        `프레임 0..${(eff.firstDiff ?? 1) - 1} 은 정점까지 같고 ${String(eff.firstDiff)} 부터 갈라진다`
+        + ` (드레이핑 0.4초 × 45Hz ≈ 18프레임)`,
+      );
+
+      // D. 체크박스도 같은 길을 지나는가. `useIEQS` 는 ISSUE-014 전수 측정에서
+      //    영향이 가장 컸던 필드다(평균 5.51cm).
+      await loadScene(page);
+      await page.check('#p-useIEQS');
+      if (await clickApply(page)) {
+        await page
+          .waitForFunction(() => globalThis.cobalt.params.dirty === 0, null, { timeout: 30_000 })
+          .then(() => true, () => false);
+      }
+      expectedApplies.push({ label: '체크박스로 켠 준정적', keys: ['useIEQS'] });
+      const afterCheck = await readPanel(page);
+      check(
+        '★ 체크박스도 워커에 걸린다 (준정적 false → true)',
+        afterCheck.worker['useIEQS'] === true,
+        `워커 useIEQS=${String(afterCheck.worker['useIEQS'])}`,
+      );
+      const D = await runFrames(page, RUN_FRAMES);
+      const eff2 = poseDiff(A, D);
+      check(
+        '★★★ 체크박스 하나로도 시뮬이 달라진다 (준정적 — ISSUE-014 전수 측정에서 영향이 가장 컸던 필드)',
+        eff2.max > 0 && eff2.mean > 0.1,
+        diffText(eff2),
+      );
+      note(
+        '두 실험의 크기',
+        `드레이핑 시간 0.4→${sliderApplied}: 평균 ${eff.mean.toFixed(2)}cm · 준정적 off→on: 평균 ${eff2.mean.toFixed(2)}cm`
+        + ` (ISSUE-014 의 100프레임 실측은 각각 4.94cm · 5.51cm — 여기서는 ${RUN_FRAMES}프레임이다)`,
+      );
+    }
+
+    // ── ⑦ 죽은 필드가 **선 위에** 없다 ───────────────────────
+    //
+    // 스모크 §11-6 은 `buildSetParamsPayload` 가 죽은 필드를 빼는 것까지 본다.
+    // 여기서 보는 것은 **화면이 그 함수를 실제로 지나는가**다. 위젯 상태 맵을
+    // `client.setParams()` 로 곧바로 넘기는 구현이면 스모크는 전부 초록이고
+    // 죽은 필드는 조용히 워커로 나간다.
+    {
+      const setOps = sent.filter((s) => s.op === 'setParams');
+      const payloads = setOps.map((s) => s.params ?? {});
+      check(
+        '전제 — 이 절에서 setParams 가 실제로 선을 지났다',
+        setOps.length >= 3,
+        `${setOps.length}건 · 키 ${payloads.map((p) => `{${Object.keys(p).join(',')}}`).join(' / ')}`,
+      );
+      const keys = payloads.flatMap((p) => Object.keys(p));
+      const deadKeys = PARAM_FIELDS.filter((f) => f.effect === 'dead').map((f) => String(f.key));
+      check(
+        '★★★ 죽은 필드가 **워커로 나간 어떤 프레임에도** 없다 (워커는 받으면 "적용됨" 이라 답하고 물리는 그 값을 보지 않는다)',
+        deadKeys.every((k) => !sent.some((s) => s.raw.includes(`"${k}"`))),
+        `찾은 것: [${deadKeys.filter((k) => sent.some((s) => s.raw.includes(`"${k}"`))).join(', ')}] / 전체 프레임 ${sent.length}건`,
+      );
+
+      // ★★ 잠긴 뒤 **되돌린** 값이 선에 없는가. ③-b 가 화면에서 되돌아온 것을
+      //    봤고, 여기서는 그것이 정말 안 나갔는지를 선에서 확인한다 — 화면만
+      //    되돌리고 `#pending` 에는 남기는 구현이면 여기서만 드러난다.
+      //    **대조군이 같은 줄에 있다**: 되돌리면 안 되는 `windMagnitude` 는
+      //    반대로 반드시 나가 있어야 한다.
+      const solverSent = sent.some((s) => s.op === 'setParams' && s.raw.includes('"solverType"'));
+      const windSent = payloads.some((p) => p['windMagnitude'] === 77);
+      check(
+        '★★★★ 잠기면서 되돌린 적분기는 **어떤 프레임에도 없고**, 되돌리지 않은 바람 세기는 **나가 있다** (한 줄에 대조군이 같이 있다)',
+        !solverSent && windSent,
+        `solverType 나감=${String(solverSent)} · windMagnitude=77 나감=${String(windSent)}`,
+      );
+
+      const unknownKeys = [...new Set(keys)].filter((k) => paramField(k) === null);
+      check(
+        '★★ 나간 키가 전부 스키마의 키다 (화면이 만든 이름이 워커로 새지 않는다)',
+        unknownKeys.length === 0,
+        unknownKeys.join(', ') || `[${[...new Set(keys)].join(', ')}]`,
+      );
+
+      // ★★ **바뀐 것만** 보낸다 — 개수가 아니라 **이름**으로 본다. 개수만 세면
+      //    되돌린 값이 다른 값과 바꿔치기돼도 통과한다.
+      check(
+        '★ [적용] 을 누른 횟수와 나간 setParams 프레임 수가 같다',
+        setOps.length === expectedApplies.length,
+        `누름 ${expectedApplies.length}회 · 프레임 ${setOps.length}건`,
+      );
+      for (const [i, want] of expectedApplies.entries()) {
+        const got = Object.keys(payloads[i] ?? {}).sort().join(',');
+        const wanted = [...want.keys].sort().join(',');
+        check(
+          `★★ 바뀐 것만 보낸다 — ${want.label}`,
+          got === wanted,
+          `보냄 {${got}} · 기대 {${wanted}}`,
+        );
+      }
+      const drape = payloads.find((p) => Object.hasOwn(p, 'drapingTime'));
+      check(
+        '★ 슬라이더로 만든 값이 그대로 선을 지났다',
+        drape !== undefined && drape['drapingTime'] === sliderApplied,
+        drape === undefined ? 'drapingTime 프레임이 없다' : `drapingTime=${String(drape['drapingTime'])}`,
+      );
+    }
+
+    // ── ⑧ 재생 중에는 **[적용] 만** 잠근다 ───────────────────
+    //
+    // 데스크톱과 다른 선택이다(데스크톱은 `solverType` 만 막는다). 이유는
+    // 시뮬이 도는 도중의 변경이 어떻게 반영되는지 **측정한 적이 없어서**이고,
+    // 그래서 위젯은 열어 둔 채 보내는 것만 막는다. 잠근 이유는 글자로 뜬다.
+    {
+      await page.locator('#params .prow[data-key="untanglingDamping"] input[type="number"]').fill('300');
+      await page.keyboard.press('Tab');
+      const dirty = await readPanel(page);
+      check(
+        '전제 — 보낼 변경이 하나 있고 [적용] 이 열려 있다',
+        dirty.dirty === 1 && !dirty.applyDisabled,
+        `dirty=${dirty.dirty} · "${dirty.applyText.trim()}"`,
+      );
+
+      await page.evaluate(() => globalThis.cobalt.play(true));
+      await untilPage(page, () => globalThis.cobalt.stats.fps > 0, 20_000);
+      const playing = await readPanel(page);
+      const playingRows = await readParamRows(page);
+      check(
+        '★★★ 재생 중에는 [적용] 이 잠기고 **왜 잠겼는지가 화면 글자로** 뜬다',
+        playing.applyDisabled && playing.hintShown && playing.hintText.includes('재생'),
+        `applyDisabled=${String(playing.applyDisabled)} · "${playing.hintText}"`,
+      );
+      check(
+        '★★ 그런데 위젯은 열려 있다 (값을 미리 맞춰 두고 정지한 뒤 한 번에 보낼 수 있다 — 22개를 통째로 회색으로 만들지 않는다)',
+        playingRows['untanglingDamping']?.disabled === false && playingRows['drapingTime']?.disabled === false,
+        `untanglingDamping 잠김=${String(playingRows['untanglingDamping']?.disabled)}`,
+      );
+
+      await page.evaluate(() => globalThis.cobalt.play(false));
+      await untilPage(page, () => !globalThis.cobalt.playbackView.playing, 20_000);
+      await sleep(300);
+      const paused = await readPanel(page);
+      check(
+        '★★ [정지] 하면 잠금이 풀린다 (사용자가 스스로 풀 수 있는 잠금이다 — 되돌릴 수 없는 상태를 만들지 않는다)',
+        !paused.applyDisabled && paused.dirty === 1,
+        `applyDisabled=${String(paused.applyDisabled)} · dirty=${paused.dirty}`,
+      );
+
+      // [워커에서 읽기] 로 화면의 값을 버린다 — 아래 절이 깨끗한 상태에서 시작한다.
+      await page.click('#paramsRead');
+      await page.waitForFunction(() => globalThis.cobalt.params.dirty === 0, null, { timeout: 20_000 });
+      const reread = await readParamRows(page);
+      check(
+        '★ [워커에서 읽기] 가 화면의 미적용 변경을 워커의 값으로 되돌린다',
+        reread['untanglingDamping']?.value !== '300',
+        `untanglingDamping 300 → ${reread['untanglingDamping']?.value ?? '-'}`,
+      );
+    }
+
+    // ── ⑨ 씬을 내려도 패널이 스스로 따라간다 ────────────────
+    //
+    // 파라미터는 씬에 딸려 있다. 씬이 내려가면 화면의 값은 더 이상 아무것도
+    // 가리키지 않으므로 패널이 **아무 버튼도 없이** 다시 읽어야 한다
+    // (`clearScene()` → `refreshParams()`).
+    //
+    // ⚠️ **`phase === 'noScene'` 은 단언하지 않는다.** 실측으로 워커는 `clear`
+    //    뒤에도 `status.loaded` 를 **true 로 답한다**(아래 note). 그래서 패널은
+    //    씬이 없는데도 'ready' 로 남고, 지금 동작을 못으로 박으면 워커가 고쳐지는
+    //    날 이 하네스가 빨간불이 된다(§9 머리말의 규칙 ③).
+    //
+    // 대신 **다시 읽었다는 사실 자체**를 값으로 확인한다: `clear` 뒤 워커가 주는
+    // 값은 씬의 값이 아니라 **엔진 구조체의 기본값**이라 눈에 띄게 다르다
+    // (실측: timeStep 45 → 30 · groundMargin 0.5 → 0.1 · 강성 750 → 7500 —
+    //  `params.ts` 머리말이 적어 둔 그 차이 그대로다).
+    {
+      const beforeClear = (await readPanel(page)).worker;
+      await blur(page);
+      await page.keyboard.press('c');
+      await untilPage(page, () => globalThis.cobalt.viewer.cloth.patternCount === 0, 20_000);
+      const reread = await page
+        .waitForFunction(
+          (was: number) => globalThis.cobalt.params.workerValues.timeStep !== was,
+          Number(beforeClear['timeStep']),
+          { timeout: 20_000 },
+        )
+        .then(() => true, () => false);
+      const gone = await readPanel(page);
+      check(
+        '★★★ 씬을 내리면 패널이 **스스로** 워커에 다시 묻는다 (아무 버튼도 누르지 않았다 — 화면의 값이 씬의 값에서 엔진 기본값으로 갈아 끼워진다)',
+        reread && gone.worker['timeStep'] !== beforeClear['timeStep'],
+        `timeStep ${String(beforeClear['timeStep'])} → ${String(gone.worker['timeStep'])}`
+        + ` · groundMargin ${String(beforeClear['groundMargin'])} → ${String(gone.worker['groundMargin'])}`,
+      );
+      note(
+        '⚠ 워커가 clear 뒤에도 loaded:true 를 답한다 (판정하지 않음)',
+        `그래서 패널의 'noScene' 화면(씬이 없다 · 위젯 전부 잠금)에 **도달할 수 없다** —`
+        + ` 지금 phase=${gone.phase} 이고 위젯이 열려 있다.`
+        + ' 값은 엔진 구조체 기본값이라 어느 씬의 값도 아닌데 화면은 "워커와 일치" 라고 말한다.'
+        + ' 원인은 화면이 아니라 워커다(`protocol.cpp:604` 의 `manager.IsLoadedZls()` 가'
+        + ' `Clear()` 뒤에도 true — 회사 저장소 코드라 여기서 고칠 수 없다).'
+        + ' 고쳐지면 이 note 를 단언으로 승격할 것',
+      );
+
+      await loadScene(page);
+      const back = await readPanel(page);
+      check(
+        '★★ 다시 로드하면 그 씬의 값이 돌아온다 (엔진 기본값이 눌러앉지 않는다)',
+        back.phase === 'ready' && !back.bannerShown
+        && back.worker['timeStep'] === beforeClear['timeStep'],
+        `phase=${back.phase} · timeStep ${String(gone.worker['timeStep'])} → ${String(back.worker['timeStep'])}`,
+      );
+
+      const sh = await shot(page, 'params-panel');
+      check(
+        '★ 패널을 펼친 채로도 화면에 옷이 그대로 서 있다 (패널이 뷰포트를 잡아먹지 않는다)',
+        sh.colors.saturated > sh.colors.total * 0.01,
+        describe(sh.colors),
+      );
+      note('파라미터 패널 스크린샷', path.basename(sh.file));
+    }
+
+    // ── ⑩ 이 절 전체의 왕복 계측기 ──────────────────────────
+    //
+    // ③-b 가 3초 창에서 폴링이 없음을 단언한다. 여기서는 **절 전체**의 총량을
+    // 남긴다 — 조작 하나당 status 한 번이라는 설계가 실제 숫자로 어떻게 보이는지
+    // 다음 사람이 알아야 문턱을 다시 정할 수 있다.
+    {
+      const ops = new Map<string, number>();
+      for (const s of sent) ops.set(s.op, (ops.get(s.op) ?? 0) + 1);
+      const applied = (await readStats(page)).applied;
+      note(
+        '이 절이 만든 왕복',
+        [...ops.entries()].sort((a, b) => b[1] - a[1]).map(([o, n]) => `${o} ${n}`).join(' · ')
+        + ` — 같은 시간에 화면에 붙은 프레임은 ${fmt(applied)}건이다`,
+      );
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
 // §8. 콘솔 오류 0건
 // ─────────────────────────────────────────────────────────────
 
@@ -1831,7 +3034,8 @@ async function sectionOpenIssues(page: Page): Promise<void> {
     );
     note(
       '덮지 못하는 것',
-      '2D 펼침(#15) · 파라미터(#16) · 업로드 경로 · 재연결(끊겼다 붙는 것). 화면이 생기면 절을 추가할 것',
+      '2D 펼침(#15) · 업로드 경로 · 재연결(끊겼다 붙는 것). 화면이 생기면 절을 추가할 것'
+      + ' (파라미터(#16)는 §11 로 들어왔다)',
     );
   });
 }
