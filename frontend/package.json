@@ -12,11 +12,13 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "smoke": "node --experimental-strip-types src/protocol/smoke.ts"
+    "smoke": "node --experimental-strip-types src/protocol/smoke.ts",
+    "verify:ui": "node --experimental-strip-types src/verify/ui.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@types/three": "^0.185.4",
+    "playwright": "^1.62.1",
     "typescript": "^5.7.2",
     "vite": "^7.1.14"
   },
