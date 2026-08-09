@@ -185,13 +185,13 @@
       "id": 14,
       "group": "frontend",
       "title": "재생 컨트롤",
-      "detail": "Start/Pause, Reset, Clear. 데스크톱 기능 #4·#5·#6과 키보드 #60~#63에 대응. 인계 (실측): status의 frame이 pause 직후 -1이 된다. 재생 중에는 정상 증가하는데 멈춘 뒤 조회하면 frame:-1, maxFrame:249가 온다. 여기가 \"현재 프레임\"을 읽는 첫 작업이므로 이걸 그대로 화면에 물리면 일시정지할 때마다 -1이 뜬다 — 표시용 프레임은 마지막 유효값을 따로 들고 있거나 maxFrame으로 보정해야 하고, 워커 쪽을 고칠지 프론트에서 가릴지는 이 작업에서 정한다.",
+      "detail": "Start/Pause, Reset, Clear. 데스크톱 기능 #4·#5·#6과 키보드 #60~#63에 대응. 인계 (실측): status의 frame이 pause 직후 -1이 된다. 재생 중에는 정상 증가하는데 멈춘 뒤 조회하면 frame:-1, maxFrame:249가 온다. 여기가 \"현재 프레임\"을 읽는 첫 작업이므로 이걸 그대로 화면에 물리면 일시정지할 때마다 -1이 뜬다 — 표시용 프레임은 마지막 유효값을 따로 들고 있거나 maxFrame으로 보정해야 하고, 워커 쪽을 고칠지 프론트에서 가릴지는 이 작업에서 정한다. 결과 — 상태를 필드가 아니라 파생으로 만들었다. disconnected / noScene / loading / paused / playing을 connected·scene·loading·playing 넷에서 계산한다. 필드로 두면 \"끊겼는데 playing\"이 표현 가능해지고 그게 정확히 ISSUE-009의 형태다. 진행 중인 op은 상태가 아니라 pending이다 — 상태로 두면 끝난 뒤 어디로 돌아갈지를 또 기억해야 하고 그 기억이 새 믿음이 된다. ISSUE-009를 1안+3안으로 닫았다: show() 시작 시점에 믿음을 내리고(성공을 기다리지 않는다 — 103MB면 그 1초 내내 화면이 거짓말한다), op·로드·재연결이 끝나는 자리마다 status로 워커 사실을 덮는다. 폴링이 아니다 — 워커의 시뮬 상태를 바꾸는 사건이 전부 우리 손을 지나므로 그 순간에만 물으면 된다. stats.corrections가 그 계측기다(믿음과 사실이 갈라져 덮은 횟수). 인계로 받은 frame:-1 함정의 답은 \"가리지 않는다\"였다 — status.frame을 화면에 쓰지 않고 maxFrame만 본다. \"마지막 유효값 보관\"으로 가리면 반대쪽 함정에 빠진다: reset은 maxFrame만 -1로 되돌리고 curFrame은 249로 남기므로 리셋해도 249가 붙어 있는다. maxFrame은 워커가 load/clear/reset에서 정확히 되돌리고, frame 이벤트가 싣는 숫자가 이미 maxFrame이라 화면과 이벤트의 출처가 같아진다. 워커는 고치지 않았다. 리셋 뒤에는 포즈를 되받는다(afterReset → meshData) — 리셋은 maxFrame을 -1로 만들어 frame 이벤트를 한 건도 내지 않으므로, 시뮬만 처음으로 가고 화면은 드레이프된 옷 그대로 남았다. 실측 bbox y 11.56~151.77 → 6.46~150.83으로 첫 로드 직후 값과 일치한다. clear는 씬을 내리고 reset은 남긴다. 확인창은 달지 않았다 — .zls가 게이트웨이에 남아 로드 한 번이면 복구되고, confirm()은 Playwright가 기본 취소해서 자동 검증에는 \"clear가 아무 일도 안 함\"으로 보인다. 대신 상태줄이 복구 방법을 말한다. 구독은 세션당 1회가 유지된다(실측 subscribes: 1). 키보드는 S=재생 토글, R=리셋, C=씬 내림이고 수식키·IME 조합·반복 입력·입력 요소 포커스에서는 양보한다. 테스트 159건(스모크 341 → 464, UI 하네스 68 → 104) — 상태 기계는 Node에서, 버튼·키·화면은 Playwright에서 본다. 겹치기는 \"재생 중 재로드\" 하나만 뒀는데 그 중복이 값을 증명했다: main.ts의 sceneLoading() 배선 한 줄을 지우면 스모크는 464건 전부 통과하고 UI 하네스만 6건이 빨간불이 된다 — 배선은 화면에서만 보인다. ⚠️ SPACE(#63)와 스텝 버튼은 넣었다가 뺐다 — 워커의 step op이 응답만 주고 아무 일도 하지 않는다(ISSUE-015). 눌러도 안 움직이는 컨트롤은 이 단위가 없애려던 바로 그 거짓말이다. PlaybackController.step()은 남아 있어 워커가 고쳐지면 index.html의 버튼 한 줄과 shortcuts.ts의 표 한 줄로 되살아난다. 데스크톱 #60·#61·#62는 됐고 #63만 미구현이다. 후속 인계: PlaybackHooks의 머리말은 \"훅은 전부 던져도 op을 실패시키지 않는다\"인데 beforePlay·afterClear만 그 계약 밖에 있다(ISSUE-017). 그리고 #16(스키마 기반 파라미터 패널)이 같은 frontend/src/panels/에 들어오므로, panels/index.ts가 무엇을 공개할지를 그때 다시 볼 것 — 지금은 재생 컨트롤 한 벌만 나가 있다.",
       "test": "버튼 → 상태 전이 자동 검증 + 화면 확인",
       "verify": "auto",
-      "files": ["frontend/src/panels/"],
+      "files": ["frontend/src/panels/playback.ts", "frontend/src/panels/shortcuts.ts", "frontend/src/panels/index.ts", "frontend/src/main.ts", "frontend/src/protocol/smoke.ts", "frontend/src/verify/ui.ts", "frontend/index.html"],
       "depends": [13],
-      "status": "todo",
-      "commit": null
+      "status": "done",
+      "commit": "3df0621"
     },
     {
       "id": 15,
