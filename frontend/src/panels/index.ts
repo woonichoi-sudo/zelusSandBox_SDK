@@ -29,6 +29,37 @@ export {
 } from './playback.ts';
 
 export {
+  buildSetParamsPayload,
+  changedParams,
+  coerceParamValue,
+  disabledParams,
+  fallbackParamValues,
+  paramDisabledReason,
+  paramField,
+  paramGroups,
+  PARAM_BY_KEY,
+  PARAM_FIELDS,
+  PARAM_GROUP_LABELS,
+  PARAM_GROUP_ORDER,
+  readParamValues,
+  type ParamAdjustment,
+  type ParamCoercion,
+  type ParamContext,
+  type ParamDisabled,
+  type ParamDisabledCause,
+  type ParamEffect,
+  type ParamEnumOption,
+  type ParamField,
+  type ParamGroup,
+  type ParamKey,
+  type ParamKind,
+  type ParamPayload,
+  type ParamRangeSource,
+  type ParamValue,
+  type ParamValues,
+} from './params.ts';
+
+export {
   isTypingTarget,
   shortcutFor,
   SHORTCUT_HINT,

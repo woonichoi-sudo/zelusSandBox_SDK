@@ -15,6 +15,8 @@
  *   - SPA 폴백   — 뚫리면 fetch가 JSON 대신 HTML을 받아 진짜 원인이 묻힌다 (§6)
  *   - 3D 지오메트리 — 뚫리면 증상이 전부 "화면이 비었다" 하나로 수렴한다 (§8)
  *   - 프레임 스트리밍 — 뚫리면 "시뮬은 도는데 옷이 안 움직인다" (§8-5~§8-7)
+ *   - 파라미터 스키마 — 뚫리면 슬라이더를 움직여도 워커가 `unknown`으로 되돌리고
+ *     사용자는 조용히 **아무 일도 안 일어나는 것**을 본다 (§11)
  *
  * 프로토콜 계층은 DOM을 쓰지 않으므로(`WebSocket`/`JSON`/`setTimeout`뿐) Node에서
  * 그대로 돈다. `main.ts`는 DOM을 쓰므로 **여기서 import하지 않는다.**
@@ -37,7 +39,7 @@
  */
 
 import { execFile } from 'node:child_process';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { createServer as createNetServer } from 'node:net';
@@ -58,10 +60,27 @@ import {
   type GatewayOptions,
 } from '../../../backend/src/server/index.ts';
 import {
+  buildSetParamsPayload,
+  changedParams,
+  coerceParamValue,
+  disabledParams,
+  fallbackParamValues,
   isTypingTarget,
+  paramDisabledReason,
+  paramField,
+  paramGroups,
+  PARAM_BY_KEY,
+  PARAM_FIELDS,
+  PARAM_GROUP_LABELS,
+  PARAM_GROUP_ORDER,
   PlaybackController,
+  readParamValues,
   shortcutFor,
   SHORTCUT_HINT,
+  type ParamField,
+  type ParamKey,
+  type ParamValue,
+  type ParamValues,
   type PlaybackHooks,
   type PlaybackPort,
   type ShortcutAction,
@@ -5287,6 +5306,1055 @@ async function sectionPlaybackRealWorker(): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────
+// §11. 파라미터 스키마 (#16-a) — 이름 하나가 어긋나면 화면이 조용해진다
+//
+// `panels/params.ts` 는 표 하나로 위젯·페이로드·검증을 전부 덮는다. 그래서
+// **표가 틀리면 전부 틀린다.** 여기서 겨냥하는 것은 세 가지다:
+//
+//   ① 키 이름 — 한 글자만 달라도 워커는 `unknown` 으로 되돌려주고 화면은
+//      아무 말도 안 한다. 정본은 `backend/native/src/protocol.cpp` 의
+//      `ReadParams`/`ApplyParams` 이므로 **그 파일을 읽어 대조한다.**
+//      스키마 쪽에 22개를 손으로 베껴 두면 둘이 같이 틀릴 수 있다.
+//   ② 죽은 필드가 페이로드에 새어 들어가는 것 — 그러면 워커가 "적용됨" 으로
+//      답하고 화면이 그 거짓말을 그대로 옮긴다 (ISSUE-014 §전수 측정).
+//   ③ 비활성인데 이유가 없는 것 — #14 가 없애려던 바로 그 거짓말이다.
+//
+// ── 무엇을 고정하고 무엇을 고정하지 않았는가 ────────────────
+//
+// **고정한다(계약)**: 키 22개와 그 이름 · 분류 17/3/2 와 그 소속 · 죽은 필드가
+// 페이로드에 없다 · `requires`/`lockedWhenSimInit` 이 붙는 필드 · 열거형 값이
+// 엔진 enum 의 인덱스와 같다 · 비활성 사유의 우선순위와 문구의 존재 ·
+// **ISSUE-014 가 실측한 기본값 22개**.
+//
+// **고정하지 않는다(현재 값)**: min/max/step 의 숫자 · 라벨/설명/note 의 문장.
+// 이것들은 조정될 수 있고, 조정할 때마다 테스트가 빨개지면 사람이 무심코
+// 테스트를 고치게 된다. 대신 **불변식**으로 본다 — min<max, fallback 이 범위
+// 안, int 는 정수 경계, 실측 기본값이 범위 밖으로 잘려 나가지 않는다.
+// 범위를 좁혀 실측값이 잘리면 그때 빨개진다. 그건 진짜 결함이다.
+// ─────────────────────────────────────────────────────────────
+
+const PROTOCOL_CPP = path.resolve(ROOT, 'backend/native/src/protocol.cpp');
+
+/** C++ 함수 본문을 중괄호 깊이로 잘라 낸다. 정규식이 옆 함수까지 먹지 않게 */
+function cppBody(src: string, signature: string): string {
+  const at = src.indexOf(signature);
+  if (at < 0) return '';
+  const open = src.indexOf('{', at);
+  if (open < 0) return '';
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') {
+      depth--;
+      if (depth === 0) return src.slice(open + 1, i);
+    }
+  }
+  return '';
+}
+
+/**
+ * 워커가 각 키를 어느 타입으로 꺼내는가 — `F`=float `I`=int `B`=bool.
+ * `ApplyParams` 를 한 번만 읽어 캐시한다. §11-1(이름 대조)과 §11-3(소수 왕복)이
+ * 같은 출처를 본다 — 표를 두 벌 두면 그 둘이 어긋날 수 있다.
+ */
+let workerKindCache: Map<string, string> | null = null;
+function workerParamKinds(): Map<string, string> {
+  if (workerKindCache !== null) return workerKindCache;
+  const m = new Map<string, string>();
+  if (existsSync(PROTOCOL_CPP)) {
+    const body = cppBody(readFileSync(PROTOCOL_CPP, 'utf8'), 'void ApplyParams');
+    for (const x of body.matchAll(/k == "(\w+)"\)\s*([FIB])\(/g)) m.set(x[1] ?? '', x[2] ?? '');
+  }
+  workerKindCache = m;
+  return m;
+}
+
+/**
+ * 스키마의 `kind` ↔ 워커가 쓰는 꺼내기 함수의 **정확한** 대응.
+ *
+ * ★ `int → F` 를 한때 "안전" 으로 봤다(`timeStep` 이 그랬다). 아니다. 워커가
+ *   float 로 읽는 필드를 스키마가 정수로 다루면 **워커가 준 소수를 UI 가
+ *   반올림해 되돌려보낸다** — 사용자가 만지지도 않은 값이 바뀐다. 대응은
+ *   양방향이어야 한다.
+ */
+const WORKER_KIND: Readonly<Record<string, string>> = {
+  bool: 'B', enum: 'I', int: 'I', float: 'F',
+};
+
+/**
+ * **[실측] ISSUE-014 §전수 측정(2026-08-09)의 기준선이다.**
+ * `W_Bra top & Leggings.zls` 로드 직후 `getParams()` 가 준 22개 값.
+ *
+ * ★ 이 표는 **스키마가 아니라 측정을 고정한다.** 스키마의 min/max 를 조정해도
+ *   이 숫자는 안 바뀐다 — 오히려 조정한 범위가 이 값을 잘라내면 그게 결함이다.
+ *   워커가 준 값을 UI 가 클램프해 되돌려보내면 사용자가 만지지도 않은 값이
+ *   바뀌고, 그 변경은 화면 어디에도 안 남는다.
+ */
+const MEASURED_DEFAULTS: Readonly<Record<string, ParamValue>> = {
+  timeStep: 45,
+  subStep: 1,
+  drapingTime: 0.4,
+  gravityY: -980,
+  groundPlane: true,
+  groundFriction: 0.2,
+  groundMargin: 0.5,
+  useWind: false,
+  windMagnitude: 30,
+  solverType: 0,
+  preconditioner: 2,
+  nonlinearIterations: 1,
+  maxSolverIterations: 600,
+  solverTolerance: 1e-4,
+  useIEQS: false,
+  staticCouplingMethod: 4,
+  dynamicCouplingMethod: 3,
+  dynCouplingStiffness: 750,
+  dynCouplingDamping: 0.1,
+  untanglingStiffness: 20000,
+  untanglingDamping: 250,
+  meshingEdgeLength: 1,
+};
+
+/** ISSUE-014 의 분류. 여기 적힌 것이 사실이고 스키마가 따라와야 한다 */
+const DEAD_KEYS = ['subStep', 'meshingEdgeLength'];
+const CONDITIONAL_KEYS = ['groundPlane', 'groundFriction', 'windMagnitude'];
+
+function sortedKeys(v: readonly string[]): string {
+  return [...v].sort().join(',');
+}
+
+/** **스키마 자신의 규칙으로** 값이 유효한지 본다. 숫자를 베껴 두지 않는다 */
+function validForField(field: ParamField, v: ParamValue): boolean {
+  if (field.kind === 'bool') return typeof v === 'boolean';
+  if (typeof v !== 'number' || !Number.isFinite(v)) return false;
+  if (field.kind === 'enum') return (field.options ?? []).some((o) => o.value === v);
+  if (field.kind === 'int' && !Number.isInteger(v)) return false;
+  if (field.min !== null && v < field.min) return false;
+  if (field.max !== null && v > field.max) return false;
+  return true;
+}
+
+// ── §11-1. 워커 프로토콜과 이름이 같은가 ─────────────────────
+//
+// 이 절만이 "스키마가 실재를 가리키는가" 를 본다. 나머지 절은 전부 스키마
+// 안에서의 일관성이라, 22개를 통째로 잘못 베꼈어도 통과한다.
+
+function sectionParamKeys(): void {
+  section('§11-1. 워커 프로토콜과 키 이름 대조 (protocol.cpp 를 읽는다)');
+
+  if (!existsSync(PROTOCOL_CPP)) {
+    check('protocol.cpp 를 찾았다', false, PROTOCOL_CPP);
+    return;
+  }
+  const src = readFileSync(PROTOCOL_CPP, 'utf8');
+  const readBody = cppBody(src, 'json ReadParams');
+  const applyBody = cppBody(src, 'void ApplyParams');
+
+  const readKeys = [...readBody.matchAll(/\{\s*"(\w+)"\s*,/g)].map((m) => m[1] ?? '');
+  const applyPairs = [...applyBody.matchAll(/k == "(\w+)"\)\s*([FIB])\(/g)]
+    .map((m) => ({ key: m[1] ?? '', kind: m[2] ?? '' }));
+
+  // 대조군 — 정규식이 아무것도 못 잡으면 아래 집합 비교가 "둘 다 비었으니 같다"
+  // 로 통과해버린다. 개수를 먼저 못 박는다.
+  check(
+    '★ 대조군: protocol.cpp 에서 22개를 실제로 파싱했다 (정규식이 헛돌면 여기서 걸린다)',
+    readKeys.length === 22 && applyPairs.length === 22,
+    `ReadParams=${readKeys.length}개, ApplyParams=${applyPairs.length}개`,
+  );
+
+  const schemaKeys = PARAM_FIELDS.map((f) => String(f.key));
+  const missing = readKeys.filter((k) => !schemaKeys.includes(k));
+  const extra = schemaKeys.filter((k) => !readKeys.includes(k));
+  check(
+    '★★ 스키마 키 22개가 워커 `ReadParams` 와 정확히 같다 (한 글자만 달라도 워커가 unknown 으로 되돌린다)',
+    missing.length === 0 && extra.length === 0 && schemaKeys.length === 22,
+    missing.length + extra.length === 0
+      ? `${schemaKeys.length}/22 일치`
+      : `스키마에 없음=[${missing.join(',')}] 워커에 없음=[${extra.join(',')}]`,
+  );
+
+  const applyKeys = applyPairs.map((p) => p.key);
+  check(
+    '워커의 읽기(ReadParams)와 쓰기(ApplyParams)가 같은 이름을 쓴다 — 읽히는데 안 써지는 키가 없다',
+    sortedKeys(readKeys) === sortedKeys(applyKeys),
+    `${applyKeys.length}개`,
+  );
+
+  // ── 타입 대조 ──────────────────────────────────────────────
+  //
+  // 워커는 `v.get<bool>()`/`get<int>()`/`get<float>()` 로 꺼낸다. 두 방향으로
+  // 아프다: bool 자리에 숫자를 보내면 nlohmann 이 던져 요청 하나가 통째로
+  // 실패하고, **워커가 float 로 읽는 필드를 스키마가 int 로 다루면 워커가 준
+  // 소수를 UI 가 반올림해 되돌려보낸다**(§11-3 이 그 왕복을 실제로 돌려 본다).
+  // 그래서 대응을 **정확히** 본다 — 한쪽으로만 느슨하게 두지 않는다.
+  const kindOf = workerParamKinds();
+  const wrongKind = PARAM_FIELDS.filter((f) => {
+    const w = kindOf.get(String(f.key));
+    if (w === undefined) return false;              // 위 검사에서 이미 잡힌다
+    return w !== WORKER_KIND[f.kind];
+  });
+  check(
+    '★★ 스키마의 kind 가 워커가 꺼내는 타입과 **정확히** 대응한다 (bool⇔B · enum⇒I · int⇔I · float⇔F)',
+    wrongKind.length === 0 && kindOf.size === 22,
+    wrongKind.map((f) => `${String(f.key)}:${f.kind}→${WORKER_KIND[f.kind] ?? '?'} 인데 워커는 ${kindOf.get(String(f.key)) ?? '?'}`).join(', ')
+    || `${PARAM_FIELDS.length}/22`,
+  );
+  check(
+    '★ timeStep 은 float 이다 — 데스크톱이 매 프레임 `(int)` 로 자르는 것(MainGUI.cpp:393-395)은 그쪽 결함이고, 엔진·프로토콜의 타입은 float 이다',
+    PARAM_BY_KEY['timeStep']?.kind === 'float' && kindOf.get('timeStep') === 'F',
+    `스키마=${String(PARAM_BY_KEY['timeStep']?.kind)} / 워커=${kindOf.get('timeStep') ?? '?'}`,
+  );
+  note('applyPairs', `${applyPairs.length}쌍을 §11-1 이 직접 파싱했고 캐시(${kindOf.size}개)와 같은 출처다`);
+
+  if (sortedKeys(readKeys) === sortedKeys(schemaKeys)) {
+    note('순서', readKeys.join(',') === schemaKeys.join(',')
+      ? '스키마 나열 순서가 protocol.cpp 와 같다 (우연이다 — 그룹을 다시 묶으면 갈라진다. 판정 안 함)'
+      : '스키마 나열 순서가 protocol.cpp 와 다르다 (문제 아님 — 그룹으로 다시 묶었다)');
+  }
+}
+
+// ── §11-2. 분류가 측정과 일치하는가 + 표의 불변식 ────────────
+
+function sectionParamSchema(): void {
+  section('§11-2. 스키마 분류와 불변식 (ISSUE-014 전수 측정)');
+
+  check('필드가 22개다', PARAM_FIELDS.length === 22, `${PARAM_FIELDS.length}개`);
+  check(
+    '★ 대조군: 키가 중복되지 않는다 (PARAM_BY_KEY 가 Object.fromEntries 라 중복은 조용히 덮인다)',
+    Object.keys(PARAM_BY_KEY).length === PARAM_FIELDS.length,
+    `BY_KEY=${Object.keys(PARAM_BY_KEY).length}개`,
+  );
+  check(
+    'PARAM_BY_KEY 가 PARAM_FIELDS 와 같은 객체를 가리킨다 (둘이 갈라질 수 없다)',
+    PARAM_FIELDS.every((f) => PARAM_BY_KEY[f.key] === f),
+    `${PARAM_FIELDS.length}/22`,
+  );
+
+  const dead = PARAM_FIELDS.filter((f) => f.effect === 'dead').map((f) => String(f.key));
+  const cond = PARAM_FIELDS.filter((f) => f.effect === 'conditional').map((f) => String(f.key));
+  const eff = PARAM_FIELDS.filter((f) => f.effect === 'effective');
+  check(
+    '★★ 죽은 필드가 정확히 subStep · meshingEdgeLength 다 (ISSUE-014 §전수 측정 ③)',
+    sortedKeys(dead) === sortedKeys(DEAD_KEYS), dead.join(',') || '없음',
+  );
+  check(
+    '★ 조건부가 정확히 groundPlane · groundFriction · windMagnitude 다 (같은 §의 ①②)',
+    sortedKeys(cond) === sortedKeys(CONDITIONAL_KEYS), cond.join(',') || '없음',
+  );
+  check('반영됨이 17개다 (17/3/2 로 갈린다)', eff.length === 17, `${eff.length}개`);
+
+  // ── requires / lockedWhenSimInit — 붙는 자리가 하나씩뿐이다 ──
+  const requiring = PARAM_FIELDS.filter((f) => f.requires !== null);
+  check(
+    '★★ `requires` 를 쓰는 필드는 windMagnitude 하나이고 게이트가 useWind 다 (측정에서 63배로 갈렸다)',
+    requiring.length === 1 && String(requiring[0]?.key) === 'windMagnitude'
+    && String(requiring[0]?.requires) === 'useWind',
+    requiring.map((f) => `${String(f.key)}→${String(f.requires)}`).join(', ') || '없음',
+  );
+  check(
+    '게이트가 스키마에 실재하고 bool 이다 (없는 키를 가리키면 영원히 비활성이 된다)',
+    requiring.every((f) => {
+      const gate = f.requires === null ? undefined : PARAM_BY_KEY[f.requires];
+      return gate !== undefined && gate.kind === 'bool';
+    }),
+    'useWind: bool',
+  );
+  const locked = PARAM_FIELDS.filter((f) => f.lockedWhenSimInit);
+  check(
+    '★ `lockedWhenSimInit` 은 solverType 하나다 (MainGUI.cpp:459 가 그 하나만 감춘다)',
+    locked.length === 1 && String(locked[0]?.key) === 'solverType',
+    locked.map((f) => String(f.key)).join(', ') || '없음',
+  );
+  check(
+    '죽은 필드에는 잠금·종속이 겹치지 않는다 (겹치면 화면이 이유를 하나만 말한다)',
+    PARAM_FIELDS.filter((f) => f.effect === 'dead')
+      .every((f) => !f.lockedWhenSimInit && f.requires === null),
+    `${dead.length}개 확인`,
+  );
+
+  // ── 표의 불변식 — 숫자를 베끼지 않고 관계만 본다 ────────────
+  const badText = PARAM_FIELDS.filter(
+    (f) => f.label.trim() === '' || f.description.trim() === '' || (f.note !== null && f.note.trim() === ''),
+  );
+  check('모든 필드에 라벨과 설명이 있다 (화면에 빈 칸이 안 생긴다)',
+    badText.length === 0, badText.map((f) => String(f.key)).join(', ') || `${PARAM_FIELDS.length}/22`);
+  check('죽은 필드·조건부 필드에는 note 가 있다 (왜 그런지가 화면에 남는다)',
+    PARAM_FIELDS.filter((f) => f.effect !== 'effective').every((f) => f.note !== null && f.note.length > 5),
+    `${dead.length + cond.length}개`);
+
+  const badShape = PARAM_FIELDS.filter((f) => {
+    if (f.kind === 'int' || f.kind === 'float') return f.min === null || f.max === null || f.options !== null;
+    if (f.kind === 'enum') return f.min !== null || f.max !== null || f.options === null;
+    return f.min !== null || f.max !== null || f.options !== null;   // bool
+  });
+  check('숫자 필드에만 min/max 가 있고 enum 에만 options 가 있다',
+    badShape.length === 0, badShape.map((f) => String(f.key)).join(', ') || `${PARAM_FIELDS.length}/22`);
+
+  const badRange = PARAM_FIELDS.filter((f) => {
+    if (f.min === null || f.max === null) return false;
+    if (!(f.min < f.max)) return true;
+    if (typeof f.fallback !== 'number') return true;
+    if (f.fallback < f.min || f.fallback > f.max) return true;
+    if (f.step !== null && !(f.step > 0)) return true;
+    if (f.kind === 'int' && !(Number.isInteger(f.min) && Number.isInteger(f.max)
+      && Number.isInteger(f.fallback) && (f.step === null || Number.isInteger(f.step)))) return true;
+    return false;
+  });
+  check(
+    '★ min<max · fallback 이 범위 안 · step>0 · int 는 경계까지 정수다',
+    badRange.length === 0,
+    badRange.map((f) => `${String(f.key)}[${String(f.min)},${String(f.max)}]f=${String(f.fallback)}`).join(', ')
+    || `${PARAM_FIELDS.filter((f) => f.min !== null).length}개 숫자 필드`,
+  );
+
+  // ── 열거형 — 값이 인덱스와 같아야 라벨이 안 밀린다 ──────────
+  const enums = PARAM_FIELDS.filter((f) => f.kind === 'enum');
+  const badEnum = enums.filter((f) => {
+    const o = f.options ?? [];
+    if (o.length === 0) return true;
+    if (!o.every((x, i) => x.value === i)) return true;        // 값 = 인덱스
+    if (!o.every((x) => x.label.trim() !== '')) return true;
+    return !o.some((x) => x.value === f.fallback);
+  });
+  check(
+    '★★ 열거형 값이 0..n-1 인덱스와 같고 fallback 이 선택지에 있다 (데스크톱이 콤보 인덱스를 그대로 대입한다 — 어긋나면 라벨이 한 칸씩 밀린다)',
+    badEnum.length === 0 && enums.length === 4,
+    badEnum.map((f) => String(f.key)).join(', ') || `${enums.length}개 열거형`,
+  );
+
+  // 라벨 문장 전체를 스냅샷으로 박지 않는다 — 대신 **엔진 enum 의 의미**에만
+  // 앵커를 건다. 배열을 한 칸 밀면 값은 그대로 0..n-1 이라 위 검사는 통과한다.
+  const labelOf = (key: ParamKey, value: number): string =>
+    (PARAM_BY_KEY[key]?.options ?? []).find((o) => o.value === value)?.label ?? '';
+  check(
+    '★★ 전처리기 라벨이 엔진 enum 의 자리와 맞는다 (0=IDENTITY, 2=BLOCK_JACOBI)',
+    labelOf('preconditioner', 0).includes('Identity') && labelOf('preconditioner', 2).includes('Block'),
+    `0=${labelOf('preconditioner', 0)} / 2=${labelOf('preconditioner', 2)}`,
+  );
+  check(
+    '★★ 커플링 라벨이 엔진 enum 의 자리와 맞는다 (0=NONE, 3=PENALTY, 4=PROJECTIVE — 실측 기본값 static=4·dynamic=3 이 데스크톱의 "권장"과 맞아떨어진다)',
+    labelOf('staticCouplingMethod', 0) === '없음'
+    && labelOf('staticCouplingMethod', 3).includes('페널티')
+    && labelOf('staticCouplingMethod', 4).includes('투영')
+    && labelOf('dynamicCouplingMethod', 3).includes('페널티'),
+    `3=${labelOf('staticCouplingMethod', 3)} / 4=${labelOf('staticCouplingMethod', 4)}`,
+  );
+  check(
+    '★ 적분기 라벨이 밀리지 않았다 (2=XPBD. 데스크톱은 3·4 배정밀도를 노출하지 않는다)',
+    labelOf('solverType', 2).includes('XPBD') && (PARAM_BY_KEY['solverType']?.options ?? []).length === 3,
+    `2=${labelOf('solverType', 2)}`,
+  );
+  check(
+    '★ 충돌 솔버(Gauss-Seidel/Jacobi/ICA)가 solverType 에 섞이지 않았다 (MainGUI 의 필드 충돌 버그를 옮기지 않는다)',
+    !(PARAM_BY_KEY['solverType']?.options ?? []).some(
+      (o) => /gauss|jacobi|ica/i.test(o.label)),
+    (PARAM_BY_KEY['solverType']?.options ?? []).map((o) => o.label).join(' / '),
+  );
+
+  // ── 그룹 ───────────────────────────────────────────────────
+  const groups = paramGroups();
+  const flat = groups.flatMap((g) => g.fields);
+  check('그룹으로 묶어도 필드가 하나도 안 사라지고 안 늘어난다',
+    flat.length === PARAM_FIELDS.length && PARAM_FIELDS.every((f) => flat.filter((x) => x === f).length === 1),
+    `${flat.length}개 / ${groups.length}그룹`);
+  check('빈 그룹은 안 나오고, 순서가 PARAM_GROUP_ORDER 의 부분수열이다',
+    groups.every((g) => g.fields.length > 0)
+    && groups.map((g) => g.group).join(',')
+      === PARAM_GROUP_ORDER.filter((g) => groups.some((x) => x.group === g)).join(','),
+    groups.map((g) => `${g.group}:${g.fields.length}`).join(' '));
+  check('그룹 헤더 글자가 PARAM_GROUP_LABELS 에서만 온다 (화면과 표가 갈라지지 않는다)',
+    groups.every((g) => g.label === PARAM_GROUP_LABELS[g.group]),
+    groups.map((g) => g.label).join('/'));
+  check('★ 대조군: PARAM_GROUP_ORDER 와 PARAM_GROUP_LABELS 의 키가 같다 (라벨 없는 그룹은 undefined 헤더가 된다)',
+    sortedKeys(PARAM_GROUP_ORDER as readonly string[]) === sortedKeys(Object.keys(PARAM_GROUP_LABELS)),
+    `${PARAM_GROUP_ORDER.length}개`);
+  check('모든 필드의 group 이 PARAM_GROUP_ORDER 안에 있다',
+    PARAM_FIELDS.every((f) => (PARAM_GROUP_ORDER as readonly string[]).includes(f.group)),
+    `${PARAM_FIELDS.length}/22`);
+
+  const fb = fallbackParamValues();
+  check('fallbackParamValues() 가 22개를 전부 채운다 (위젯이 값 없이 그려지지 않는다)',
+    Object.keys(fb).length === 22 && PARAM_FIELDS.every((f) => fb[f.key] === f.fallback),
+    `${Object.keys(fb).length}개`);
+}
+
+// ── §11-3. 실측 기본값 — 측정을 고정한다 ─────────────────────
+//
+// 사용자가 첫 화면에서 겪는 경로는 정확히 이것이다: 워커가 `getParams` 로 준
+// 값을 화면이 받아 들고, 사용자가 슬라이더 **하나**를 만지고, 그 결과가
+// `setParams` 로 돌아간다. 이 왕복에서 **만지지 않은 값이 달라지면 안 된다.**
+
+function sectionParamMeasured(): void {
+  section('§11-3. 실측 기본값과 왕복 안정성 (ISSUE-014 기준선)');
+
+  const schemaKeys = PARAM_FIELDS.map((f) => String(f.key));
+  check(
+    '★ 대조군: 실측 표가 스키마 22개를 그대로 덮는다 (표가 낡으면 아래가 전부 헛돈다)',
+    sortedKeys(Object.keys(MEASURED_DEFAULTS)) === sortedKeys(schemaKeys),
+    `${Object.keys(MEASURED_DEFAULTS).length}개`,
+  );
+
+  // ★ 이 절의 핵심. 스키마가 실측값을 잘라내면 사용자가 만지지도 않은 값이 바뀐다.
+  const clipped = PARAM_FIELDS.filter((f) => !coerceParamValue(f, MEASURED_DEFAULTS[String(f.key)]).ok);
+  check(
+    '★★ 실측 기본값 22개가 전부 스키마 범위 안이다 — 손대지 않고 통과한다',
+    clipped.length === 0,
+    clipped.map((f) => {
+      const c = coerceParamValue(f, MEASURED_DEFAULTS[String(f.key)]);
+      return `${String(f.key)}: ${String(MEASURED_DEFAULTS[String(f.key)])}→${String(c.value)}`;
+    }).join(', ') || '22/22',
+  );
+
+  const fbDiff = PARAM_FIELDS.filter((f) => f.fallback !== MEASURED_DEFAULTS[String(f.key)]);
+  check(
+    'fallback 이 실측치와 같다 (params.ts 머리말이 그렇게 주장한다)',
+    fbDiff.length === 0,
+    fbDiff.map((f) => `${String(f.key)}: ${String(f.fallback)}≠${String(MEASURED_DEFAULTS[String(f.key)])}`).join(', ')
+    || '22/22',
+  );
+
+  // ── 왕복: 워커가 준 값 → 화면 → 다시 워커 ──────────────────
+  const read = readParamValues(MEASURED_DEFAULTS);
+  check('readParamValues 가 워커의 22개를 하나도 안 흘린다',
+    Object.keys(read).length === 22, `${Object.keys(read).length}개`);
+
+  // 워커가 언젠가 문자열이나 객체를 실어 보내면(프로토콜 확장·버그) 그 값이
+  // 화면 상태로 들어가 그대로 setParams 로 되돌아간다. 여기서 잘라야 한다.
+  const dirty = readParamValues({
+    timeStep: '45', useWind: 'true', gravityY: null, drapingTime: {},
+    solverType: [0], preconditioner: undefined, subStep: 2, groundPlane: true,
+    없는키: 1, __proto__: 9,
+  } as unknown as Record<string, unknown>);
+  check(
+    '★★ readParamValues 는 아는 키 + number|boolean 만 통과시킨다 (문자열 "45" 가 상태에 들어가면 그대로 워커로 되돌아간다)',
+    sortedKeys(Object.keys(dirty)) === sortedKeys(['subStep', 'groundPlane'])
+    && dirty.subStep === 2 && dirty.groundPlane === true,
+    JSON.stringify(dirty),
+  );
+  check(
+    '★ 워커가 빠뜨린 키를 fallback 으로 메우지 않는다 (없는 것을 있는 것처럼 그리지 않는다)',
+    Object.keys(readParamValues({})).length === 0
+    && Object.keys(readParamValues({ timeStep: 45 })).length === 1,
+    '{} → {} · {timeStep} → 1개',
+  );
+
+  const round = buildSetParamsPayload(read);
+  const changedByRoundTrip = Object.entries(round.payload)
+    .filter(([k, v]) => v !== MEASURED_DEFAULTS[k]);
+  check(
+    '★★ 아무것도 안 만졌는데 값이 달라지지 않는다 (getParams → setParams 왕복)',
+    changedByRoundTrip.length === 0 && round.adjusted.length === 0,
+    changedByRoundTrip.map(([k, v]) => `${k}: ${String(MEASURED_DEFAULTS[k])}→${String(v)}`).join(', ')
+    || `${Object.keys(round.payload).length}개 그대로`,
+  );
+  check(
+    '★★ 그 왕복에서 죽은 필드 2개만 빠지고 dropped 로 보고된다',
+    Object.keys(round.payload).length === 20
+    && sortedKeys(round.dropped.map(String)) === sortedKeys(DEAD_KEYS)
+    && round.unknown.length === 0,
+    `payload=${Object.keys(round.payload).length} dropped=[${round.dropped.join(',')}] unknown=[${round.unknown.join(',')}]`,
+  );
+
+  // ── ★ 소수가 왕복에서 살아남는가 ──────────────────────────
+  //
+  // 워커가 `get<float>()` 로 읽는 필드는 씬에 따라 **소수를 들고 온다.**
+  // 스키마가 그걸 정수로 다루면 화면을 여는 것만으로 값이 반올림돼 되돌아간다.
+  // 데스크톱이 정확히 그 결함을 갖고 있고(`MainGUI.cpp:393-395` 가 조건 없이
+  // 매 프레임 `(int)` 로 자른다) 우리는 그걸 옮기지 않기로 했다.
+  //
+  // 필드 이름을 손으로 적지 않고 **워커가 F 로 읽는 필드 전부**를 돈다 —
+  // 나중에 어떤 필드가 int 로 되돌려져도 여기서 걸린다.
+  const floatKeys = PARAM_FIELDS.filter(
+    (f) => workerParamKinds().get(String(f.key)) === 'F' && f.effect !== 'dead');
+  const fractional: Record<string, number> = {};
+  for (const f of floatKeys) {
+    const lo = f.min ?? 0;
+    const hi = f.max ?? 1;
+    const mid = (lo + hi) / 2;
+    fractional[String(f.key)] = Number.isInteger(mid) ? mid + 0.5 : mid;
+  }
+  check('★ 대조군: 워커가 실수로 읽는 필드를 실제로 골라냈다 (0개면 아래가 헛돈다)',
+    floatKeys.length > 0 && Object.values(fractional).every((v) => !Number.isInteger(v)),
+    `${floatKeys.length}개`);
+  const fracOut = buildSetParamsPayload(fractional);
+  const lost = Object.entries(fractional).filter(([k, v]) => fracOut.payload[k] !== v);
+  check(
+    '★★★ 워커가 실수로 읽는 필드는 소수가 왕복에서 그대로 살아남는다 (스키마가 int 로 다루면 사용자가 만지지도 않은 값이 반올림돼 돌아간다)',
+    lost.length === 0 && fracOut.adjusted.length === 0,
+    lost.map(([k, v]) => `${k}: ${v}→${String(fracOut.payload[k])}`).join(', ') || `${floatKeys.length}개 그대로`,
+  );
+  const ts = PARAM_BY_KEY['timeStep'];
+  const tsRound = ts === undefined ? null : buildSetParamsPayload(
+    readParamValues({ ...MEASURED_DEFAULTS, timeStep: 33.5 }));
+  check(
+    '★★ 소수 타임스텝을 가진 씬이 와도 값이 안 잘린다 (33.5Hz → 33.5)',
+    ts !== undefined && coerceParamValue(ts, 45.5).ok && coerceParamValue(ts, 45.5).value === 45.5
+    && tsRound?.payload['timeStep'] === 33.5 && tsRound.adjusted.length === 0,
+    `coerce(45.5)=${String(ts === undefined ? '?' : coerceParamValue(ts, 45.5).value)} / 왕복=${String(tsRound?.payload['timeStep'])}`,
+  );
+
+  check('changedParams: 같은 값이면 아무것도 안 보낸다 (applied 가 22개로 도배되지 않는다)',
+    Object.keys(changedParams(read, read)).length === 0, '{}');
+  const one = changedParams(read, { ...read, timeStep: 60 });
+  check('changedParams: 하나 만지면 하나만 나온다',
+    Object.keys(one).length === 1 && one.timeStep === 60, JSON.stringify(one));
+  const fresh = changedParams({}, { timeStep: 60 });
+  check('changedParams: current 에 없던 키는 바뀐 것으로 본다 (워커가 안 준 필드를 우리가 처음 정하는 경우)',
+    Object.keys(fresh).length === 1 && fresh.timeStep === 60, JSON.stringify(fresh));
+  check('changedParams: 스키마에 없는 키는 통과하지 못한다',
+    Object.keys(changedParams({}, { 없는키: 1 } as never)).length === 0, '{}');
+  check('changedParams: false → true 도 변경이다 (0/false 를 undefined 로 오해하지 않는다)',
+    changedParams({ useWind: false }, { useWind: true }).useWind === true
+    && Object.keys(changedParams({ groundPlane: true }, { groundPlane: false })).length === 1,
+    'bool 양방향');
+}
+
+// ── §11-4. coerce — 던지지 않고 항상 유효한 값을 준다 ────────
+//
+// 입력 이벤트 핸들러에서 도는 함수다. 던지면 화면에 단서가 하나도 안 남고,
+// 유효하지 않은 값을 돌려주면 그 값이 그대로 워커로 간다.
+
+function sectionParamCoerce(): void {
+  section('§11-4. coerceParamValue — 던지지 않고 항상 유효 (22 × 적대적 입력)');
+
+  const hostile: [string, unknown][] = [
+    ['NaN', NaN], ['Infinity', Infinity], ['-Infinity', -Infinity],
+    ['null', null], ['undefined', undefined],
+    ['빈 문자열', ''], ['문자열', 'abc'], ['숫자꼴 문자열', '45'],
+    ['객체', {}], ['배열', []], ['배열(값1개)', [1]],
+    ['true', true], ['false', false],
+    ['-1e30', -1e30], ['1e30', 1e30], ['0', 0], ['-0', -0],
+    ['MAX_SAFE_INTEGER', Number.MAX_SAFE_INTEGER], ['1e-323', 1e-323],
+    ['bigint', 10n], ['심볼', Symbol('x')], ['함수', () => 1],
+  ];
+
+  const threw: string[] = [];
+  const invalid: string[] = [];
+  const contract: string[] = [];
+  for (const f of PARAM_FIELDS) {
+    for (const [label, raw] of hostile) {
+      try {
+        const c = coerceParamValue(f, raw);
+        if (!validForField(f, c.value)) invalid.push(`${String(f.key)}/${label}→${String(c.value)}`);
+        if ((c.ok && c.reason !== null) || (!c.ok && c.reason === null)) {
+          contract.push(`${String(f.key)}/${label}`);
+        }
+      } catch (err: unknown) {
+        threw.push(`${String(f.key)}/${label}: ${messageOf(err)}`);
+      }
+    }
+  }
+  check(`★★ 적대적 입력 ${hostile.length}종 × 22필드에서 한 번도 던지지 않는다`,
+    threw.length === 0, threw.slice(0, 3).join(' | ') || `${hostile.length * 22}회`);
+  check('★★ 그 모든 경우에 value 가 **그 필드에 유효한 값**이다 (못 고칠 입력이면 fallback)',
+    invalid.length === 0, invalid.slice(0, 5).join(' | ') || `${hostile.length * 22}회`);
+  check('ok ⇔ reason===null 이 항상 성립한다 (화면이 "왜 바뀌었는지" 를 못 찾는 일이 없다)',
+    contract.length === 0, contract.slice(0, 5).join(' | ') || `${hostile.length * 22}회`);
+
+  // ── 대조군: 멀쩡한 값을 뭉개지 않는다 ──────────────────────
+  // (전부 fallback 을 돌려주는 구현이면 위 세 검사는 전부 통과한다)
+  const untouched = PARAM_FIELDS.filter((f) => {
+    const c = coerceParamValue(f, f.fallback);
+    return !(c.ok && c.value === f.fallback && c.reason === null);
+  });
+  check('★ 대조군: 유효한 값은 손대지 않고 그대로 돌려준다',
+    untouched.length === 0, untouched.map((f) => String(f.key)).join(', ') || '22/22');
+  const mid = PARAM_BY_KEY['maxSolverIterations'];
+  check('★ 대조군: fallback 이 아닌 유효값도 그대로 통과한다 (전부 fallback 으로 뭉개는 구현이 아니다)',
+    mid !== undefined && coerceParamValue(mid, 123).value === 123 && coerceParamValue(mid, 123).ok,
+    '123 → 123');
+
+  // ── 클램프 — 경계 숫자를 베끼지 않고 스키마에서 꺼낸다 ─────
+  const numeric = PARAM_FIELDS.filter((f) => f.min !== null && f.max !== null);
+  const badLow = numeric.filter((f) => {
+    const c = coerceParamValue(f, (f.min ?? 0) - 1);
+    return !(c.value === f.min && !c.ok && c.reason !== null);
+  });
+  const badHigh = numeric.filter((f) => {
+    const c = coerceParamValue(f, (f.max ?? 0) + 1);
+    return !(c.value === f.max && !c.ok && c.reason !== null);
+  });
+  check('★★ min 아래는 min 으로, 이유와 함께 (부등호가 뒤집히면 여기서 걸린다)',
+    badLow.length === 0, badLow.map((f) => String(f.key)).join(', ') || `${numeric.length}개`);
+  check('★★ max 위는 max 로, 이유와 함께',
+    badHigh.length === 0, badHigh.map((f) => String(f.key)).join(', ') || `${numeric.length}개`);
+  const atEdge = numeric.filter((f) => !coerceParamValue(f, f.min ?? 0).ok || !coerceParamValue(f, f.max ?? 0).ok);
+  check('경계값 자체는 유효하다 (min/max 를 배타 구간으로 읽지 않는다)',
+    atEdge.length === 0, atEdge.map((f) => String(f.key)).join(', ') || `${numeric.length}개`);
+
+  // ── int 반올림 · float 은 안 한다 ──────────────────────────
+  //
+  // 개수를 박지 않는다. 어느 필드가 int 인지는 **현재 값**이고(`timeStep` 이
+  // int→float 으로 옮겨 갔다), 계약은 "int 는 반올림하고 float 은 안 한다" 다.
+  // 대신 양쪽 집합이 비지 않았는지를 대조군으로 둔다 — 한쪽이 비면 그쪽
+  // 검사가 조용히 공회전한다.
+  const ints = PARAM_FIELDS.filter((f) => f.kind === 'int');
+  const floats = PARAM_FIELDS.filter((f) => f.kind === 'float');
+  const midOf = (f: ParamField): number => Math.floor(((f.min ?? 0) + (f.max ?? 0)) / 2);
+  const badRound = ints.filter((f) => {
+    const base = midOf(f);
+    return coerceParamValue(f, base + 0.4).value !== base
+      || coerceParamValue(f, base + 0.6).value !== base + 1
+      || coerceParamValue(f, base + 0.4).ok;      // 고쳤으면 ok 가 아니어야 한다
+  });
+  check('★ int 필드는 반올림한다 (.4 는 내리고 .6 은 올린다) — 고쳤다고 말하면서',
+    badRound.length === 0, badRound.map((f) => String(f.key)).join(', ') || `${ints.length}개 int`);
+  const badKeep = floats.filter((f) => {
+    const v = midOf(f) + 0.4;
+    if (v < (f.min ?? 0) || v > (f.max ?? 0)) return false;
+    const c = coerceParamValue(f, v);
+    return !(c.ok && c.value === v);
+  });
+  check('★★ 대조군: float 필드는 소수를 깎지 않는다 (반올림이 온 필드로 번지면 여기서 걸린다)',
+    badKeep.length === 0, badKeep.map((f) => String(f.key)).join(', ') || `${floats.length}개 float`);
+  check('★ 대조군: int·float 집합이 둘 다 비어 있지 않다 (위 두 검사가 공회전하지 않는다)',
+    ints.length > 0 && floats.length > 0, `int ${ints.length}개 / float ${floats.length}개`);
+
+  // ── 사유가 둘이면 둘 다 남는다 ─────────────────────────────
+  //
+  // int 필드에 `max + 0.6` 을 넣으면 **반올림과 클램프가 함께** 일어난다.
+  // 예전 구현은 `reason` 을 덮어써서 뒤에 온 클램프만 남겼고, 그러면 사용자가
+  // 넣은 소수가 어디로 갔는지 화면 어디에도 안 남았다.
+  //
+  // ⚠️ 문구를 통째로 박지 않는다 — 사람이 읽는 글이라 문장이 바뀐다. 대신
+  //    **구분자(` · `)로 사유가 몇 개인지**와 **원본 숫자가 문구에 남았는지**만 본다.
+  const badBoth = ints.filter((f) => {
+    const raw = (f.max ?? 0) + 0.6;
+    const c = coerceParamValue(f, raw);
+    if (c.value !== f.max || c.ok || c.reason === null) return true;
+    if (c.reason.split(' · ').length !== 2) return true;       // 사유 둘
+    return !c.reason.includes(String(raw));                    // 원본 소수가 남는다
+  });
+  check(
+    '★★ 반올림 + 클램프가 함께 일어나면 사유가 둘 다 남는다 (하나만 남기면 넣은 소수가 어디로 갔는지 안 보인다)',
+    badBoth.length === 0,
+    badBoth.map((f) => `${String(f.key)}: "${String(coerceParamValue(f, (f.max ?? 0) + 0.6).reason)}"`).join(' | ')
+    || `${ints.length}개 int`,
+  );
+  const badSingle = floats.filter((f) => {
+    const c = coerceParamValue(f, (f.max ?? 0) + 1);
+    return c.reason === null || c.reason.split(' · ').length !== 1;
+  });
+  check(
+    '★ 대조군: 사유가 하나면 하나만 남는다 (구분자를 항상 붙이는 구현이 아니다)',
+    badSingle.length === 0, badSingle.map((f) => String(f.key)).join(', ') || `${floats.length}개 float`,
+  );
+  note('두 사유 예시', String(ints[0] === undefined ? '' : coerceParamValue(ints[0], (ints[0].max ?? 0) + 0.6).reason));
+
+  // ── float 은 step 으로 스냅하지 않는다 (step 은 전부 추정이다) ──
+  const stepped = PARAM_FIELDS.filter((f) => f.kind === 'float' && f.step !== null);
+  const snapped = stepped.filter((f) => {
+    const v = (f.min ?? 0) + (f.step ?? 1) * 0.37;
+    const c = coerceParamValue(f, v);
+    return !(c.ok && c.value === v);
+  });
+  check(
+    '★ float 은 step 격자로 깎지 않는다 (step 은 근거 없는 추정이라 그걸로 사용자 입력을 바꾸면 안 된다)',
+    snapped.length === 0, snapped.map((f) => String(f.key)).join(', ') || `${stepped.length}개`,
+  );
+
+  // ── enum — 가까운 값으로 붙이지 않는다 ─────────────────────
+  const enums = PARAM_FIELDS.filter((f) => f.kind === 'enum');
+  const badEnum = enums.filter((f) => {
+    const max = Math.max(...(f.options ?? []).map((o) => o.value));
+    const over = coerceParamValue(f, max + 1);          // 바로 위 값
+    const frac = coerceParamValue(f, 1.5);              // 선택지 사이
+    const neg = coerceParamValue(f, -1);
+    return over.value !== f.fallback || frac.value !== f.fallback || neg.value !== f.fallback
+      || over.ok || frac.ok || neg.ok;
+  });
+  check(
+    '★★ 열거형은 없는 값을 가까운 선택지로 붙이지 않고 fallback 으로 되돌린다 (열거형에서 "가깝다"는 의미가 없다)',
+    badEnum.length === 0, badEnum.map((f) => String(f.key)).join(', ') || `${enums.length}개`,
+  );
+  const okEnum = enums.every((f) => (f.options ?? []).every((o) => {
+    const c = coerceParamValue(f, o.value);
+    return c.ok && c.value === o.value;
+  }));
+  check('대조군: 선택지에 있는 값은 전부 그대로 통과한다', okEnum, `${enums.length}개 전 선택지`);
+
+  // ── bool ───────────────────────────────────────────────────
+  const bools = PARAM_FIELDS.filter((f) => f.kind === 'bool');
+  const badBool = bools.filter((f) => {
+    const t = coerceParamValue(f, true);
+    const one = coerceParamValue(f, 1);
+    const zero = coerceParamValue(f, 0);
+    const str = coerceParamValue(f, 'true');
+    return !(t.ok && t.value === true)
+      || !(one.value === true && !one.ok) || !(zero.value === false && !zero.ok)
+      || !(str.value === f.fallback && !str.ok);
+  });
+  check(
+    '★ bool 은 boolean 을 그대로, 0/1 은 변환해 받고, 그 밖(문자열 "true" 포함)은 fallback 이다',
+    badBool.length === 0 && bools.length === 3,
+    badBool.map((f) => String(f.key)).join(', ') || `${bools.length}개 bool`,
+  );
+  check(
+    '숫자 필드에 boolean 이 오면 받지 않는다 (true 를 1 로 삼키지 않는다)',
+    PARAM_FIELDS.filter((f) => f.kind !== 'bool')
+      .every((f) => coerceParamValue(f, true).value === f.fallback && !coerceParamValue(f, true).ok),
+    '19개 필드',
+  );
+}
+
+// ── §11-5. 비활성 판정 — 회색이면 반드시 이유가 있다 ─────────
+
+function sectionParamDisabled(): void {
+  section('§11-5. 비활성 사유 (회색만 되고 이유가 없으면 그게 #14 의 거짓말이다)');
+
+  const cases: [string, { values: ParamValues; simInitialized: boolean }, string[]][] = [
+    ['워커에 붙기 전 (값이 없다)', { values: {}, simInitialized: false },
+      ['subStep', 'meshingEdgeLength', 'windMagnitude']],
+    ['바람 꺼짐 · 시뮬 전', { values: { useWind: false }, simInitialized: false },
+      ['subStep', 'meshingEdgeLength', 'windMagnitude']],
+    ['바람 켜짐 · 시뮬 전', { values: { useWind: true }, simInitialized: false },
+      ['subStep', 'meshingEdgeLength']],
+    ['바람 켜짐 · 시뮬 초기화됨', { values: { useWind: true }, simInitialized: true },
+      ['subStep', 'meshingEdgeLength', 'solverType']],
+    ['바람 꺼짐 · 시뮬 초기화됨', { values: { useWind: false }, simInitialized: true },
+      ['subStep', 'meshingEdgeLength', 'windMagnitude', 'solverType']],
+  ];
+  for (const [label, ctx, want] of cases) {
+    const got = disabledParams(ctx).map((d) => String(d.key));
+    check(`비활성 집합 — ${label}`, sortedKeys(got) === sortedKeys(want),
+      `[${got.join(',')}] (기대 [${[...want].sort().join(',')}])`);
+  }
+
+  check(
+    '★ 조건부 3개 중 groundPlane·groundFriction 은 끄지 않는다 (조건을 프런트가 알 수 없다 — 모르면서 끄면 만질 수 있는 걸 못 만지게 된다)',
+    !disabledParams({ values: { useWind: true }, simInitialized: false })
+      .some((d) => d.key === 'groundPlane' || d.key === 'groundFriction'),
+    'groundPlane·groundFriction 활성',
+  );
+
+  // ── 문구 ───────────────────────────────────────────────────
+  const all = cases.flatMap(([, ctx]) => disabledParams(ctx));
+  const mute = all.filter((d) => d.text.trim().length < 8);
+  check('★★ 모든 비활성 사유에 사람이 읽을 문구가 있다',
+    mute.length === 0, mute.map((d) => `${String(d.key)}:"${d.text}"`).join(', ') || `${all.length}건`);
+  check('사유의 key 가 그 필드를 가리킨다 (화면이 엉뚱한 위젯에 회색을 칠하지 않는다)',
+    PARAM_FIELDS.every((f) => {
+      const d = paramDisabledReason(f, { values: {}, simInitialized: true });
+      return d === null || d.key === f.key;
+    }), `${PARAM_FIELDS.length}/22`);
+  const deadText = all.find((d) => d.cause === 'dead')?.text ?? '';
+  check('★ 죽은 필드의 문구가 근거(ISSUE-014)와 "보내지 않는다"를 둘 다 말한다',
+    deadText.includes('ISSUE-014') && deadText.includes('전송하지 않'), deadText);
+  const depText = all.find((d) => d.cause === 'dependency')?.text ?? '';
+  check('★ 종속 문구가 게이트를 **라벨**로 말한다 (`useWind` 라는 내부 키를 사용자에게 보이지 않는다)',
+    depText.includes(PARAM_BY_KEY['useWind']?.label ?? ' ') && !depText.includes('useWind'), depText);
+  const lockText = all.find((d) => d.cause === 'simInitialized')?.text ?? '';
+  check('시뮬 잠금 문구가 있다', lockText.length > 8, lockText);
+
+  // ── 우선순위 — 합성 필드로만 볼 수 있다 ────────────────────
+  //
+  // 실제 22개 중 사유가 **둘 이상 겹치는 필드가 하나도 없다.** 그래서 실제
+  // 스키마만으로는 우선순위를 뒤집어도 아무 검사도 안 깨진다. 합성 필드를
+  // 만들어 직접 물어본다 (`paramDisabledReason` 이 필드를 인자로 받는 덕이다).
+  const base = PARAM_BY_KEY['windMagnitude'];
+  check('전제: 우선순위를 볼 기준 필드가 있다', base !== undefined, 'windMagnitude');
+  if (base !== undefined) {
+    const ctx = { values: { useWind: false }, simInitialized: true };
+    const three: ParamField = { ...base, effect: 'dead', lockedWhenSimInit: true };
+    const two: ParamField = { ...base, effect: 'conditional', lockedWhenSimInit: true };
+    const one: ParamField = { ...base, effect: 'conditional', lockedWhenSimInit: false };
+    check('★★ 우선순위 dead > simInitialized (되돌리기 어려운 것을 먼저 말한다)',
+      paramDisabledReason(three, ctx)?.cause === 'dead',
+      String(paramDisabledReason(three, ctx)?.cause));
+    check('★★ 우선순위 simInitialized > dependency',
+      paramDisabledReason(two, ctx)?.cause === 'simInitialized',
+      String(paramDisabledReason(two, ctx)?.cause));
+    check('세 번째가 dependency 다',
+      paramDisabledReason(one, ctx)?.cause === 'dependency',
+      String(paramDisabledReason(one, ctx)?.cause));
+    const free: ParamField = { ...base, effect: 'effective', requires: null, lockedWhenSimInit: false };
+    check('★ 대조군: 사유가 없으면 null 이다 (전부 비활성으로 만드는 구현이 아니다)',
+      paramDisabledReason(free, ctx) === null, 'null');
+    check('★ conditional 자체는 비활성 사유가 아니다',
+      paramDisabledReason({ ...base, effect: 'conditional', requires: null },
+        { values: {}, simInitialized: false }) === null, 'null');
+  }
+
+  check('disabledParams 의 순서가 PARAM_FIELDS 순서다 (화면이 위에서 아래로 훑는다)',
+    (() => {
+      const got = disabledParams({ values: {}, simInitialized: true }).map((d) => String(d.key));
+      const want = PARAM_FIELDS.map((f) => String(f.key)).filter((k) => got.includes(k));
+      return got.join(',') === want.join(',');
+    })(), '순서 일치');
+}
+
+// ── §11-6. buildSetParamsPayload — 죽은 필드가 새지 않는다 ───
+//
+// **이 단위가 존재하는 이유다.** 워커는 `subStep` 을 받아 `applied` 에 넣어
+// 성공으로 답하고, 물리는 그 값을 보지 않는다. 보내는 순간 화면은 "적용됨"
+// 이라고 말할 근거를 얻고, 그 말은 거짓이다.
+
+function sectionParamPayload(): void {
+  section('§11-6. setParams 페이로드 변환 (#16 통과 기준)');
+
+  // 죽은 필드를 **온갖 방법으로** 밀어 넣어 본다.
+  const pushes: [string, unknown][] = [
+    ['유효값', 4], ['fallback', 1], ['범위 밖', 999], ['문자열', '4'],
+    ['NaN', NaN], ['null', null], ['true', true], ['0', 0],
+  ];
+  const leaked: string[] = [];
+  for (const key of DEAD_KEYS) {
+    for (const [label, v] of pushes) {
+      const r = buildSetParamsPayload({ [key]: v });
+      if (Object.keys(r.payload).length !== 0) leaked.push(`${key}/${label}`);
+      if (!r.dropped.map(String).includes(key)) leaked.push(`${key}/${label}(dropped 누락)`);
+    }
+  }
+  check(
+    '★★★ 죽은 필드는 어떤 값으로도 페이로드에 들어가지 않고 dropped 로 보고된다',
+    leaked.length === 0, leaked.slice(0, 4).join(', ') || `2필드 × ${pushes.length}종`,
+  );
+
+  const everything = buildSetParamsPayload(fallbackParamValues());
+  check(
+    '★★ 22개를 전부 넣어도 페이로드는 20개다 (죽은 2개가 빠진 자리)',
+    Object.keys(everything.payload).length === 20
+    && !DEAD_KEYS.some((k) => k in everything.payload)
+    && sortedKeys(everything.dropped.map(String)) === sortedKeys(DEAD_KEYS),
+    `payload=${Object.keys(everything.payload).length} dropped=[${everything.dropped.join(',')}]`,
+  );
+  check(
+    '★ 종속이 안 맞아도 windMagnitude 는 보낸다 (빼면 나중에 바람을 켠 순간 옛 세기가 살아난다)',
+    'windMagnitude' in buildSetParamsPayload({ useWind: false, windMagnitude: 77 }).payload,
+    'windMagnitude 포함',
+  );
+  check(
+    '★ 잠긴 필드(solverType)도 보낸다 (위젯을 막는 규칙이지 전송 규칙이 아니다)',
+    buildSetParamsPayload({ solverType: 1 }).payload['solverType'] === 1,
+    'solverType=1',
+  );
+
+  // ── 모르는 키를 조용히 삼키지 않는다 ───────────────────────
+  const typo = buildSetParamsPayload({ timestep: 45, TimeStep: 45, gravity: -980, '': 1 });
+  check(
+    '★★ 대소문자·이름이 틀린 키는 전부 unknown 이고 페이로드는 빈다 (조용히 먹히면 디버깅이 지옥이 된다)',
+    Object.keys(typo.payload).length === 0 && typo.unknown.length === 4,
+    `unknown=[${typo.unknown.join(',')}]`,
+  );
+  const empty = buildSetParamsPayload({});
+  check('빈 입력이면 전부 빈다 (없는 것을 지어내지 않는다)',
+    Object.keys(empty.payload).length === 0 && empty.dropped.length === 0
+    && empty.unknown.length === 0 && empty.adjusted.length === 0, '{} → 전부 0');
+
+  // ── 고친 값은 반드시 보고된다 ──────────────────────────────
+  //
+  // 반올림을 겪을 필드를 **이름으로 적지 않고 스키마에서 고른다** — `timeStep`
+  // 이 int→float 으로 옮겨 가며 이 예제가 한 번 낡았다. 뽑는 조건이 계약이다.
+  const roundee = PARAM_FIELDS.find((f) => f.kind === 'int' && f.effect !== 'dead');
+  check('전제: 반올림을 겪을 int 필드가 스키마에 있다', roundee !== undefined,
+    String(roundee?.key));
+  if (roundee !== undefined) {
+    const rk = String(roundee.key);
+    const rawInt = Math.floor(((roundee.min ?? 0) + (roundee.max ?? 0)) / 2) + 0.7;
+    const b = buildSetParamsPayload({
+      [rk]: rawInt, subStep: 8, windMagnitude: 1e6, nope: 1, solverType: 9,
+    });
+    check(
+      '★ 고친 값 · 뺀 값 · 모르는 키가 한 번에 정확히 보고된다',
+      b.payload[rk] === Math.round(rawInt) && b.payload['windMagnitude'] === 500
+      && b.payload['solverType'] === 0
+      && Object.keys(b.payload).length === 3
+      && b.dropped.map(String).join(',') === 'subStep'
+      && b.unknown.join(',') === 'nope'
+      && b.adjusted.length === 3,
+      `payload=${JSON.stringify(b.payload)} adjusted=${b.adjusted.length}건`,
+    );
+    const adj = buildSetParamsPayload({ [rk]: rawInt }).adjusted[0];
+    check('adjusted 가 원본(from)도 들고 있다 (화면이 "45.7 → 46" 처럼 말할 수 있다)',
+      adj?.from === rawInt && adj?.to === Math.round(rawInt),
+      JSON.stringify(adj));
+  }
+  check(
+    '★★ 워커가 실수로 읽는 필드는 소수를 넣어도 adjusted 가 생기지 않는다 (조용히 반올림하지 않는다)',
+    (() => {
+      const f = PARAM_FIELDS.find(
+        (x) => workerParamKinds().get(String(x.key)) === 'F' && x.effect !== 'dead');
+      if (f === undefined) return false;
+      const v = ((f.min ?? 0) + (f.max ?? 0)) / 2 + 0.25;
+      const r = buildSetParamsPayload({ [String(f.key)]: v });
+      return r.payload[String(f.key)] === v && r.adjusted.length === 0;
+    })(),
+    'float 필드 무손실',
+  );
+  const noSilent = PARAM_FIELDS.filter((f) => {
+    // 각 필드에 확실히 못 쓰는 값을 넣고, 값이 바뀌었으면 반드시 adjusted 에 남는지
+    const r = buildSetParamsPayload({ [String(f.key)]: 'x' });
+    if (f.effect === 'dead') return false;
+    const sent = r.payload[String(f.key)];
+    return sent !== f.fallback || r.adjusted.length !== 1 || r.adjusted[0]?.reason === '';
+  });
+  check(
+    '★★ 값을 고쳤으면 반드시 이유와 함께 adjusted 에 남는다 (몰래 바꾸지 않는다)',
+    noSilent.length === 0, noSilent.map((f) => String(f.key)).join(', ') || '20개 필드',
+  );
+  // ── 페이로드는 워커가 받는 타입만 담는다 ───────────────────
+  const typed = buildSetParamsPayload(
+    Object.fromEntries(PARAM_FIELDS.map((f) => [String(f.key), 'x'])));
+  const badType = Object.entries(typed.payload).filter(
+    ([, v]) => !(typeof v === 'number' || typeof v === 'boolean'));
+  check('페이로드 값이 전부 number|boolean 이다 (게이트웨이가 문자열을 막기 전에 우리가 막는다)',
+    badType.length === 0, badType.map(([k]) => k).join(', ') || '20개');
+  const boolKeys = PARAM_FIELDS.filter((f) => f.kind === 'bool').map((f) => String(f.key));
+  check(
+    '★ bool 필드는 boolean 으로, 나머지는 number 로 나간다 (워커의 get<bool>/get<float> 가 던지지 않는다)',
+    Object.entries(typed.payload).every(
+      ([k, v]) => (boolKeys.includes(k) ? typeof v === 'boolean' : typeof v === 'number')),
+    `bool 3개 / number 17개`,
+  );
+
+  // ── ★ 프로토타입 이름의 키 ─────────────────────────────────
+  //
+  // `PARAM_BY_KEY` 가 `Object.fromEntries` 산물이던 시절, `Object.prototype` 의
+  // 이름이 전부 "스키마에 있는 필드" 로 읽혔다. `PARAM_BY_KEY['constructor']` 는
+  // `Object` 생성자 함수라 `!== undefined` 를 통과하고, 그 "필드" 의 `key` 가
+  // `undefined` 라서 **`"undefined"` 라는 키가 워커로 나갔다.** 동시에 그 키는
+  // `unknown` 에 안 담겨 "오타를 조용히 삼키지 않는다" 가 정확히 뒤집혔다.
+  //
+  // ⚠️ 객체 리터럴의 `__proto__` 는 소유 속성이 아니라 프로토타입 지정이다.
+  //    워커 응답이 오는 경로와 같게 하려면 **`JSON.parse` 로 만들어야** 한다.
+  const protoKeys = ['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__'];
+  const proto = buildSetParamsPayload(
+    JSON.parse(`{${protoKeys.map((k) => `"${k}":1`).join(',')},"nope":2}`) as Record<string, unknown>);
+  check(
+    '★★★ 프로토타입 이름의 키가 필드로 둔갑하지 않는다 — 전부 unknown 이고 페이로드는 빈다',
+    Object.keys(proto.payload).length === 0
+    && sortedKeys(proto.unknown) === sortedKeys([...protoKeys, 'nope']),
+    `payload=${JSON.stringify(proto.payload)} unknown=[${proto.unknown.join(',')}]`,
+  );
+  check(
+    '★★ 그래서 `"undefined"` 라는 키가 워커로 나가지 않는다 (증상은 이 한 글자로만 드러났다)',
+    !('undefined' in proto.payload), `keys=[${Object.keys(proto.payload).join(',')}]`,
+  );
+  check(
+    '★★ paramField() 가 그 이름들에 null 을 준다 (조회 지점이 늘어도 같은 답을 준다)',
+    protoKeys.every((k) => paramField(k) === null) && paramField('nope') === null,
+    `${protoKeys.length + 1}개 → null`,
+  );
+  check(
+    '★ 대조군: paramField() 는 진짜 키에는 필드를 준다 (전부 null 을 주는 구현이 아니다)',
+    PARAM_FIELDS.every((f) => paramField(String(f.key)) === f),
+    `${PARAM_FIELDS.length}/22`,
+  );
+  check(
+    '★ PARAM_BY_KEY 자체에 프로토타입이 없다 (바깥에서 맨손으로 읽어도 안 뚫린다)',
+    Object.getPrototypeOf(PARAM_BY_KEY) === null,
+    String(Object.getPrototypeOf(PARAM_BY_KEY)),
+  );
+}
+
+// ── §11-7. 실제 워커로 스키마를 검증한다 ─────────────────────
+//
+// §11-1 은 `protocol.cpp` 를 **글자로** 읽었다. 그 파일이 실제로 빌드된
+// 워커와 같다는 보장은 없다(빌드가 오래됐을 수 있다). 여기서 진짜 워커에
+// 스키마가 만든 페이로드를 그대로 던져 `unknown` 이 비는지 본다. 이 절이
+// 통과하면 "슬라이더를 움직였는데 아무 일도 안 일어난다" 의 절반(이름)이
+// 구조적으로 배제된다. 나머지 절반(물리 반영)은 ISSUE-014 의 측정이 덮는다.
+
+async function sectionParamRealWorker(): Promise<void> {
+  section('§11-7. 실제 워커 대조 (스키마 → setParams)');
+
+  if (!existsSync(EXE) || !existsSync(ZLS)) {
+    check('워커 exe와 sample.zls가 있다', false, `exe=${existsSync(EXE)}, zls=${existsSync(ZLS)}`);
+    return;
+  }
+
+  await withGateway(async (_gw, addr) => {
+    const scene = await findOrUploadScene(addr.url);
+    if (!scene) {
+      check('씬 준비', false, 'sample.zls를 준비하지 못했다');
+      return;
+    }
+    const client = new GatewayClient({ url: addr.url, requestTimeoutMs: 60_000 });
+    try {
+      await client.connect();
+      await client.load(scene.id);
+
+      const raw = await client.getParams() as unknown as Record<string, unknown>;
+      const schemaKeys = PARAM_FIELDS.map((f) => String(f.key));
+      const workerKeys = Object.keys(raw);
+      check(
+        '★★ 살아 있는 워커의 getParams 키가 스키마 22개와 정확히 같다',
+        sortedKeys(workerKeys) === sortedKeys(schemaKeys),
+        `워커=${workerKeys.length}개 / 스키마=${schemaKeys.length}개`,
+      );
+
+      const values = readParamValues(raw);
+      check('readParamValues 가 워커 응답에서 22개를 전부 건진다 (타입 필터에 걸려 새는 것이 없다)',
+        Object.keys(values).length === 22, `${Object.keys(values).length}개`);
+
+      // ★ 실측 표는 W_Bra 씬의 것이라 sample.zls 의 값은 다르다. 그래서 값이
+      //   아니라 **범위 밖으로 잘리는가**만 본다 — 잘리면 사용자가 만지지도
+      //   않은 값이 바뀐다.
+      const clipped = PARAM_FIELDS.filter((f) => {
+        const v = values[f.key];
+        return v !== undefined && !coerceParamValue(f, v).ok;
+      });
+      check(
+        '★★ 이 씬(sample.zls)의 값도 스키마 범위 안이다 — UI 가 워커 값을 몰래 클램프하지 않는다',
+        clipped.length === 0,
+        clipped.map((f) => {
+          const v = values[f.key];
+          return `${String(f.key)}=${String(v)}→${String(coerceParamValue(f, v).value)}`;
+        }).join(', ') || '22/22',
+      );
+      note('sample.zls 실측', PARAM_FIELDS.slice(0, 6)
+        .map((f) => `${String(f.key)}=${String(values[f.key])}`).join(' '));
+
+      const built = buildSetParamsPayload(values);
+      const res = await client.setParams(built.payload as Parameters<GatewayClient['setParams']>[0]);
+      check(
+        '★★★ 스키마가 만든 페이로드를 워커가 하나도 모르는 키 없이 받는다',
+        res.unknown.length === 0 && res.applied.length === 20,
+        `applied=${res.applied.length} unknown=[${res.unknown.join(',')}]`,
+      );
+      check(
+        '★ applied 가 우리가 보낸 20개와 같은 이름이다 (죽은 2개는 애초에 안 갔다)',
+        sortedKeys(res.applied) === sortedKeys(Object.keys(built.payload)),
+        `${res.applied.length}개`,
+      );
+
+      const after = await client.getParams() as unknown as Record<string, unknown>;
+      const drifted = PARAM_FIELDS.filter((f) => {
+        const a = values[f.key];
+        const b = after[String(f.key)];
+        return typeof b !== 'object' && a !== b;
+      });
+      check(
+        '★★ 왕복 뒤 워커의 값이 하나도 안 달라졌다 (아무것도 안 만졌으므로)',
+        drifted.length === 0,
+        drifted.map((f) => `${String(f.key)}: ${String(values[f.key])}→${String(after[String(f.key)])}`)
+          .join(', ') || '22/22',
+      );
+
+      // ── 죽은 필드를 보냈다면 워커가 뭐라고 답하는가 ──────────
+      // ISSUE-014 의 전제를 여기서 못 박는다: **워커는 성공으로 답한다.**
+      // 그래서 이 값을 보내면 화면이 "적용됨" 이라는 거짓말을 하게 된다.
+      const deadEcho = await client.setParams({ subStep: 8, meshingEdgeLength: 4 });
+      check(
+        '★★ 전제 확인: 죽은 2개도 워커는 "적용됨"으로 답한다 — 그래서 보내면 안 된다',
+        deadEcho.applied.length === 2 && deadEcho.unknown.length === 0,
+        `applied=[${deadEcho.applied.join(',')}] unknown=[${deadEcho.unknown.join(',')}]`,
+      );
+      const typoEcho = await client.setParams({ timestep: 45 });
+      check(
+        '★★ 전제 확인: 키 한 글자가 틀리면 워커는 unknown 으로 되돌린다 (§11-1 이 막는 것이 이것이다)',
+        typoEcho.unknown.join(',') === 'timestep' && typoEcho.applied.length === 0,
+        `unknown=[${typoEcho.unknown.join(',')}]`,
+      );
+    } catch (err: unknown) {
+      check('§11-7 실제 워커 대조', false, messageOf(err));
+    } finally {
+      await client.close().catch(() => {});
+    }
+  }, { sessions: { idleTimeout: 0, requestTimeoutMs: 120_000 } });
+}
+
+// ─────────────────────────────────────────────────────────────
 // §9. 좀비 프로세스
 // ─────────────────────────────────────────────────────────────
 
@@ -5362,6 +6430,15 @@ async function main(): Promise<void> {
   await sectionPlaybackStep();
   sectionPlaybackShortcuts();
   await sectionPlaybackRealWorker();
+  // #16-a 파라미터 스키마. §11-1~§11-6 은 순수 함수라 즉시 끝나고, §11-7 만
+  // 실제 워커를 하나 띄운다 — 스키마의 키가 **빌드된 워커**와 같은지 보는 절이다.
+  sectionParamKeys();
+  sectionParamSchema();
+  sectionParamMeasured();
+  sectionParamCoerce();
+  sectionParamDisabled();
+  sectionParamPayload();
+  await sectionParamRealWorker();
   await sectionZombies();
 
   clearInterval(keepAlive);
