@@ -20,7 +20,12 @@
  * 쓴다 — 네이티브라 3~5배 빠르다. 없으면 조용히 폴백한다.
  */
 
-import type { FrameMesh, PatternData, PatternTransform } from './types.ts';
+import type {
+  FrameMesh,
+  PatternData,
+  PatternTransform,
+  PatternTransform2D,
+} from './types.ts';
 
 /** ES2025 `Uint8Array.fromBase64`. 아직 lib 에 없어서 직접 좁힌다 */
 type FromBase64 = (base64: string) => Uint8Array;
@@ -111,6 +116,19 @@ export interface DecodedPattern {
    * 프레임 이벤트에는 오지 않으므로 여기서 받은 것을 계속 쓴다.
    */
   transform?: PatternTransform;
+  /**
+   * 서피스 로컬 → **2D 재단 도면** 배치 (ISSUE-018). **topology:true 일 때만.**
+   *
+   * ⚠️ 위의 `transform`(3D)과 **다른 것이다.** 저쪽은 옷이 몸에 둘러지는 자리,
+   *    이쪽은 도면 위의 자리다. 2D 펼침 뷰(#15-b)는 3D 변환을 **쓰지 않는다.**
+   *
+   * `uvs` 와 짝으로 쓴다 — `uvs` 만으로 그리면 패턴 24개가 겹쳐 한 덩어리가
+   * 된다(실측: 겹치는 AABB 쌍 82.2% → 이 행렬 적용 후 2.5%).
+   *
+   * 행 우선 3×3, 열벡터 규약: `wx = m[0]*x + m[1]*y + m[2]`,
+   * `wy = m[3]*x + m[4]*y + m[5]`. 단위 cm.
+   */
+  transform2d?: PatternTransform2D;
   vertices: number;
   triangles: number;
 }
@@ -158,6 +176,37 @@ function decodeTransform(uuid: string, raw: unknown): PatternTransform | undefin
     rotation: [rx, ry, rz, rw],
     scale: [sx, sy, sz],
   };
+}
+
+/**
+ * `transform2d` 검증 — `decodeTransform` 과 **같은 이유로 같은 일**을 한다.
+ *
+ * 길이 9 와 유한성만 본다. 모양이 틀린 채 통과시키면 2D 위치가 `NaN` 이 되고,
+ * three 는 조용히 아무것도 그리지 않는다 — 패턴 하나가 통째로 사라지는데
+ * 정점 수는 정상으로 찍히므로 화면에서 원인을 읽을 방법이 없다.
+ *
+ * ⚠️ 없는 것(`undefined`)은 오류가 아니다. `topology:false` 로 받은 프레임
+ *    이벤트의 mesh 와, 서피스가 없는 패턴이 그렇다. 그 경우 2D 배치를
+ *    **모르는 것**이고, 항등행렬로 대신하지 않는다 — 원점에 배치된 패턴과
+ *    구분할 수 없게 된다.
+ */
+function decodeTransform2D(uuid: string, raw: unknown): PatternTransform2D | undefined {
+  if (raw === undefined || raw === null) return undefined;
+
+  if (!Array.isArray(raw) || raw.length !== 9) {
+    throw new Error(
+      `패턴 ${uuid}: transform2d 는 길이 9 의 배열이어야 합니다 `
+      + `(${Array.isArray(raw) ? `길이 ${raw.length}` : typeof raw})`,
+    );
+  }
+
+  for (const v of raw) {
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      throw new Error(`패턴 ${uuid}: transform2d 에 숫자가 아닌 값이 있습니다`);
+    }
+  }
+
+  return [...(raw as number[])] as unknown as PatternTransform2D;
 }
 
 /**
@@ -216,6 +265,13 @@ export function decodePattern(p: PatternData): DecodedPattern {
   // 사람이 읽을 수 있어야 익스포트 산출물의 노드 변환과 대조할 수 있다.
   const transform = decodeTransform(p.uuid, p.transform);
   if (transform) out.transform = transform;
+
+  // 2D 도면 배치 (ISSUE-018). 같은 이유로 평문 숫자다 — 패턴당 9개뿐이고,
+  // 사람이 읽을 수 있어야 씬 파일의 translateX/translateY 와 대조할 수 있다
+  // (실측 대조: 패턴 12 의 m02=64.9047 / m12=102.6260 이 .zls 의
+  //  translateX=64.9046783 / translateY=102.6260376 과 일치했다).
+  const transform2d = decodeTransform2D(p.uuid, p.transform2d);
+  if (transform2d) out.transform2d = transform2d;
 
   return out;
 }

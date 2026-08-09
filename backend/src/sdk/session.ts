@@ -26,11 +26,23 @@ export interface SessionOptions extends WorkerOptions {
   autoInit?: boolean;
 }
 
-/** three.js 등에서 바로 쓸 수 있게 푼 지오메트리 */
+/**
+ * three.js 등에서 바로 쓸 수 있게 푼 지오메트리 — **base64 배열만 푼다.**
+ *
+ * ⚠️ 변환 두 개(`transform` 3D / `transform2d` 2D)는 **여기 없다.** 둘 다
+ *    base64 가 아니라 평문 숫자라 풀 것이 없고, 이 SDK 를 쓰는 쪽(도구·게이트
+ *    웨이)은 원본 `MeshDataResult` 를 그대로 들고 있기 때문이다 — 필요하면
+ *    `mesh.patterns[i].transform` / `.transform2d` 를 직접 읽는다
+ *    (`tools/ground-probe.ts` 가 그렇게 한다). 하나만 여기 올리면 "2D 배치는
+ *    풀어 주는데 3D 는 안 풀어 주나" 라는 어긋남이 생기므로 둘 다 두지 않는다.
+ *    **프론트의 `DecodedPattern`(frontend/src/protocol/decode.ts)은 다르다** —
+ *    그쪽은 three 에 바로 꽂아야 해서 둘 다 싣는다.
+ */
 export interface DecodedPattern {
   uuid: string;
   positions: Float32Array;
   indices?: Int32Array;
+  /** cm 단위 2D 패턴 좌표. **서피스 로컬**이다 (`transform2d` 를 곱해야 도면) */
   uvs?: Float32Array;
   vertices: number;
   triangles: number;

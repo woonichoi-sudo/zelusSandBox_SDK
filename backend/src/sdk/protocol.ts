@@ -135,6 +135,38 @@ export interface PatternTransform {
   scale: [number, number, number];
 }
 
+/**
+ * 서피스 → **2D 재단 도면** 배치 (ISSUE-018). 행 우선 3×3, 9개.
+ *
+ * ⚠️ 위의 `PatternTransform`(3D)과 **전혀 다른 것이다.** 저쪽은 패턴 로컬 →
+ *    3D 월드(옷이 몸에 둘러지는 자리)이고, 이쪽은 로컬 → 2D 도면 위의 자리다.
+ *    2D 펼침 뷰의 요점은 3D 변환을 **쓰지 않는 것**이라 둘을 섞으면 안 된다.
+ *
+ * ── 왜 필요한가 ────────────────────────────────────────────
+ * `uvs` 는 cm 단위 2D 패턴 좌표지만 **서피스 로컬**이다 — 패턴마다 자기 원점
+ * 근처에서 시작하므로 그대로 그리면 겹친다. `W_Bra top & Leggings.zls`
+ * (패턴 24개) 실측: 적용 전 AABB 쌍 276개 중 227개(82.2%)가 겹쳤고, 적용 후
+ * **7개(2.5%)** 로 떨어졌다(면적비 2.05배 → 0.55배).
+ *
+ * ── 규약 (전치해도 그럴듯한 그림이 나오므로 못박는다) ──────
+ * 배열은 **행 우선** `[m00,m01,m02, m10,m11,m12, m20,m21,m22]` 이고 적용은
+ * **열벡터** 규약이다:
+ *
+ *   wx = m[0]*x + m[1]*y + m[2]
+ *   wy = m[3]*x + m[4]*y + m[5]
+ *
+ * 마지막 행은 항상 `[0,0,1]` 이다. 단위는 정점·uv 와 같은 **cm**.
+ *
+ * 워커가 `ztDesignSurface::GetTransform().GetMatrix33()` 을 그대로 내보내고,
+ * 그 값은 데스크톱 2D 뷰포트가 캔버스에 거는 것과 **같은 행렬**이다
+ * (`Renderer2D.cpp:164` → `PaintInterface2D.cpp:908-914`).
+ */
+export type PatternTransform2D = [
+  number, number, number,
+  number, number, number,
+  number, number, number,
+];
+
 export interface PatternData {
   uuid: string;
   vertices: number;
@@ -145,7 +177,12 @@ export interface PatternData {
   /** base64. int32. topology:true 일 때만 */
   indices?: string;
   indexStride?: number;
-  /** base64. float32 x2. topology:true 일 때만 */
+  /**
+   * base64. float32 x2. topology:true 일 때만.
+   *
+   * cm 단위 2D 패턴 좌표다(텍스처 좌표가 아니다). **서피스 로컬**이라
+   * 이것만으로는 2D 도면을 그릴 수 없다 — `transform2d` 를 곱해야 한다.
+   */
   uvs?: string;
   /**
    * 패턴 로컬 → 월드 (ISSUE-011). **topology:true 일 때만.**
@@ -155,6 +192,18 @@ export interface PatternData {
    * 동일). 받는 쪽은 한 번 받아 계속 쓴다.
    */
   transform?: PatternTransform;
+  /**
+   * 서피스 → 2D 도면 배치 (ISSUE-018). **topology:true 일 때만.**
+   *
+   * `uvs` 와 짝이다 — 저것이 로컬 좌표, 이것이 배치. 서피스가 없는 패턴에는
+   * 아예 오지 않는다(항등행렬을 대신 보내지 않는다 — "원점에 배치된 것" 과
+   * "배치를 모르는 것" 을 구분할 수 있어야 한다).
+   *
+   * ⚠️ topology 안에 있는 근거가 3D `transform` 과 **다르다.** 저쪽은 249프레임
+   *    실측으로 불변을 확인한 것이고, 이쪽은 **워커에 2D 배치를 바꿀 op 이
+   *    하나도 없다**는 것이다. 2D 저작 기능이 붙으면 깨진다.
+   */
+  transform2d?: PatternTransform2D;
 }
 
 export interface MeshDataResult {

@@ -135,9 +135,9 @@ import {
   type SceneSummary,
   type StatusResult,
 } from './index.ts';
-// `PatternTransform` 만은 배럴(`index.ts`)이 재export 하지 않아 여기서 직접 꺼낸다.
-// (`types.ts` 가 `sdk/protocol.ts` 의 정의를 재export 하는 그 타입이다.)
-import type { PatternTransform } from './types.ts';
+// 변환 타입 둘. ISSUE-018 부터는 배럴(`index.ts`)도 이 둘을 재export 하지만,
+// 정의가 사는 곳은 `types.ts`(→ `sdk/protocol.ts`)이므로 여기서 직접 꺼낸다.
+import type { PatternTransform, PatternTransform2D } from './types.ts';
 
 // ── 하네스 ───────────────────────────────────────────────────
 
@@ -661,6 +661,132 @@ function sectionDecodeLength(): void {
       `${label} → 던진다`,
       msg.includes(expect) && msg.includes('p-t'),
       msg || '조용히 통과해버렸다 — 화면이 비고 원인을 못 읽는다',
+    );
+  }
+
+  // ── transform2d (ISSUE-018) — 2D 도면 배치 ──────────────────
+  //
+  // `transform`(3D)과 **다른 것이다.** 저쪽은 옷이 몸에 둘러지는 자리, 이쪽은
+  // 재단 도면 위의 자리다. 실패 양상은 같다 — 모양이 틀린 것을 통과시키면 2D
+  // 좌표가 `NaN` 이 되어 그 패턴이 화면에서 통째로 사라지는데 정점 수는 정상으로
+  // 찍힌다. 반대로 없는 것을 오류로 만들면 프레임 이벤트마다 던져서 2D 뷰가
+  // 아예 안 선다. 두 방향 모두 못으로 박는다.
+  //
+  // ⚠️ 여기서 보는 것은 **모양뿐**이다. 값이 옳은가(전치되지 않았는가)는 바깥의
+  //    정답지가 있어야 알 수 있고, 그건 backend 스모크 §5.7·§5.8 이 씬 파일의
+  //    translateX/rotation 과 성분별로 대조해서 본다. 이 절이 그것까지 본다고
+  //    착각하면 전치를 놓친다.
+  const with2d = (raw: unknown): PatternData =>
+    ({ ...tBase, transform2d: raw } as unknown as PatternData);
+
+  const r2 = decodePattern(with2d([1, 2, 3, 4, 5, 6, 0, 0, 1])).transform2d;
+  check(
+    'transform2d 왕복 — 아홉 개 숫자가 순서 그대로 실린다 (행 우선)',
+    r2 !== undefined && r2.length === 9 && r2.join(',') === '1,2,3,4,5,6,0,0,1',
+    JSON.stringify(r2),
+  );
+  check(
+    '★ 디코더가 배열을 복사한다 (워커 응답 객체를 나중에 재사용해도 값이 안 새어 나간다)',
+    (() => {
+      const raw = [1, 2, 3, 4, 5, 6, 0, 0, 1];
+      const out = decodePattern(with2d(raw)).transform2d;
+      raw[2] = 999;
+      return out?.[2] === 3;
+    })(),
+  );
+
+  const absent2d = (label: string, p: PatternData): { ok: boolean; detail: string } => {
+    try {
+      const d = decodePattern(p);
+      return {
+        ok: d.transform2d === undefined && !('transform2d' in d),
+        detail: 'transform2d' in d
+          ? `${label}: 키가 남았다 ${JSON.stringify(d.transform2d)}`
+          : `${label}: 키 자체가 없다`,
+      };
+    } catch (err: unknown) {
+      return { ok: false, detail: `${label}: 던졌다 — ${messageOf(err)}` };
+    }
+  };
+  const no2dKey = absent2d('키 없음', tBase);
+  const null2dKey = absent2d('null', with2d(null));
+  check(
+    '★★ transform2d 가 없으면 undefined 다 — 항등행렬로 메우지 않는다',
+    no2dKey.ok, no2dKey.detail,
+  );
+  check(
+    '★ null 도 오류가 아니다 (topology:false·서피스 없는 패턴 → "배치를 모른다")',
+    null2dKey.ok, null2dKey.detail,
+  );
+
+  const bad2d: [string, unknown, string][] = [
+    ['★★ 원소가 6개 (마지막 행을 잘라 보낸 워커 — 2×3 으로 착각하기 딱 좋은 모양)',
+      [1, 0, 0, 0, 1, 0], '길이 6'],
+    ['★ 원소가 16개 (3D 4×4 행렬을 그대로 실었다)',
+      [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], '길이 16'],
+    ['★ 원소가 하나 모자란다 (8개)',
+      [1, 0, 0, 0, 1, 0, 0, 0], '길이 8'],
+    ['★ 빈 배열',
+      [], '길이 0'],
+    ['★★ NaN 이 섞였다 (three 가 조용히 아무것도 안 그린다 — 화면에서 원인을 못 읽는다)',
+      [1, 0, Number.NaN, 0, 1, 0, 0, 0, 1], '숫자가 아닌 값'],
+    ['★ Infinity 가 섞였다 (0 으로 나눈 스케일)',
+      [1, 0, 0, 0, Number.POSITIVE_INFINITY, 0, 0, 0, 1], '숫자가 아닌 값'],
+    ['★ 숫자를 문자열로 실었다 (JSON 직렬화 사고)',
+      ['1', 0, 0, 0, 1, 0, 0, 0, 1], '숫자가 아닌 값'],
+    ['★ null 이 원소로 섞였다',
+      [1, 0, null, 0, 1, 0, 0, 0, 1], '숫자가 아닌 값'],
+    ['★★ 배열이 아니라 객체다 ({m00:…} 로 보낸 워커)',
+      { m00: 1, m01: 0, m02: 0, m10: 0, m11: 1, m12: 0, m20: 0, m21: 0, m22: 1 }, 'object'],
+    ['★★ 3D transform 을 2D 자리에 실었다 (키 이름을 헷갈린 워커)',
+      { translation: [1, 2, 3], rotation: [0, 0, 0, 1], scale: [1, 1, 1] }, 'object'],
+    ['★ 숫자 하나를 실었다',
+      42, 'number'],
+    ['★ 중첩 배열로 실었다 ([[…],[…],[…]] — 길이 3이라 길이 검사에 먼저 걸린다)',
+      [[1, 0, 0], [0, 1, 0], [0, 0, 1]], '길이 3'],
+  ];
+  for (const [label, raw, expect] of bad2d) {
+    let msg = '';
+    try {
+      decodePattern(with2d(raw));
+    } catch (err: unknown) {
+      msg = messageOf(err);
+    }
+    check(
+      `${label} → 던진다`,
+      msg.includes(expect) && msg.includes('transform2d') && msg.includes('p-t'),
+      msg || '조용히 통과해버렸다 — 패턴 하나가 화면에서 사라지고 원인을 못 읽는다',
+    );
+  }
+
+  // 두 변환이 서로의 검증을 건드리지 않는다. 한쪽만 틀린 응답에서 **틀린 쪽**을
+  // 지목해야 원인을 읽을 수 있다.
+  {
+    const both = decodePattern({
+      ...tBase,
+      transform: { translation: [1, 2, 3], rotation: [0, 0, 0, 1], scale: [1, 1, 1] },
+      transform2d: [9, 8, 7, 6, 5, 4, 0, 0, 1],
+    } as unknown as PatternData);
+    check(
+      '★ 한 패턴이 3D·2D 변환을 동시에 들 수 있다 (topology:true 응답의 실제 모양)',
+      both.transform?.translation.join(',') === '1,2,3'
+      && both.transform2d?.join(',') === '9,8,7,6,5,4,0,0,1',
+      `${JSON.stringify(both.transform)} / ${JSON.stringify(both.transform2d)}`,
+    );
+    let which = '';
+    try {
+      decodePattern({
+        ...tBase,
+        transform: { translation: [1, 2, 3], rotation: [0, 0, 0, 1], scale: [1, 1, 1] },
+        transform2d: [1, 2, 3],
+      } as unknown as PatternData);
+    } catch (err: unknown) {
+      which = messageOf(err);
+    }
+    check(
+      '★★ 2D 만 틀렸을 때 오류가 2D 를 지목한다 (3D 를 탓하면 엉뚱한 곳을 판다)',
+      which.includes('transform2d') && !which.includes('transform.'),
+      which || '던지지 않았다',
     );
   }
 
@@ -1593,6 +1719,8 @@ async function sectionRealWorker(): Promise<void> {
       let decodeErr = '';
       /** 로드 직후의 변환 원문. 시뮬을 돌린 뒤 그대로인지 아래에서 다시 본다 */
       let transformsAtLoad: string | null = null;
+      /** 같은 것을 2D 배치에 대해서도 (ISSUE-018) */
+      let transform2dAtLoad: string | null = null;
       try {
         const patterns = decodePatterns(md);
         decoded = patterns.length;
@@ -1666,6 +1794,46 @@ async function sectionRealWorker(): Promise<void> {
         note('변환', patterns.map((p) => {
           const t = p.transform?.translation;
           return t ? `[${t.map((v) => v.toFixed(2)).join(',')}]` : '없음';
+        }).join(' '));
+
+        // ── 2D 도면 배치 (ISSUE-018) — 3D 와 섞이지 않는가 ──────
+        //
+        // 여기서 보는 것도 "워커가 무엇을 실었는가" 다. 그 행렬이 **전치되지
+        // 않았는가**는 씬 파일의 정답지와 대조해야 알 수 있고, 그건 backend
+        // 스모크 §5.7·§5.8 이 한다 — 이 파일에는 `.zls` 를 읽는 손이 없다.
+        const raws2d = md.patterns.map((p) => (p as unknown as Record<string, unknown>)['transform2d']);
+        transform2dAtLoad = JSON.stringify(raws2d);
+        check(
+          '★ topology:true 응답의 모든 패턴에 transform2d 가 실려 있다 (ISSUE-018)',
+          raws2d.length > 0 && raws2d.every((t) => Array.isArray(t) && t.length === 9),
+          `${raws2d.filter((t) => Array.isArray(t)).length}/${raws2d.length}개`,
+        );
+        check(
+          '★ decodePattern 이 그 형식을 통과시킨다 (길이 9, 전부 유한)',
+          patterns.length > 0 && patterns.every((p) => p.transform2d !== undefined),
+          `${patterns.filter((p) => p.transform2d).length}/${patterns.length}개`,
+        );
+        check(
+          '★★ 마지막 행이 [0,0,1] 이다 — 전치되면 여기에 translate 가 앉는다',
+          patterns.length > 0 && patterns.every(
+            (p) => p.transform2d?.[6] === 0 && p.transform2d[7] === 0 && p.transform2d[8] === 1,
+          ),
+          patterns.map((p) => `[${p.transform2d?.slice(6).join(',')}]`).join(' '),
+        );
+        check(
+          '★★ 3D transform 과 2D transform2d 가 **다른 값**이다 (섞이면 ISSUE-011 을 다시 겪는다)',
+          patterns.length > 0 && patterns.every((p) => {
+            const t3 = p.transform;
+            const t2 = p.transform2d;
+            if (!t3 || !t2) return false;
+            return Math.abs(t3.translation[0] - t2[2]) > 1e-3
+              || Math.abs(t3.translation[1] - t2[5]) > 1e-3;
+          }),
+          patterns.map((p) => `3D[${p.transform?.translation.slice(0, 2).map((v) => v.toFixed(1)).join(',')}]≠2D[${p.transform2d?.[2].toFixed(1)},${p.transform2d?.[5].toFixed(1)}]`).join(' '),
+        );
+        note('2D 배치', patterns.map((p) => {
+          const m = p.transform2d;
+          return m ? `[${m[2].toFixed(1)},${m[5].toFixed(1)}]` : '없음';
         }).join(' '));
 
         const stats = meshStats(md);
@@ -1742,6 +1910,17 @@ async function sectionRealWorker(): Promise<void> {
         framePatterns.length > 0 && withTransformKey === 0,
         `패턴 ${framePatterns.length}개 중 ${withTransformKey}개에 실렸다`,
       );
+      // 2D 배치도 같은 갈래에 있다. 근거는 **다르다** — 3D 쪽은 249프레임 실측
+      // 불변이 근거이고, 이쪽은 "이 워커에 2D 배치를 바꿀 op 이 하나도 없다"다.
+      // 2D 저작 기능이 붙는 순간 이 단언이 설계 변경을 알리는 자리가 된다.
+      const with2dKey = framePatterns.filter(
+        (p) => 'transform2d' in (p as unknown as Record<string, unknown>),
+      ).length;
+      check(
+        '★★ 프레임 이벤트의 mesh 에는 transform2d 키도 아예 없다 (ISSUE-018 — topology 게이팅)',
+        framePatterns.length > 0 && with2dKey === 0,
+        `패턴 ${framePatterns.length}개 중 ${with2dKey}개에 실렸다`,
+      );
 
       // ── 프레임 불변 — 워커가 "한 번만 보낸다"는 근거 ────────
       //
@@ -1758,6 +1937,16 @@ async function sectionRealWorker(): Promise<void> {
         transformsAtLoad !== null && raws2 === transformsAtLoad,
         transformsAtLoad === null ? '로드 직후 값을 못 받았다'
           : raws2 === transformsAtLoad ? `${md2.patterns.length}개 동일 (frame ${reached}+)` : `달라졌다: ${raws2.slice(0, 160)}`,
+      );
+      const raws2d2 = JSON.stringify(
+        md2.patterns.map((p) => (p as unknown as Record<string, unknown>)['transform2d']),
+      );
+      check(
+        '★★ 시뮬을 돌린 뒤에도 transform2d 가 한 글자도 안 바뀐다 (ISSUE-018 — 한 번만 보내는 근거)',
+        transform2dAtLoad !== null && raws2d2 === transform2dAtLoad,
+        transform2dAtLoad === null ? '로드 직후 값을 못 받았다'
+          : raws2d2 === transform2dAtLoad ? `${md2.patterns.length}개 동일 (frame ${reached}+)`
+            : `달라졌다: ${raws2d2.slice(0, 160)}`,
       );
       check(
         '대조군 — 그 사이 정점은 실제로 움직였다 (아무것도 안 변한 것이 아니다)',
@@ -2268,6 +2457,212 @@ function sectionClothTransform(): void {
       '★ 갱신 뒤 경계 상자도 여전히 월드다 (computeBoundingBox 를 다시 부르면서 변환을 잃지 않는다)',
       Math.abs(cloth.boundingBox().getCenter(new THREE.Vector3()).y - 54.653) < 2,
       xyz(cloth.boundingBox().getCenter(new THREE.Vector3())),
+    );
+    cloth.clear();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// §8-12. 2D 도면 배치가 3D 를 타고 흘러 내려온다 (ISSUE-018)
+//
+// `transform2d` 는 3D 뷰가 쓰지 않는 값인데도 `cloth.ts` 가 들고 있다 —
+// `uvs` 와 짝이고, 그 둘을 함께 쥐고 있는 유일한 객체가 여기이기 때문이다
+// (#15-b 의 2D 뷰가 `cloth.patterns` 에서 꺼내 간다).
+//
+// ★ 이 절의 값어치는 두 가지다:
+//   ① **2D 행렬이 3D 로 새지 않는다** — `mesh` 에 걸리는 것은 `transform`
+//      뿐이다. 2D 행렬을 실수로 `mesh.position` 에 얹으면 옷이 도면 좌표만큼
+//      통째로 옮겨 가는데, 화면에서는 "옷이 좀 떠 있네" 로만 보인다.
+//   ② **열벡터 규약을 실행 가능한 형태로 못박는다.** #15-b 는 이 식을 그대로
+//      쓴다. 행렬을 전치해 읽어도 패턴은 흩어지고 그림은 그럴듯해서, 규약을
+//      주석으로만 두면 반대로 구현해도 아무 데서도 안 걸린다.
+// ─────────────────────────────────────────────────────────────
+
+/** uv 와 2D 배치를 함께 든 패턴 하나 */
+function pattern2d(
+  uuid: string,
+  uvs: readonly number[],
+  transform2d?: readonly number[],
+  transform?: PatternTransform,
+): DecodedPattern {
+  const vertices = uvs.length / 2;
+  const p: DecodedPattern = {
+    uuid,
+    positions: Float32Array.from(new Array(vertices * 3).fill(0)),
+    uvs: Float32Array.from(uvs),
+    vertices,
+    triangles: 0,
+  };
+  if (transform2d) p.transform2d = [...transform2d] as unknown as PatternTransform2D;
+  if (transform) p.transform = transform;
+  return p;
+}
+
+/** 행 우선 3×3 · 열벡터: world = M · [x, y, 1]ᵀ. #15-b 가 쓸 바로 그 식 */
+function apply2d(m: readonly number[], x: number, y: number): [number, number] {
+  return [m[0]! * x + m[1]! * y + m[2]!, m[3]! * x + m[4]! * y + m[5]!];
+}
+
+function sectionCloth2D(): void {
+  section('§8-12. 2D 도면 배치 (ISSUE-018, cloth.ts, DOM 없이)');
+
+  // ── ① 실려 오고, 우리 것이 된다 ─────────────────────────────
+  {
+    // ⚠️ 디코더가 준 **그 배열**을 건드려야 한다. 여기서 사본을 만들어 넘기면
+    //    `cloth.ts` 가 참조를 그대로 들고 있어도 통과해버린다 (실제로 그렇게
+    //    썼다가 돌연변이 M8 을 놓쳤다).
+    const decoded = pattern2d('a', [0, 0, 1, 1], [2, 0, 0, 0, 3, 0, 0, 0, 1]);
+    const src = decoded.transform2d as unknown as number[];
+    const cloth = new ClothObject();
+    cloth.setTopology([decoded]);
+    const p = cloth.patterns[0];
+    check(
+      '★ PatternMesh 가 transform2d 를 든다 (uvs 와 같은 객체에서 꺼낼 수 있다 — #15-b 가 여기서 읽는다)',
+      p?.transform2d?.join(',') === '2,0,0,0,3,0,0,0,1',
+      JSON.stringify(p?.transform2d),
+    );
+    src[0] = 999;
+    check(
+      '★★ 복사본이다 — 디코더가 준 그 배열을 나중에 건드려도 화면 쪽 값이 안 바뀐다',
+      cloth.patterns[0]?.transform2d?.[0] === 2,
+      `${cloth.patterns[0]?.transform2d?.[0]} (원본은 ${src[0]} 로 바꿨다)`,
+    );
+    cloth.clear();
+  }
+
+  // ── ② 없으면 null. 그리고 남지 않는다 ───────────────────────
+  //
+  // 항등행렬로 메우면 "원점에 배치된 패턴" 과 "배치를 모르는 패턴" 이 구분되지
+  // 않는다 — 2D 뷰가 배치를 못 받은 채로 **정상인 척** 그리게 된다.
+  {
+    const cloth = new ClothObject();
+    cloth.setTopology([pattern2d('n', [0, 0, 1, 1])]);
+    check(
+      '★★ transform2d 가 없으면 null 이다 (항등행렬로 메우지 않는다)',
+      cloth.patterns[0]?.transform2d === null,
+      JSON.stringify(cloth.patterns[0]?.transform2d),
+    );
+
+    // 배치가 있는 씬 → 없는 씬 (재연결·다른 씬·구버전 워커)
+    cloth.setTopology([pattern2d('n', [0, 0, 1, 1], [5, 0, 50, 0, 5, 60, 0, 0, 1])]);
+    cloth.setTopology([pattern2d('n', [0, 0, 1, 1])]);
+    check(
+      '★ 옛 씬의 배치가 새 씬에 남지 않는다 (setTopology 는 통째로 새로 만든다)',
+      cloth.patterns[0]?.transform2d === null,
+      JSON.stringify(cloth.patterns[0]?.transform2d),
+    );
+    cloth.clear();
+  }
+
+  // ── ③ 2D 가 3D 로 새지 않는다 ───────────────────────────────
+  //
+  // 이 둘을 한 번이라도 같은 자리에 넣으면 ISSUE-011 을 그대로 다시 겪는다.
+  {
+    const cloth = new ClothObject();
+    // 2D 배치만 있고 3D 변환은 없다 — 워커가 서피스는 아는데 3D 는 아직 없는 모양.
+    cloth.setTopology([pattern2d('x', [0, 0, 1, 1], [1, 0, 111, 0, 1, 222, 0, 0, 1])]);
+    const p = cloth.patterns[0];
+    check(
+      '★★★ 2D 행렬이 mesh 에 걸리지 않는다 — 3D 변환이 없으면 identity 그대로다',
+      p !== undefined && p.mesh.position.length() === 0
+      && p.mesh.scale.x === 1 && p.mesh.quaternion.w === 1,
+      p ? `pos ${p.mesh.position.toArray().join(',')} scale ${p.mesh.scale.toArray().join(',')}` : '패턴 없음',
+    );
+
+    // 둘 다 있을 때 서로를 덮어쓰지 않는다.
+    cloth.setTopology([pattern2d(
+      'x', [0, 0, 1, 1],
+      [1, 0, 111, 0, 1, 222, 0, 0, 1],
+      { translation: [7, 8, 9], rotation: [0, 0, 0, 1], scale: [1, 1, 1] },
+    )]);
+    const q = cloth.patterns[0];
+    check(
+      '★★ 둘 다 있으면 각자 제자리에 간다 (3D 는 mesh, 2D 는 필드)',
+      q !== undefined && q.mesh.position.x === 7 && q.mesh.position.y === 8
+      && q.transform2d?.[2] === 111 && q.transform2d[5] === 222,
+      q ? `mesh ${q.mesh.position.toArray().join(',')} / 2D [${q.transform2d?.join(',')}]` : '패턴 없음',
+    );
+    cloth.clear();
+  }
+
+  // ── ④ 프레임 갱신이 배치를 지우지 않는다 ─────────────────────
+  //
+  // 프레임 이벤트에는 `transform2d` 가 안 온다. `updatePositions()` 가 그때
+  // 필드를 건드리면 **2D 뷰가 첫 프레임 뒤에 통째로 원점으로 무너진다.**
+  {
+    const cloth = new ClothObject();
+    cloth.setTopology([pattern2d('f', [0, 0, 1, 1], [1, 0, 30, 0, 1, 40, 0, 0, 1])]);
+    const frame: DecodedPattern = {
+      uuid: 'f',
+      positions: Float32Array.from([1, 1, 1, 2, 2, 2]),
+      vertices: 2,
+      triangles: 0,
+    };
+    let ok = cloth.updatePositions([frame]);
+    for (let i = 0; i < 50; i++) ok = cloth.updatePositions([frame]) && ok;
+    check(
+      '★★ transform2d 없는 프레임을 50번 먹여도 배치가 남는다',
+      ok && cloth.patterns[0]?.transform2d?.join(',') === '1,0,30,0,1,40,0,0,1',
+      JSON.stringify(cloth.patterns[0]?.transform2d),
+    );
+    check(
+      '★ 그 사이 정점은 실제로 갈렸다 (아무 일도 안 일어난 것과 구분한다)',
+      (cloth.patterns[0]?.position.array as Float32Array)[0] === 1,
+      String((cloth.patterns[0]?.position.array as Float32Array)[0]),
+    );
+    cloth.clear();
+  }
+
+  // ── ⑤ 열벡터 규약 — #15-b 가 쓸 식을 여기서 못박는다 ─────────
+  //
+  // ★ 회전이 있는 행렬을 쓴다. 회전이 없으면 전치해도 **같은 답이 나와서**
+  //   어느 규약인지 구분할 수 없다 (sample.zls 가 정확히 그 씬이라, 이 규약을
+  //   실제 값으로 가르는 일은 backend 스모크 §5.8 이 회전 있는 씬에서 맡는다).
+  {
+    // 90° 회전 + (100, 200) 이동. GetMatrix33 의 모양 그대로:
+    //   [ cos, −sin, tx ]   [ 0, −1, 100 ]
+    //   [ sin,  cos, ty ] = [ 1,  0, 200 ]
+    const m = [0, -1, 100, 1, 0, 200, 0, 0, 1];
+    const [wx, wy] = apply2d(m, 3, 0);
+    check(
+      '★★★ 열벡터 규약: wx = m0·x + m1·y + m2 — 로컬 (3,0) 이 도면 (100, 203) 으로 간다',
+      Math.abs(wx - 100) < 1e-9 && Math.abs(wy - 203) < 1e-9,
+      `(${wx}, ${wy})`,
+    );
+    const t = [m[0]!, m[3]!, m[6]!, m[1]!, m[4]!, m[7]!, m[2]!, m[5]!, m[8]!];
+    const [tx, ty] = apply2d(t, 3, 0);
+    check(
+      '★★★ 같은 점을 전치본으로 옮기면 확실히 다른 자리다 (그래서 규약을 못박을 값어치가 있다)',
+      Math.abs(tx - wx) > 1 || Math.abs(ty - wy) > 1,
+      `원본 (${wx}, ${wy}) vs 전치 (${tx}, ${ty})`,
+    );
+    check(
+      '★ 마지막 행 [0,0,1] 은 계산에 안 쓰인다 (2×3 만 있으면 되지만 3×3 으로 받는다)',
+      apply2d([...m.slice(0, 6), 9, 9, 9], 3, 0).join(',') === `${wx},${wy}`,
+    );
+
+    // 그리고 그 식이 실제로 겹침을 푼다 — 같은 uv 를 든 두 패턴이 갈라진다.
+    const uv = [0, 0, 10, 0, 10, 20, 0, 20];
+    const cloth = new ClothObject();
+    cloth.setTopology([
+      pattern2d('p1', uv, [1, 0, 0, 0, 1, 0, 0, 0, 1]),
+      pattern2d('p2', uv, [1, 0, 40, 0, 1, 0, 0, 0, 1]),
+    ]);
+    const boxOf = (i: number): { x0: number; x1: number } => {
+      const p = cloth.patterns[i]!;
+      let x0 = Infinity; let x1 = -Infinity;
+      for (let k = 0; k + 1 < (p.uvs?.length ?? 0); k += 2) {
+        const [x] = apply2d(p.transform2d!, p.uvs![k]!, p.uvs![k + 1]!);
+        x0 = Math.min(x0, x); x1 = Math.max(x1, x);
+      }
+      return { x0, x1 };
+    };
+    const a = boxOf(0);
+    const b = boxOf(1);
+    check(
+      '★★ 같은 uv 를 든 두 패턴이 배치를 곱하면 갈라진다 (uvs 만 쓰면 완전히 포개진다)',
+      a.x1 <= b.x0,
+      `p1 x [${a.x0}, ${a.x1}] / p2 x [${b.x0}, ${b.x1}] — 배치 없이는 둘 다 [0, 10]`,
     );
     cloth.clear();
   }
@@ -6410,6 +6805,7 @@ async function main(): Promise<void> {
   sectionClothTopology();
   sectionClothFrames();
   sectionClothTransform();
+  sectionCloth2D();
   sectionFrameStreamQueue();
   sectionFrameStreamCloth();
   await sectionSnapshotMachine();

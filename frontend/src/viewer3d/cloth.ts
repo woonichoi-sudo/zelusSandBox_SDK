@@ -28,6 +28,13 @@
  * ⚠️ `uvs` 는 텍스처 좌표가 아니라 **cm 단위 2D 패턴 좌표**다(앞판 20.5 × 96.4).
  *    0~1 로 정규화돼 있지 않다. #15 의 2D 펼침 뷰가 이 값을 위치로 쓴다.
  *
+ *    ★ **그런데 `uvs` 만으로는 2D 뷰가 안 나온다** (ISSUE-018). 이 좌표는
+ *      **서피스 로컬**이라 패턴마다 자기 원점 근처에서 시작한다 — 그대로
+ *      그리면 24개가 겹쳐 한 덩어리가 된다(실측: AABB 쌍 276개 중 227개
+ *      = 82.2% 가 겹쳤고, 98cm 짜리 레깅스 판 두 장이 소수점 둘째 자리까지
+ *      같은 자리였다). 도면 위의 자리는 아래 `transform2d` 를 곱해야 정해진다
+ *      (적용 후 겹침 2.5%). 그래서 이 클래스가 둘을 **함께** 들고 있는다.
+ *
  * ── 정점은 로컬 좌표다 (ISSUE-011) ──────────────────────────
  * `positions` 는 **패턴 로컬 좌표**이고, 월드 위치는 패턴마다 딸려 오는
  * `transform`(TRS)을 곱해야 정해진다. 그래서 여기서 그것을 `Mesh` 에 건다.
@@ -48,7 +55,7 @@
 
 import * as THREE from 'three';
 
-import type { DecodedPattern } from '../protocol/index.ts';
+import type { DecodedPattern, PatternTransform2D } from '../protocol/index.ts';
 
 /** 패턴 하나에 대응하는 three 객체 묶음 */
 export interface PatternMesh {
@@ -59,8 +66,25 @@ export interface PatternMesh {
   readonly position: THREE.BufferAttribute;
   readonly vertices: number;
   readonly triangles: number;
-  /** cm 단위 2D 패턴 좌표. #15 가 쓴다. 없으면 null */
+  /**
+   * cm 단위 2D 패턴 좌표. #15 가 쓴다. 없으면 null.
+   *
+   * **서피스 로컬**이다 — 도면 위의 자리는 `transform2d` 를 곱해야 나온다.
+   */
   readonly uvs: Float32Array | null;
+  /**
+   * 서피스 로컬 → 2D 도면 배치. 행 우선 3×3, 열벡터 규약 (ISSUE-018).
+   *
+   *   wx = m[0]*x + m[1]*y + m[2]
+   *   wy = m[3]*x + m[4]*y + m[5]
+   *
+   * ⚠️ `mesh` 에 걸어 둔 3D 변환(`p.transform`)과 **다른 것이다.** 2D 펼침은
+   *    그것을 쓰지 않는 것이 요점이다.
+   *
+   * 없으면 null — 서피스가 없는 패턴이거나 구버전 워커다. 항등행렬로 메우지
+   * 않는다(원점에 배치된 것과 구분할 수 있어야 한다).
+   */
+  readonly transform2d: PatternTransform2D | null;
 }
 
 /**
@@ -196,6 +220,8 @@ export class ClothObject {
         vertices: p.vertices,
         triangles: p.triangles,
         uvs: p.uvs ? new Float32Array(p.uvs) : null,
+        // 복사해서 우리가 소유한다 — `uvs`·`positions` 와 같은 이유다.
+        transform2d: p.transform2d ? ([...p.transform2d] as PatternTransform2D) : null,
       });
 
       this.#vertices += p.vertices;

@@ -4,7 +4,9 @@
 
 #include <zsTransform.h>   // 패턴 → 월드 변환 (MeshData)
 
+#include <ztDesign2DTransform.h>   // 서피스 2D 배치 (MeshData의 transform2d)
 #include <ztDesignClothPattern.h>
+#include <ztDesignSurface.h>       // GetTransform() — 전방선언만으론 부족하다
 #include <ztDesignTriMesh.h>
 #include <ztLiveEditUtil.h>
 #include <ztScene.h>
@@ -343,12 +345,100 @@ json MeshData(ZestManager& manager, bool includeTopology)
                 { "scale",       { s.x, s.y, s.z } },
             };
 
+            // ── 서피스 → 2D 도면 배치 (ISSUE-018) ───────────────────
+            //
+            // ⚠️ **위의 `transform`과 전혀 다른 것이다.** 저쪽은 패턴 로컬 →
+            //    3D 월드(옷이 몸에 둘러지는 자리)이고, 이쪽은 로컬 → **2D
+            //    재단 도면 위의 자리**다. 2D 펼침 뷰의 요점은 3D 변환을
+            //    **쓰지 않는 것**이므로 둘을 섞으면 ISSUE-011을 다시 겪는다.
+            //    그래서 키 이름을 나눴다 — `transform` 재사용 금지.
+            //
+            // ── 왜 필요한가 (실측) ──────────────────────────────────
+            // `uvs`만으로는 2D 뷰를 그릴 수 없다. uv는 서피스 **로컬** 평면
+            // 좌표라(ztDesignClothPattern.cpp:562-568의 GenerateUVs →
+            // ztUVMaker::CopyPositionToUV, uv.x=p.x / uv.y=p.y) 패턴마다 자기
+            // 원점 근처에서 시작한다. `W_Bra top & Leggings.zls`(패턴 24개)를
+            // 실측했더니 AABB 쌍 276개 중 227개(82.2%)가 겹쳤고, 개별 AABB
+            // 면적 합이 전체 합집합 상자의 **2.05배**였다. 98cm짜리 레깅스 판
+            // 두 장(패턴 16·21)이 소수점 둘째 자리까지 같은 자리에 포개진다.
+            //
+            // ── 왜 행렬로 보내는가 ──────────────────────────────────
+            // ztDesign2DTransform은 translate/scale/rotate/rotCenter/
+            // scaleCenter 다섯 필드의 **합성**이고, 그 순서를 프론트에서 다시
+            // 구현하면 그게 곧 어긋날 자리다. 엔진이 이미 합성해 주는
+            // GetMatrix33()을 그대로 내보낸다.
+            //
+            // ★ 이 값이 데스크톱 2D 뷰포트가 쓰는 것과 **같은 값**이다:
+            //   Renderer2D.cpp:164가 서피스마다 PaintInterface2D::Transform을
+            //   부르고, 그 안(PaintInterface2D.cpp:908-914)이 쓰는 것이
+            //   GetMatrix()이며 GetMatrix()는 GetMatrix33()을 그대로 편다.
+            //
+            // ⚠️ GetMatrix33()과 Transform()은 **엄밀히는 같지 않다.**
+            //    Transform()은 스케일을 원점 기준으로 걸고(ztDesign2DTransform
+            //    .cpp:13-21), GetMatrix33()은 scaleCenter 기준으로 건다(:61-80).
+            //    둘이 갈라지는 조건은 `scaleCenter != 0` 하나인데, 그 필드는
+            //    **어디서도 채워지지 않는다** — .zls 직렬화에 아예 없고
+            //    (ztDesignSurface.cpp:731-739/785-792가 translate/scale/
+            //    rotation/rotationCenter/scaleFactor만 읽고 쓴다) operator==
+            //    조차 비교하지 않는다(:110-113). 따라서 로드된 씬에서는 항상
+            //    (0,0)이고 두 경로가 일치한다. 언젠가 scaleCenter를 쓰는
+            //    기능이 붙으면 이 등식이 깨지므로 여기 적어 둔다.
+            //
+            // ── 배열 형식 ───────────────────────────────────────────
+            // **행 우선(row-major) 9개**다: [m00,m01,m02, m10,m11,m12,
+            // m20,m21,m22]. 적용은 **열벡터** 규약 — world = M · [x, y, 1]ᵀ,
+            // 즉 wx = m00*x + m01*y + m02 / wy = m10*x + m11*y + m12.
+            // (마지막 행은 항상 [0,0,1]이라 정보가 없지만, 잘라 보내면 받는
+            //  쪽이 "이게 3x3인가 2x3인가"를 매번 되물어야 해서 그대로 둔다.)
+            //
+            // ⚠️ zsMatrix33의 **저장 방식은 열 우선**이다(zsMatrix33.h:24의
+            //    주석, `T e[3][4]`). 우리가 쓰는 GetElement(i, j)는 `e[j][i]`를
+            //    돌려주므로 **(행, 열)** 접근이다(:330-336). 즉 아래 순서는
+            //    메모리 순서가 아니라 수학 표기 순서다. 전치해서 읽어도 그림은
+            //    그럴듯하게 나오므로(회전이 작으면 더욱), 규약을 여기 못박는다.
+            //
+            // ── 왜 includeTopology 안에 두는가 ──────────────────────
+            // 위의 3D transform은 "249프레임 실측 결과 비트 단위로 불변"이
+            // 근거인데, **2D 배치에는 그 근거가 없다.** 여기 근거는 다른
+            // 것이다: 이 워커에 2D 배치를 바꿀 수 있는 op이 **하나도 없다.**
+            // (ping/version/init/load/clear/start/pause/reset/step/subscribe/
+            //  unsubscribe/status/getParams/setParams/meshInfo/meshData/
+            //  export/quit — 전부 시뮬 제어·조회이고 디자인 데이터를 만지지
+            //  않는다.) 시뮬레이션은 GetSimulationOutputMesh의 정점을 움직일
+            //  뿐 서피스 변환을 건드리지 않는다. 따라서 한 세션 안에서 상수다.
+            //
+            // ★ 깨지면 어떻게 드러나는가 — 2D 창에서 패턴을 끌어 옮기는 기능
+            //   (데스크톱의 2D 저작)이 붙는 순간이다. 클라이언트는 최초 1회
+            //   받은 행렬을 계속 쓰므로 **끌어도 화면에서 패턴이 안 움직이거나,
+            //   놓는 순간 원래 자리로 되돌아간 것처럼 보인다.** 3D 쪽의 실패
+            //   양상("정점은 흔들리는데 옷이 엉뚱한 자리에 고정")과 달리
+            //   오차가 아니라 **입력이 먹지 않는 것**으로 나타나서 렌더링
+            //   문제로 오진하기 쉽다. 그때 할 일은 이 블록을 includeTopology
+            //   밖으로 꺼내거나(패턴당 +9 float) 배치 변경 이벤트를 따로 내는
+            //   것이다.
+            //
+            // ⚠️ 서피스가 없는 패턴이 있을 수 있다(GetSurface()가 널). 그때는
+            //    키를 아예 싣지 않는다 — 항등행렬을 대신 보내면 받는 쪽이
+            //    "원점에 배치된 것"과 "배치를 모르는 것"을 구분할 수 없다.
+            if (const ztDesignSurface* surface = pattern->GetSurface())
+            {
+                const ZELUS::zsMatrix33 m = surface->GetTransform().GetMatrix33();
+                p["transform2d"] = json::array({
+                    m.GetElement(0, 0), m.GetElement(0, 1), m.GetElement(0, 2),
+                    m.GetElement(1, 0), m.GetElement(1, 1), m.GetElement(1, 2),
+                    m.GetElement(2, 0), m.GetElement(2, 1), m.GetElement(2, 2),
+                });
+            }
+
             if (mesh.indices.size() > 0)
             {
                 p["indices"] = Base64(&mesh.indices[0],
                                       mesh.indices.size() * sizeof(ZELUS::zsInt));
                 p["indexStride"] = static_cast<int>(sizeof(ZELUS::zsInt));
             }
+            // cm 단위 2D 패턴 좌표다(텍스처 좌표가 아니다 — 0~1로 정규화돼
+            // 있지 않다). **서피스 로컬**이므로 이것만으로 2D 뷰를 그리면
+            // 패턴들이 겹친다 — 위 `transform2d`를 곱해야 도면 좌표가 된다.
             if (mesh.uvs.size() > 0)
             {
                 p["uvs"] = Base64(&mesh.uvs[0],

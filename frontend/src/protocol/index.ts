@@ -55,6 +55,8 @@ export type {
   Op,
   PatternData,
   PatternInfo,
+  PatternTransform,
+  PatternTransform2D,
   SceneSummary,
   ServerEvent,
   ServerMessage,
