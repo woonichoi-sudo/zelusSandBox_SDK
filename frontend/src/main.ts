@@ -56,6 +56,7 @@ import {
   type SceneSummary,
 } from './protocol/index.ts';
 import { ParamsPanel } from './ui/index.ts';
+import { Unfolder, UnfoldController } from './viewer2d/index.ts';
 import {
   FrameStream,
   showScene,
@@ -100,6 +101,10 @@ const ui = {
   paramsWrap: el<HTMLDetailsElement>('paramsWrap'),
   params: el<HTMLElement>('params'),
   paramsBadge: el<HTMLElement>('paramsBadge'),
+  // 2D 펼침 (#15-b). 슬라이더 하나와 글자 두 자리 — 판단은 `viewer2d/` 다.
+  unfold: el<HTMLInputElement>('unfold'),
+  unfoldStat: el<HTMLElement>('unfoldStat'),
+  unfoldWhy: el<HTMLElement>('unfoldWhy'),
 };
 
 ui.hint.textContent = `${ui.hint.textContent ?? ''}  |  ${SHORTCUT_HINT}`;
@@ -216,6 +221,50 @@ const stream = new FrameStream({
   },
 });
 
+// ── 2D 펼침 (#15-b) ─────────────────────────────────────────
+//
+// 여기 있는 것도 배선뿐이다. **좌표 변환과 보간은 `viewer2d/unfold.ts`**,
+// **상태 판정은 `viewer2d/control.ts`** 에 있고 둘 다 DOM 을 안 만져서 Node 가
+// 그대로 돌린다. 카메라(원근 ↔ 정사영)는 `viewer3d/viewer.ts` 의 `setUnfold` 다.
+//
+// ── 배타 모드와 어떻게 맞물리는가 ───────────────────────────
+// **맞물리지 않는다 — 2D 는 세 번째 뷰가 아니다.** `ViewMode` 는 여전히
+// `live | snapshot` 둘뿐이고, 펼침은 **실시간 옷의 자세**를 바꾼다(같은 메시,
+// 같은 그룹, 정점만 이동). 그래서 `setMode` 의 불변식("둘 다 켜짐을 표현할 수
+// 없다")도, UI 하네스 §7 이 검사하는 것도 그대로다.
+//
+// 스냅샷을 보는 중에 펼치면 어떻게 되는가 — **화면은 안 바뀐다.** 펼쳐지는
+// 것은 숨어 있는 실시간 옷이고, 스냅샷(익스포트한 glTF)은 도면 좌표를 갖고
+// 있지 않다. 그래서 아래에서 스냅샷 모드일 때는 슬라이더를 만지면 실시간으로
+// 돌아온다 — 재생 버튼이 하는 것(`returnToLiveForPlayback`)과 같은 판단이다.
+const unfolder = new Unfolder();
+const unfoldControl = new UnfoldController();
+
+/** 슬라이더·글자·카메라를 한 번에 맞춘다. **상태는 만들지 않는다** */
+function paintUnfold(): void {
+  const v = unfoldControl.view;
+  ui.unfold.disabled = busy || !v.enabled;
+  // 컨트롤러가 정본이다. 씬이 내려가 t 가 0 으로 돌아갔는데 슬라이더만 오른쪽에
+  // 남아 있으면, 화면이 "2D 를 보고 있다" 고 거짓말한다.
+  const want = String(Math.round(v.t * 100));
+  if (ui.unfold.value !== want) ui.unfold.value = want;
+  ui.unfoldStat.textContent = v.label;
+  ui.unfoldWhy.textContent = v.reason ?? '';
+  // 카메라·투영·격자. 정점은 아래 rAF 가 옮긴다.
+  viewer.setUnfold(v.t, unfolder.stats.bounds);
+}
+
+ui.unfold.addEventListener('input', () => {
+  // 스냅샷은 도면 좌표가 없다 — 펼쳐도 화면이 안 바뀐다. 재생과 같은 이유로
+  // 실시간으로 돌려놓는다(원인이 화면 어디에도 안 남는 실패를 만들지 않는다).
+  if (viewer.mode === 'snapshot' && Number(ui.unfold.value) > 0) {
+    log('펼침 — 스냅샷에는 2D 배치가 없어 실시간 뷰로 돌아갑니다 (스냅샷은 남아 있습니다)');
+    setMode('live');
+  }
+  unfoldControl.set(Number(ui.unfold.value) / 100);
+  paintUnfold();
+});
+
 // ── 파라미터 패널 (#16) ─────────────────────────────────────
 //
 // 여기 있는 것도 배선뿐이다. **스키마·검증·비활성 판정은 `panels/params.ts`**
@@ -299,6 +348,10 @@ async function refreshPose(): Promise<void> {
     log('리셋 후 포즈가 화면의 토폴로지와 다릅니다 — 씬을 다시 로드하세요');
     return;
   }
+  // 정점 버퍼가 방금 3D 로 덮였다. 펼침의 원본도 같이 갱신해야 한다 —
+  // 안 하면 t>0 인 채로 리셋했을 때 화면이 리셋 전 포즈에 멎는다
+  // (`sync` 가 다시 쓰라고 표시까지 해 준다).
+  unfolder.sync(viewer.cloth.patterns);
   log(`리셋 — 포즈를 다시 받아 화면에 반영했습니다 (패턴 ${patterns.length})`);
 }
 
@@ -313,6 +366,11 @@ function clearScene(): void {
   viewer.cloth.clear();
   dropSnapshot();
   stream.resume();
+  // 도면 좌표는 씬에 딸려 있다. 남겨 두면 다음 씬의 패턴에 옛 배치가 섞인다.
+  unfolder.clear();
+  unfoldControl.setScene(false);
+  unfoldControl.setStats(null);
+  paintUnfold();
   currentScene = null;
   ui.stat.textContent = '-';
   ui.frames.textContent = '-';
@@ -398,6 +456,13 @@ viewer.onBeforeRender(() => {
   // 여기서만 되돌린다 — 로드 성공 시점에 되돌리면 "로드는 되는데 계속
   // 어긋나는" 경우에 상한이 무의미해져 103MB 재로드를 무한히 돈다.
   if (out.status === 'applied' && topologyRecoveries !== 0) topologyRecoveries = 0;
+  // ★ 2D 펼침 (#15-b). **순서가 전부다.**
+  //   `sync` 는 정점 버퍼에 3D 가 들어 있을 때만 불러야 한다 — 방금 프레임이
+  //   붙었을 때가 정확히 그 순간이다. 순서가 뒤집히면 섞인 값을 원본으로
+  //   착각해서, 재생하는 동안 옷이 조금씩 도면 쪽으로 눌어붙는다.
+  //   `apply` 는 t=0 이면 아무 일도 하지 않으므로 2D 를 안 쓰는 동안의 비용이 0 이다.
+  if (out.status === 'applied') unfolder.sync(viewer.cloth.patterns);
+  unfolder.apply(viewer.cloth.patterns, unfoldControl.effectiveT);
   // 화면에 숫자를 찍는 것은 초당 4회면 충분하다. 매 rAF 로 textContent 를
   // 건드리면 60/s 로 레이아웃을 흔들면서, 정작 읽을 수는 없다.
   const now = performance.now();
@@ -603,6 +668,9 @@ function setBusy(on: boolean): void {
   // 재생 컨트롤 네 개의 활성 조건은 `playback.view` 가 정한다. 여기서 따로
   // 계산하면 조건이 두 곳에 생기고, 둘이 갈라지는 날 버튼이 거짓말을 한다.
   paintPlayback();
+  // 로드 중에는 펼침도 잠근다. 토폴로지가 갈리는 도중에 슬라이더를 밀면
+  // 이미 버려진 지오메트리를 대상으로 보간하게 된다.
+  paintUnfold();
 }
 
 async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<void> {
@@ -630,10 +698,28 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
     playback.sceneLoaded(sceneId);
     // 새 토폴로지가 섰다. 칸에 남아 있던 옛 프레임을 버리고 정지 상태를 푼다.
     stream.resume();
+    // ★ 2D 도면 좌표를 여기서 한 번 만든다 (#15-b). `uvs`·`transform2d` 는
+    //   topology 와 함께 한 번만 오므로 프레임마다 다시 만들 이유가 없다 —
+    //   정점 3,022~13,398개에 행렬 곱이 붙는 일을 로드당 1회로 묶는다.
+    unfolder.build(viewer.cloth.patterns);
+    unfoldControl.setScene(true);
+    unfoldControl.setStats(unfolder.stats);
+    const u = unfolder.stats;
+    log(
+      `2D 도면 — 패턴 ${u.placed}/${u.patterns} 배치됨`
+      + (u.bounds
+        ? ` · ${u.bounds.width.toFixed(1)} × ${u.bounds.height.toFixed(1)}cm`
+        : ' · 배치 없음')
+      + (u.unplaced > 0 ? ` · ⚠ 배치 없는 패턴 ${u.unplaced}개` : ''),
+    );
     ui.stat.textContent = `패턴 ${shown.patterns} · 정점 ${shown.vertices} · 삼각형 ${shown.triangles}`;
     status(`로드 완료 (${shown.elapsedMs}ms)`);
   } catch (err: unknown) {
     playback.sceneLoadFailed();
+    // 화면에 무엇이 서 있는지 모르는 상태다. 도면 좌표를 남겨 두면 슬라이더가
+    // "펼칠 수 있다" 고 말하면서 옛 씬의 배치로 보간한다.
+    unfolder.clear();
+    unfoldControl.setStats(null);
     status(`로드 실패: ${message(err)}`, true);
   } finally {
     setBusy(false);
@@ -820,6 +906,15 @@ declare global {
      * 마지막으로 말한 사실이고, `params.dirty` 가 아직 안 보낸 변경 수다.
      */
     params: ParamsPanel;
+    /**
+     * #15-b 의 진단 표면. `unfolder.stats.placed` 가 0 이면 워커가 `transform2d`
+     * 를 안 실은 것이고(그때 화면의 슬라이더도 비활성이다), `unplaced` 가 0 이
+     * 아니면 그 수만큼의 패턴이 t=1 에서도 3D 자리에 남는다.
+     * `unfoldControl.effectiveT` 가 **화면에 실제로 반영된 값**이다 —
+     * 슬라이더의 `value` 와 갈라질 수 있다(씬이 없으면 항상 0).
+     */
+    unfolder: Unfolder;
+    unfoldControl: UnfoldController;
     show: typeof show;
     play: (on: boolean) => Promise<boolean>;
     snap: typeof takeSnapshot;
@@ -837,6 +932,8 @@ globalThis.cobalt = {
   snapshots,
   playback,
   params,
+  unfolder,
+  unfoldControl,
   show,
   play: (on: boolean) => (on ? playback.play() : playback.pause()),
   snap: takeSnapshot,

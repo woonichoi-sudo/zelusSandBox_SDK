@@ -111,6 +111,37 @@
       .pwhy { color: #ffb0b0; }
       .pfix, .psrc { color: #ffd9a0; }
 
+      /*
+        2D 펼침 (#15-b). `#paramsWrap` 과 **같은 판단**이다 — 상단 `.bar` 는
+        `src/verify/ui.ts` 의 판정면(버튼 위치·상태 글자)이라 건드리지 않는다.
+
+        아래 가운데에 둔다. 왼쪽 아래는 파라미터(26rem), 오른쪽 아래는
+        로그(38rem)가 이미 쓴다. 1280px 에서 그 사이의 빈 띠가 428~680px 이라
+        좁으므로 **내용 너비로만** 차지하고, 접힌 `<details>` 들의 투명한 영역이
+        슬라이더를 삼키지 않도록 z-index 를 하나 올린다.
+
+        ⚠️ `bottom` 이 0.6rem 이 **아닌** 이유: 그 줄은 `#hint` 가 이미 쓴다.
+           단축키 문구까지 붙어 700px 가까이 뻗어서 가운데까지 올라오는데,
+           겹쳐 놓으면 글자 위에 글자가 찍힌다(실측으로 "R펼침…씬 내림" 이
+           됐다). 한 줄 위로 올린다.
+      */
+      #unfoldWrap {
+        position: fixed; left: 50%; transform: translateX(-50%);
+        bottom: 2.2rem; z-index: 3;
+        display: flex; flex-direction: column; align-items: center; gap: 0.15rem;
+        max-width: min(22rem, 26vw);
+      }
+      .urow { display: flex; align-items: center; gap: 0.45rem; }
+      .urow label { opacity: 0.55; }
+      #unfold {
+        width: 9rem; accent-color: #6d8cff; vertical-align: middle;
+      }
+      #unfold:disabled { opacity: 0.4; cursor: default; }
+      #unfoldStat { opacity: 0.6; min-width: 3.2rem; }
+      /* 배치를 못 받은 패턴이 있으면 **회색만 되지 않는다** — 이유가 글자로 남는다 */
+      #unfoldWhy { color: #ffd9a0; opacity: 0.9; text-align: center; font-size: 12px; }
+      #unfoldWhy:empty { display: none; }
+
       #logWrap {
         position: fixed; right: 0.75rem; bottom: 0.6rem; z-index: 2;
         width: min(38rem, 46vw);
@@ -200,6 +231,31 @@
       <summary>⚙ 파라미터 <span id="paramsBadge"></span></summary>
       <div id="params"></div>
     </details>
+
+    <!--
+      2D 펼침 (#15-b). 좌표 변환·보간은 `src/viewer2d/unfold.ts`, 상태 판정은
+      `src/viewer2d/control.ts` 에 있고(둘 다 DOM 없음) 여기 있는 것은 슬라이더
+      하나와 글자 두 자리뿐이다.
+
+      ⚠️ **토글이 아니라 슬라이더인 이유**: 토글이면 3D 와 2D 라는 화면 두 개가
+         될 뿐이고, 그건 이미 있는 배타 모드(실시간 ↔ 스냅샷)와 같은 물건이다.
+         모핑의 값어치는 **중간**에 있다 — 3D 에서 접혀 있던 곳이 도면의 어느
+         조각인지가 이어지는 동안에만 보인다. 멈춰 세울 수 없으면 그 대응을
+         눈으로 좇을 수 없다.
+
+      ⚠️ `<input type="range">` 는 `panels/shortcuts.ts` 의 INTERACTIVE 집합에
+         들어 있다(INPUT). 슬라이더에 포커스가 있을 때 S/R/C 를 가로채지 않는다 —
+         화살표키로 값을 미는 동안 시뮬이 리셋되면 안 된다.
+    -->
+    <div id="unfoldWrap">
+      <span id="unfoldWhy"></span>
+      <div class="urow">
+        <label for="unfold">펼침</label>
+        <input id="unfold" type="range" min="0" max="100" step="1" value="0" disabled
+               title="3D 드레이프 ↔ 2D 재단 도면. 중간에서 멈추면 어느 조각이 어디로 가는지 보입니다" />
+        <span id="unfoldStat" class="stat">—</span>
+      </div>
+    </div>
 
     <details id="logWrap">
       <summary>로그</summary>

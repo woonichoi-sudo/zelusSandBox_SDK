@@ -22,6 +22,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 
+import type { DraftingBounds } from '../viewer2d/index.ts';
 import { ClothObject } from './cloth.ts';
 import { SnapshotObject } from './snapshotView.ts';
 
@@ -70,6 +71,24 @@ export class Viewer3D {
   readonly #controls: OrbitControls;
   readonly #grid: THREE.GridHelper;
   readonly #resizeObserver: ResizeObserver;
+
+  // ── 2D 펼침 (#15-b) ────────────────────────────────────────
+  //
+  // **카메라 객체를 바꾸지 않는다.** `#camera` 하나로 계속 그리고, 투영행렬만
+  // 정사영 쪽으로 섞는다. 카메라를 갈아 끼우면 `controls`·`frameCamera`·
+  // 하네스가 읽는 `viewer.camera` 가 전부 "지금 어느 카메라냐" 에 의존하게
+  // 되고, 무엇보다 **모핑이 아니라 전환**이 된다.
+  /** 정사영 쪽 투영행렬의 출처. 씬에 넣지 않는다 — 행렬을 뽑는 용도뿐이다 */
+  readonly #ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 5000);
+  /** 0 = 원근, 1 = 정사영. `setUnfold` 가 정한다 */
+  #unfold = 0;
+  /** 도면 범위. 정사영 화각과 카메라 목표를 여기서 뽑는다 */
+  #drafting: DraftingBounds | null = null;
+  /** 펼침이 시작될 때의 카메라 자세. 되돌아올 자리다 */
+  readonly #from = { pos: new THREE.Vector3(), target: new THREE.Vector3() };
+  #fromValid = false;
+  /** 매 프레임 새로 만들지 않으려고 잡아 둔다 */
+  readonly #blend = new THREE.Matrix4();
 
   #raf = 0;
   #running = false;
@@ -227,6 +246,9 @@ export class Viewer3D {
     this.#renderer.setSize(w, h, false);
     this.#camera.aspect = w / h;
     this.#camera.updateProjectionMatrix();
+    // 정사영 화각도 종횡비를 따라야 한다. 창을 줄이면 도면이 옆으로 잘린다.
+    // (`#driveUnfold` 가 렌더 직전에 다시 걸므로 여기서는 계산만 해 둔다.)
+    if (this.#unfold > 0) this.#fitDrafting();
   }
 
   /**
@@ -269,7 +291,280 @@ export class Viewer3D {
     const cells = Math.max(10, Math.round(span / 10));
     this.#grid.position.set(center.x, box.min.y, center.z);
     this.#grid.scale.setScalar((cells * 10) / 400);
+    // 2D 펼침에서 되돌아올 자리. **여기서만 정해진다** — 3D 격자를 놓는 곳이
+    // 여기뿐이라, 다른 데서 기억하면 두 값이 갈라진다.
+    this.#gridHome = this.#grid.position.clone();
+    this.#grid3dScale = this.#grid.scale.x;
   }
+
+  /**
+   * 2D 펼침의 카메라 쪽 (#15-b). **정점을 옮기는 것은 `viewer2d/unfold.ts` 다.**
+   *
+   * 이 함수가 맡는 것은 셋이다: 투영(원근 ↔ 정사영), 카메라 자세, 격자 평면.
+   * 셋 다 같은 `t` 하나로 움직이므로 화면 전체가 한 덩어리로 이어진다.
+   *
+   * ── 왜 정사영인가 ───────────────────────────────────────────
+   * **재단 치수를 보는 뷰에서 원근 왜곡은 거짓말이다.** 원근으로 두면 화면
+   * 안쪽의 패턴이 실제보다 작게 그려져서, 같은 20cm 가 자리에 따라 다른 길이로
+   * 보인다. 격자 한 칸 = 10cm 규약도 그때 깨진다.
+   *
+   * ── 왜 투영행렬을 섞는가 (카메라를 갈아 끼우지 않고) ────────
+   * 원근 카메라와 정사영 카메라를 t 에서 맞바꾸면 그 지점에서 화면이 **튄다.**
+   * 두 투영행렬을 성분별로 섞으면 t=0 에서 정확히 원근, t=1 에서 정확히
+   * 정사영이면서 중간이 이어진다. 안전한 이유는 w 성분이다 — 원근은
+   * `w = −z`(눈앞이면 양수), 정사영은 `w = 1` 이라 섞어도
+   * `w = (1−t)(−z) + t` 로 항상 양수다. 0 으로 나누는 자리가 생기지 않는다.
+   *
+   * ── 카메라 자세는 누구 것인가 ───────────────────────────────
+   * `t = 0` 과 `t = 1` 에서는 **사용자 것**이다(OrbitControls 가 산다). 그 사이
+   * 에서만 우리가 몬다 — 3D 에서 보던 시점에서 도면 정면까지 데려다 놓는 것이
+   * 모핑의 절반이기 때문이다. 양 끝의 자세를 각각 기억해 두므로, 도면에서
+   * 확대해 놓고 슬라이더를 되돌리면 **그 자리에서** 3D 로 돌아온다.
+   *
+   * @param t      0 = 3D, 1 = 2D 도면
+   * @param bounds 도면 범위(cm). 한 번 주면 기억한다
+   */
+  setUnfold(t: number, bounds?: DraftingBounds | null): void {
+    if (bounds !== undefined && bounds !== this.#drafting) {
+      this.#drafting = bounds;
+      // 씬이 바뀌었다. 이전 씬에서 사용자가 잡아 둔 도면 시점은 새 도면과
+      // 아무 관계가 없다 — 들고 있으면 새 옷의 도면이 화면 밖에서 시작한다.
+      this.#toValid = false;
+    }
+
+    const next = t <= 0 ? 0 : t >= 1 ? 1 : t;
+    const prev = this.#unfold;
+    if (next === prev && bounds === undefined) return;
+
+    // 양 끝을 떠나는 순간의 자세를 붙잡는다. 이게 없으면 되돌아올 자리가
+    // 사라져서, 슬라이더를 왕복할 때마다 카메라가 기본 위치로 튄다.
+    if (prev === 0 && next > 0) this.#captureFrom();
+    if (prev === 1 && next < 1) this.#captureTo();
+
+    this.#unfold = next;
+
+    // ★ 도면에 **도착**하는 순간. 여기서 자세를 한 번 딱 맞춰 준다.
+    //   `#driveUnfold` 는 t=1 에서 조작을 사용자에게 넘기느라 자세를 건드리지
+    //   않는데, 그러면 카메라가 t=0.99 에서 멈춘 자리에 그대로 남는다 —
+    //   실측으로 도면 위쪽(브라 어깨끈)이 화면 밖으로 잘려 나갔다.
+    if (next === 1 && prev !== 1) {
+      this.#fitDrafting();
+      this.#camera.position.copy(this.#to.pos);
+      this.#controls.target.copy(this.#to.target);
+      this.#camera.lookAt(this.#controls.target);
+      // 이제부터 `#to` 는 **사용자가 잡은 자리**다. 다시 계산해 덮어쓰지 않는다.
+      this.#toValid = true;
+    }
+
+    // 양 끝에서만 조작을 돌려준다. 그 사이는 우리가 몰고 있어서, 켜 두면
+    // 사용자의 드래그와 보간이 같은 값을 두고 싸운다(관성 때문에 손을 떼도
+    // 계속 싸운다).
+    this.#controls.enabled = next === 0 || next === 1;
+    // 도면에서는 회전을 잠근다. 재단 도면을 비스듬히 보는 것은 원근 왜곡을
+    // 없앤 이유를 스스로 무르는 일이다. 팬과 줌은 살려 둔다 — 치수를 보려면
+    // 확대가 필요하다.
+    this.#controls.enableRotate = next < 1;
+
+    if (next === 0) {
+      // 완전히 3D 다. 투영도 카메라도 손대지 않은 상태로 되돌린다 —
+      // **이 경로가 "2D 를 안 쓰는 동안은 이 기능이 없는 것과 같다" 를 보장한다.**
+      this.#camera.updateProjectionMatrix();
+      this.#fromValid = false;
+      // ★ 격자도 되돌린다. **투영은 저절로 돌아오는데 격자는 아니다** —
+      //   그 비대칭이 이 버그의 전부였다(t 를 밀었다 되돌리면 옷·투영·카메라는
+      //   3D 인데 격자만 도면 자리에 비스듬히 남았다).
+      //
+      //   왜 갈리는가: 투영행렬은 **재구성할 원본이 있다.** fov·aspect·near·far
+      //   가 카메라에 그대로 남아 있어서 위의 `updateProjectionMatrix()` 한 줄이
+      //   언제든 원근을 다시 만들어 낸다. 격자의 3D 자리는 그런 원본이 없다 —
+      //   `#gridHome`/`#grid3dScale` 에만 있고, **돌아오는 길에 그걸 읽는
+      //   사람이 없었다.** 그래서 되돌리는 일을 명시적으로 해 줘야 한다.
+      this.#restoreGrid();
+      return;
+    }
+
+    this.#driveUnfold();
+  }
+
+  /** 지금 펼침 정도 (0 = 3D, 1 = 2D) */
+  get unfold(): number {
+    return this.#unfold;
+  }
+
+  #captureFrom(): void {
+    this.#from.pos.copy(this.#camera.position);
+    this.#from.target.copy(this.#controls.target);
+    this.#fromValid = true;
+  }
+
+  /** 도면 쪽 자세. 사용자가 도면에서 움직여 놨으면 그 자리를 기억한다 */
+  readonly #to = { pos: new THREE.Vector3(), target: new THREE.Vector3() };
+  #toValid = false;
+
+  #captureTo(): void {
+    this.#to.pos.copy(this.#camera.position);
+    this.#to.target.copy(this.#controls.target);
+    this.#toValid = true;
+  }
+
+  /**
+   * 도면을 정면으로 보는 자세와 정사영 화각을 계산한다.
+   *
+   * 도면은 월드 XY 평면(z = 0)에 있으므로 **−Z 방향으로 내려다본다.**
+   * 창이 좁으면 가로가 먼저 잘리므로 세로·가로를 둘 다 담는다.
+   */
+  #fitDrafting(): void {
+    const b = this.#drafting;
+    if (!b) return;
+
+    const aspect = this.#camera.aspect || 1;
+    // ★ 여백이 큰 이유는 **화면 위아래를 다른 것이 덮고 있기 때문**이다.
+    //   상단 `.bar`(약 70px)는 불투명하고 하단에는 힌트·슬라이더(약 40px)가
+    //   있다. 800px 중 실제로 보이는 띠는 690px 뿐이라, 딱 맞게 잡으면
+    //   도면 위쪽이 바 뒤로 들어간다 — 실측으로 브라 어깨끈이 잘렸다.
+    //   690/800 을 되돌리면 1.16 이 최소이고, 눈에 보이는 여백까지 두어 1.28.
+    const pad = 1.28;
+    let halfH = Math.max(b.height, 1) * 0.5 * pad;
+    let halfW = Math.max(b.width, 1) * 0.5 * pad;
+    // 종횡비에 맞춰 넓은 쪽을 기준으로 키운다.
+    if (halfW / halfH > aspect) halfH = halfW / aspect;
+    else halfW = halfH * aspect;
+
+    this.#ortho.left = -halfW;
+    this.#ortho.right = halfW;
+    this.#ortho.top = halfH;
+    this.#ortho.bottom = -halfH;
+    this.#ortho.near = 0.1;
+    this.#ortho.far = Math.max(halfH, halfW) * 20 + 1000;
+    this.#ortho.updateProjectionMatrix();
+
+    // 원근 쪽도 같은 크기로 보이게 거리를 잡는다. 이래야 투영을 섞는 동안
+    // 도면 크기가 출렁이지 않는다.
+    const fov = THREE.MathUtils.degToRad(this.#camera.fov);
+    this.#draftDist = halfH / Math.tan(fov / 2);
+
+    if (!this.#toValid) {
+      this.#to.target.set(b.centerX, b.centerY, 0);
+      this.#to.pos.set(b.centerX, b.centerY, this.#draftDist);
+    }
+  }
+
+  /** 도면을 꽉 채우는 기준 거리. 줌을 환산하는 분자다 */
+  #draftDist = 0;
+
+  /** `t` 를 카메라·투영·격자에 반영한다 */
+  #driveUnfold(): void {
+    const t = this.#unfold;
+    if (t === 0) return;
+    this.#fitDrafting();
+    if (!this.#fromValid) this.#captureFrom();
+
+    // 끝에서 부드럽게 붙도록 완만하게 만든다. 선형으로 두면 슬라이더를 놓는
+    // 순간 카메라가 딱 멈춰서 기계적으로 보인다.
+    const e = t * t * (3 - 2 * t);
+
+    // 양 끝에서는 조작이 살아 있으므로 우리가 자세를 덮어쓰지 않는다.
+    if (t < 1) {
+      this.#camera.position.lerpVectors(this.#from.pos, this.#to.pos, e);
+      this.#controls.target.lerpVectors(this.#from.target, this.#to.target, e);
+      this.#camera.lookAt(this.#controls.target);
+    }
+
+    // 클리핑을 자세에 맞춰 다시 잡는다. 도면이 near 안쪽에 들어가면 통째로
+    // 사라지는데, 원인이 화면에 아무 흔적도 안 남는다.
+    const span = this.#camera.position.distanceTo(this.#controls.target);
+    this.#camera.near = Math.max(span * 0.001, 0.1);
+    this.#camera.far = span * 10 + 2000;
+    this.#camera.updateProjectionMatrix();
+
+    // ★ 휠 줌을 정사영에 옮긴다. OrbitControls 는 원근 카메라를 **가까이
+    //   끌어당겨** 확대하는데, 정사영에서는 거리가 크기를 바꾸지 않는다 —
+    //   그대로 두면 도면에서 휠이 아무 일도 안 하는 것처럼 보인다(카메라는
+    //   실제로 움직이고 있어서 원인을 찾기 어렵다). 거리비를 `zoom` 으로
+    //   환산하면 같은 손동작이 같은 결과를 낸다.
+    if (this.#draftDist > 0) {
+      this.#ortho.zoom = this.#draftDist / Math.max(span, 1e-3);
+      this.#ortho.updateProjectionMatrix();
+    }
+
+    // ★ 투영행렬을 성분별로 섞는다 (머리말 참고). `updateProjectionMatrix()`
+    //   가 방금 원근으로 덮어썼으므로 **반드시 그 뒤에** 온다.
+    const p = this.#camera.projectionMatrix.elements;
+    const o = this.#ortho.projectionMatrix.elements;
+    const out = this.#blend.elements;
+    for (let i = 0; i < 16; i++) out[i] = (p[i] ?? 0) * (1 - t) + (o[i] ?? 0) * t;
+    this.#camera.projectionMatrix.copy(this.#blend);
+    this.#camera.projectionMatrixInverse.copy(this.#blend).invert();
+
+    this.#driveGrid(t);
+  }
+
+  /**
+   * 격자를 도면 평면으로 눕힌다.
+   *
+   * `GridHelper` 는 XZ 평면에 있어서 도면(XY)에서는 **모로 서서 선 하나로**
+   * 보인다. X 축으로 90° 돌려 XY 로 옮긴다. 한 칸 10cm 규약은 그대로 따라온다 —
+   * 단위가 cm 로 같으므로 공짜다(`index.html` 의 힌트가 2D 에서도 참이 된다).
+   */
+  #driveGrid(t: number): void {
+    const b = this.#drafting;
+    if (!b) return;
+    // 되돌릴 것이 생겼다고 표시한다. `#restoreGrid` 가 이 깃발만 보고 일한다.
+    this.#gridDisplaced = true;
+    this.#grid.rotation.x = (Math.PI / 2) * t;
+    // 3D 자리 → 도면 평면. 도면은 z = 0 이고, 격자를 살짝 뒤로 밀어 패턴과
+    // 깊이가 겹치지 않게 한다(둘 다 평면이라 z 가 같으면 얼룩진다).
+    this.#gridHome ??= this.#grid.position.clone();
+    this.#grid.position.set(
+      THREE.MathUtils.lerp(this.#gridHome.x, b.centerX, t),
+      THREE.MathUtils.lerp(this.#gridHome.y, b.centerY, t),
+      THREE.MathUtils.lerp(this.#gridHome.z, -0.5, t),
+    );
+    // ★ 도면에서는 **배율 1 이 정답이다.** `GridHelper(400, 40)` 은 한 칸이
+    //   정확히 10 단위(= 10cm)이므로 배율을 건드리는 순간 한 칸이 10cm 가
+    //   아니게 된다. 400cm 짜리 격자가 도면(144 × 175cm)을 넉넉히 덮는다.
+    //   화면 아래 힌트의 "격자 한 칸 = 10cm" 가 도면에서 **글자 그대로 참**이
+    //   되는 자리다 — 재단 치수를 눈으로 재는 뷰에서 이게 어긋나면 격자가
+    //   자가 아니라 장식이 된다.
+    const scale3d = this.#grid3dScale ?? this.#grid.scale.x;
+    this.#grid.scale.setScalar(THREE.MathUtils.lerp(scale3d, 1, t));
+  }
+
+  /**
+   * 격자를 3D 자리로 되돌린다 — **t=0 으로 돌아온 순간 한 번.**
+   *
+   * ── 조기 반환의 의도를 살린다 ───────────────────────────────
+   * `setUnfold` 의 `t=0` 분기는 "2D 를 안 쓰는 동안 비용 0" 을 위한 것이고,
+   * 렌더 루프의 `if (this.#unfold > 0)` 도 같은 뜻이다. 그 의도를 지키려고
+   * 여기서는 **깃발 하나만 보고 즉시 되돌아온다** — 격자가 옮겨진 적이
+   * 없으면(= 한 번도 안 펼쳤으면) 불리언 비교 하나가 전부다. 매 프레임
+   * `#driveGrid(0)` 을 부르는 쪽으로 고치면 안 쓰는 기능이 렌더 루프에
+   * 상주하게 되고, 그건 이 분기가 애초에 없애려던 것이다.
+   *
+   * ── 보간이 아니라 **딱 되돌린다** ───────────────────────────
+   * `#driveGrid(0)` 을 부르지 않는 이유는 하나이고, 그것으로 충분하다:
+   * **그쪽은 `#drafting` 이 있어야 동작한다.** 씬을 내리면(`clearScene` →
+   * `paintUnfold` → `setUnfold(0, null)`) bounds 가 null 이 되는데, 하필
+   * 그때가 격자를 반드시 되돌려야 하는 순간이다 — 조건이 서로 어긋나서
+   * 격자가 도면 자리에 영영 남는다.
+   *
+   * (`lerp(a, b, 0)` 자체는 IEEE754 에서도 정확히 `a` 다. 그건 이유가 아니다.
+   *  다만 기억해 둔 값을 그대로 대입하는 편이 읽는 사람에게 "정확히 되돌린다"
+   *  를 보이는 데 짧다 — 하네스가 배율을 1e-6 으로 맞춘다.)
+   */
+  #restoreGrid(): void {
+    if (!this.#gridDisplaced) return;
+    this.#gridDisplaced = false;
+    this.#grid.rotation.x = 0;
+    if (this.#gridHome) this.#grid.position.copy(this.#gridHome);
+    if (this.#grid3dScale !== null) this.#grid.scale.setScalar(this.#grid3dScale);
+  }
+
+  /** 3D 에서의 격자 자리. 되돌아올 때 쓴다 */
+  #gridHome: THREE.Vector3 | null = null;
+  #grid3dScale: number | null = null;
+  /** 격자가 도면 쪽으로 옮겨져 있는가. `#restoreGrid` 의 유일한 조건 */
+  #gridDisplaced = false;
 
   /** 렌더 루프 시작. 여러 번 불러도 안전하다 */
   start(): void {
@@ -289,6 +584,11 @@ export class Viewer3D {
       }
       // damping 이 켜져 있으면 update() 를 매 프레임 불러야 관성이 돈다.
       this.#controls.update();
+      // ★ 펼침 중이면 **렌더 직전에 다시 건다.** `resize()` 와 조작이
+      //   `updateProjectionMatrix()` 로 원근 행렬을 되살려 놓기 때문이다 —
+      //   한 프레임이라도 놓치면 도면을 보다가 화면이 원근으로 튄다.
+      //   `t = 0` 이면 이 줄은 아무 일도 하지 않는다.
+      if (this.#unfold > 0) this.#driveUnfold();
       this.#renderer.render(this.#scene, this.#camera);
       this.#renders += 1;
     };

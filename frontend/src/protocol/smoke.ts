@@ -85,6 +85,15 @@ import {
   type PlaybackPort,
   type ShortcutAction,
 } from '../panels/index.ts';
+// ★ #15-b 부터는 **제품의 `apply2d` 를 그대로 쓴다.** 15-a 때는 스모크가 자기
+//   사본을 들고 열벡터 규약을 못박았는데, 그러면 사본만 지켜지고 제품이 갈라져도
+//   초록이다. 규약을 못박는 절(§8-12 ⑤)이 제품 함수를 부르게 두면 그 틈이 닫힌다.
+import {
+  apply2d,
+  Unfolder,
+  UnfoldController,
+  type UnfoldStats,
+} from '../viewer2d/index.ts';
 import { ClothObject } from '../viewer3d/cloth.ts';
 import {
   FrameStream,
@@ -2498,11 +2507,6 @@ function pattern2d(
   return p;
 }
 
-/** 행 우선 3×3 · 열벡터: world = M · [x, y, 1]ᵀ. #15-b 가 쓸 바로 그 식 */
-function apply2d(m: readonly number[], x: number, y: number): [number, number] {
-  return [m[0]! * x + m[1]! * y + m[2]!, m[3]! * x + m[4]! * y + m[5]!];
-}
-
 function sectionCloth2D(): void {
   section('§8-12. 2D 도면 배치 (ISSUE-018, cloth.ts, DOM 없이)');
 
@@ -2665,6 +2669,648 @@ function sectionCloth2D(): void {
       `p1 x [${a.x0}, ${a.x1}] / p2 x [${b.x0}, ${b.x1}] — 배치 없이는 둘 다 [0, 10]`,
     );
     cloth.clear();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// §12. 2D 펼침 — 모핑과 판정 (#15-b, viewer2d/, DOM 없이)
+//
+// **#15 의 통과 기준 중 "좌표 변환 자동 검증" 의 나머지 절반이다.** 15-a 는
+// 워커가 실은 행렬이 옳은가를 씬 파일의 정답지로 갈랐다. 여기서 보는 것은
+// **그 행렬로 만든 도면이 옳은가** — 그리고 그건 화면으로는 대부분 못 본다:
+//
+//   - 도면이 평평한가        → 옆에서 보지 않으면 안 보인다. 게다가 경계 상자로
+//                              재면 **거짓말한다**(아래 ② 참고)
+//   - 3D 변환을 되돌렸는가   → 안 되돌리면 도면이 통째로 옮겨질 뿐이라, 카메라가
+//                              그 자리를 비추면 멀쩡해 보인다
+//   - y 가 뒤집혔는가        → 실루엣이 대칭이라 눈으로는 절대 못 잡는다
+//   - 재생 중 눌어붙는가     → 몇 초에 걸쳐 서서히 일어나 "원래 이런가" 로 보인다
+//
+// `viewer2d/` 의 두 모듈은 DOM 을 안 만지므로(three 자료구조만 쓴다) 여기서
+// 전부 돈다. 화면 쪽(투영 보간·카메라·격자)은 `verify/ui.ts` §12 가 맡는다.
+// ─────────────────────────────────────────────────────────────
+
+/** 3D 로컬 정점 + uv + 2D 배치를 함께 든 패턴. 정점 수는 3의 배수로 준다 */
+function unfoldPattern(
+  uuid: string,
+  opts: {
+    positions: readonly number[];
+    uvs?: readonly number[] | null;
+    transform2d?: readonly number[] | null;
+    transform?: PatternTransform;
+  },
+): DecodedPattern {
+  const vertices = opts.positions.length / 3;
+  const p: DecodedPattern = {
+    uuid,
+    positions: Float32Array.from(opts.positions),
+    vertices,
+    triangles: 0,
+  };
+  if (opts.uvs) p.uvs = Float32Array.from(opts.uvs);
+  if (opts.transform2d) p.transform2d = [...opts.transform2d] as unknown as PatternTransform2D;
+  if (opts.transform) p.transform = opts.transform;
+  return p;
+}
+
+/**
+ * 도면 좌표의 **독립적인** 기댓값. 행 우선 · 열벡터 규약을 손으로 적는다.
+ *
+ * ⚠️ 여기서 제품의 `apply2d` 를 부르면 안 된다. **그것을 전치해도 양쪽이 함께
+ *    틀려서 단언이 통과해버린다** — 실제로 처음에는 제품 함수를 썼고, `apply2d`
+ *    를 전치하는 돌연변이를 §12 가 통째로 놓쳤다(§8-12 ⑤ 만 잡았다). 기댓값은
+ *    검사 대상과 다른 손에서 나와야 한다.
+ *
+ * 제품 함수 자체를 못박는 일은 §8-12 ⑤ 가 한다(90° 회전에서 (3,0) → (100,203)).
+ * 그쪽은 **숫자가 하드코딩**이라 같은 함정에 빠지지 않는다.
+ */
+function expect2d(m: readonly number[], x: number, y: number): [number, number] {
+  return [
+    (m[0] ?? 0) * x + (m[1] ?? 0) * y + (m[2] ?? 0),
+    (m[3] ?? 0) * x + (m[4] ?? 0) * y + (m[5] ?? 0),
+  ];
+}
+
+/** 정점 하나를 그 패턴의 **3D 월드**로 옮긴다 (Mesh 에 걸린 변환을 태운다) */
+function vertexWorld(cloth: ClothObject, uuid: string, i: number): THREE.Vector3 {
+  const p = cloth.patterns.find((m) => m.uuid === uuid);
+  if (!p) return new THREE.Vector3(Number.NaN, Number.NaN, Number.NaN);
+  const a = p.position.array as Float32Array;
+  return new THREE.Vector3(a[i * 3], a[i * 3 + 1], a[i * 3 + 2]).applyMatrix4(p.mesh.matrix);
+}
+
+/** 패턴 전체 정점의 월드 z 범위. **점으로 잰다** — 경계 상자는 아래 ② 참고 */
+function worldZSpan(cloth: ClothObject): { min: number; max: number; span: number } {
+  let min = Infinity;
+  let max = -Infinity;
+  const v = new THREE.Vector3();
+  for (const p of cloth.patterns) {
+    const a = p.position.array as Float32Array;
+    for (let i = 0; i + 2 < a.length; i += 3) {
+      v.set(a[i] ?? 0, a[i + 1] ?? 0, a[i + 2] ?? 0).applyMatrix4(p.mesh.matrix);
+      if (v.z < min) min = v.z;
+      if (v.z > max) max = v.z;
+    }
+  }
+  return { min, max, span: max - min };
+}
+
+/** 정점 버퍼 전체의 사본. 비트 단위로 비교할 때 쓴다 */
+function snapshotVertices(cloth: ClothObject): Map<string, Float32Array> {
+  const out = new Map<string, Float32Array>();
+  for (const p of cloth.patterns) out.set(p.uuid, new Float32Array(p.position.array as Float32Array));
+  return out;
+}
+
+function sameVertices(cloth: ClothObject, snap: Map<string, Float32Array>): boolean {
+  for (const p of cloth.patterns) {
+    const was = snap.get(p.uuid);
+    const now = p.position.array as Float32Array;
+    if (!was || was.length !== now.length) return false;
+    for (let i = 0; i < now.length; i++) if (now[i] !== was[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * 이 절 전체가 쓰는 표본 하나.
+ *
+ * ★ **3D 변환이 항등이 아니어야 한다.** 항등이면 `M3d⁻¹` 를 곱하든 말든 결과가
+ *   같아서, "되돌렸는가" 를 묻는 단언이 통째로 이빨을 잃는다.
+ *
+ * ⚠️ **그런데 회전축이 Z 이면 안 된다.** 도면은 월드 z=0 평면이고 Z축 회전은 그
+ *    평면을 자기 자신으로 보내므로, 되돌린 로컬 좌표도 z=0 에 남는다 — 그러면
+ *    아래 ② 의 "경계 상자가 부푼다" 가 재현되지 않는다(처음에 Z축 90° 로 썼다가
+ *    상자 z 두께가 0.00 으로 나와 그 절이 빨간불이 됐다). X축으로 기울여야
+ *    로컬 평면이 비스듬해지고 그 AABB 가 두꺼워진다 — **실제 씬이 그 상태다.**
+ *
+ * ★ **2D 배치도 회전이 있어야 한다.** 회전이 없으면 `apply2d` 를 전치해도 값이
+ *   같다(15-a 에서 sample.zls 가 정확히 그 씬이었다).
+ */
+const A50 = (50 * Math.PI) / 180;
+/** X축 50° + 이동. 되돌리지 않으면 확실히 다른 자리로 간다 */
+const T3D: PatternTransform = {
+  translation: [30, 40, 50],
+  rotation: [Math.sin(A50 / 2), 0, 0, Math.cos(A50 / 2)],
+  scale: [1, 1, 1],
+};
+/** 2D 배치: 30° 회전 + (100, 200) 이동. 전치하면 다른 그림이 된다 */
+const A30 = Math.PI / 6;
+const T2D: readonly number[] = [
+  Math.cos(A30), -Math.sin(A30), 100,
+  Math.sin(A30), Math.cos(A30), 200,
+  0, 0, 1,
+];
+/** 삼각형 두 장. x·y 에 대칭이 아니라 방향을 읽을 수 있다 */
+const UV6: readonly number[] = [0, 0, 12, 0, 12, 7, 0, 0, 12, 7, 3, 7];
+const POS6: readonly number[] = [
+  0, 0, 0, 12, 0, 2, 12, 7, -3,
+  0, 0, 0, 12, 7, -3, 3, 7, 1,
+];
+
+function buildSample(): { cloth: ClothObject; unf: Unfolder } {
+  const cloth = new ClothObject();
+  cloth.setTopology([
+    unfoldPattern('a', { positions: POS6, uvs: UV6, transform2d: T2D, transform: T3D }),
+  ]);
+  const unf = new Unfolder();
+  unf.build(cloth.patterns);
+  return { cloth, unf };
+}
+
+function sectionUnfold(): void {
+  section('§12. 2D 펼침 — 모핑 (#15-b, viewer2d/unfold.ts)');
+
+  // ── ① 도면 좌표가 옳다 + 3D 변환을 되돌렸다 ─────────────────
+  //
+  // ★★ 이 절에서 가장 값진 단언이다. `t=1` 의 정점 버퍼는 **메시 로컬**이므로,
+  //    거기에 `Mesh` 의 변환을 도로 곱하면 `apply2d(transform2d, uv)` 가 나와야
+  //    한다. 이 한 줄이 셋을 동시에 본다:
+  //      - `apply2d` 를 열벡터 규약으로 썼는가 (전치하면 어긋난다)
+  //      - `M3d⁻¹` 를 곱했는가 (안 곱하면 3D 변환이 두 번 걸린다)
+  //      - 도면을 z=0 평면에 놓았는가
+  {
+    const { cloth, unf } = buildSample();
+    check(
+      '★ 배치가 있는 패턴이 도면에 놓인다',
+      unf.ready && unf.stats.placed === 1 && unf.stats.unplaced === 0
+      && unf.stats.vertices === 6,
+      JSON.stringify({ ...unf.stats, bounds: undefined }),
+    );
+
+    const touched = unf.apply(cloth.patterns, 1);
+    check('★ apply(1) 이 버퍼를 실제로 건드린다', touched);
+
+    let worst = 0;
+    let worstZ = 0;
+    for (let i = 0; i < 6; i++) {
+      const [wx, wy] = expect2d(T2D, UV6[i * 2] ?? 0, UV6[i * 2 + 1] ?? 0);
+      const got = vertexWorld(cloth, 'a', i);
+      worst = Math.max(worst, Math.hypot(got.x - wx, got.y - wy));
+      worstZ = Math.max(worstZ, Math.abs(got.z));
+    }
+    check(
+      '★★★ t=1 의 정점을 3D 변환으로 되돌리면 정확히 M · [u, v, 1]ᵀ 다'
+      + ' (기댓값은 제품의 apply2d 가 아니라 손으로 적은 식이다 — 전치·M3d⁻¹ 누락을 여기서 가른다)',
+      worst < 1e-3,
+      `최대 어긋남 ${worst.toExponential(2)}cm`,
+    );
+    check(
+      '★★ 그리고 z = 0 이다 — 도면은 월드 XY 평면 위에 있다',
+      worstZ < 1e-3,
+      `최대 |z| ${worstZ.toExponential(2)}cm`,
+    );
+
+    // 대조군 — 되돌리지 않았다면 어디로 갔을까. 이 거리가 크지 않으면 위
+    // 단언에 이빨이 없다는 뜻이다(3D 변환이 항등에 가까운 표본을 골랐다).
+    const naive = new THREE.Vector3(
+      ...(() => {
+        const [wx, wy] = expect2d(T2D, UV6[0] ?? 0, UV6[1] ?? 0);
+        return [wx, wy, 0] as [number, number, number];
+      })(),
+    ).applyMatrix4(cloth.patterns[0]!.mesh.matrix);
+    const [ax, ay] = expect2d(T2D, UV6[0] ?? 0, UV6[1] ?? 0);
+    check(
+      '★★ 대조군 — M3d⁻¹ 를 안 곱했다면 도면이 확연히 다른 자리로 간다 (위 단언에 이빨이 있다는 증거)',
+      Math.hypot(naive.x - ax, naive.y - ay, naive.z) > 10,
+      `되돌리지 않은 자리 ${xyz(naive)} vs 도면 (${ax.toFixed(2)}, ${ay.toFixed(2)}, 0)`,
+    );
+
+    // bounds 가 실제 도면 범위와 같은가 — 카메라 화각이 여기 걸려 있다.
+    const b = unf.stats.bounds;
+    let bMinX = Infinity; let bMaxX = -Infinity; let bMinY = Infinity; let bMaxY = -Infinity;
+    for (let i = 0; i < 6; i++) {
+      const [wx, wy] = expect2d(T2D, UV6[i * 2] ?? 0, UV6[i * 2 + 1] ?? 0);
+      bMinX = Math.min(bMinX, wx); bMaxX = Math.max(bMaxX, wx);
+      bMinY = Math.min(bMinY, wy); bMaxY = Math.max(bMaxY, wy);
+    }
+    check(
+      '★ stats.bounds 가 실제 도면 범위와 같다 (카메라 화각이 이 값에 걸려 있다)',
+      b !== null
+      && Math.abs(b.minX - bMinX) < 1e-3 && Math.abs(b.maxX - bMaxX) < 1e-3
+      && Math.abs(b.minY - bMinY) < 1e-3 && Math.abs(b.maxY - bMaxY) < 1e-3
+      && Math.abs(b.width - (bMaxX - bMinX)) < 1e-3
+      && Math.abs(b.centerY - (bMinY + bMaxY) / 2) < 1e-3,
+      b ? `${b.minX.toFixed(2)}~${b.maxX.toFixed(2)} × ${b.minY.toFixed(2)}~${b.maxY.toFixed(2)}` : 'null',
+    );
+    cloth.clear();
+  }
+
+  // ── ② 평평한가는 **점으로** 잰다 (경계 상자가 거짓말한다) ────
+  //
+  // ★ `cloth.boundingBox()` 는 패턴마다 **로컬 AABB 의 모서리 8개를** 변환해
+  //   합친다. 도면은 로컬 좌표계에서 기울어진 평면이라 그 상자는 부푼다 —
+  //   Builder 실측으로 t=1 에서 z 범위가 [−12, +10.4] 로 나왔다. 평면인데도
+  //   그렇다. **ISSUE-011 의 교훈이 여기서 또 나왔다**: 상자로 재면 통과도
+  //   실패도 엉터리다. 아래 두 줄이 그 사실 자체를 못박는다.
+  {
+    const { cloth, unf } = buildSample();
+    const before = worldZSpan(cloth);
+    unf.apply(cloth.patterns, 1);
+    const after = worldZSpan(cloth);
+    const box = cloth.boundingBox();
+
+    check(
+      '★★★ t=1 에서 **모든 정점**의 월드 z 가 0 이다 (도면이 진짜로 평평하다)',
+      after.span < 1e-3 && Math.abs(after.min) < 1e-3,
+      `z ${after.min.toExponential(2)} ~ ${after.max.toExponential(2)} (t=0 일 때는 ${before.span.toFixed(2)}cm 두께였다)`,
+    );
+    check(
+      '★ 대조군 — t=0 의 옷은 확실히 입체였다 (평평해진 것이 원래부터 평평했던 것이 아니다)',
+      before.span > 1,
+      `${before.span.toFixed(2)}cm`,
+    );
+    check(
+      '★★ 같은 상태에서 **경계 상자는 평평하지 않다고 말한다** — 상자로 재면 안 된다는 증거',
+      box.max.z - box.min.z > after.span * 100 + 1,
+      `상자 z ${(box.max.z - box.min.z).toFixed(2)}cm vs 점 z ${after.span.toExponential(2)}cm`,
+    );
+    note(
+      '왜 부푸는가',
+      '패턴마다 로컬 AABB 의 모서리 8개를 변환해 합치기 때문이다. 기울어진 평면의 AABB 는 두껍다',
+    );
+    cloth.clear();
+  }
+
+  // ── ③ 보간과 헛일 안 하기 ───────────────────────────────────
+  {
+    const { cloth, unf } = buildSample();
+    const origin = snapshotVertices(cloth);
+
+    check(
+      '★★ t=0 은 아무 일도 하지 않는다 (2D 를 안 쓰는 동안 이 단위의 비용이 0 이라는 계약)',
+      unf.apply(cloth.patterns, 0) === false && sameVertices(cloth, origin),
+    );
+
+    unf.apply(cloth.patterns, 1);
+    const at1 = snapshotVertices(cloth);
+    check(
+      '★ 같은 t 를 다시 주면 다시 쓰지 않는다',
+      unf.apply(cloth.patterns, 1) === false,
+    );
+
+    unf.apply(cloth.patterns, 0.5);
+    const half = cloth.patterns[0]!.position.array as Float32Array;
+    const o = origin.get('a')!;
+    const one = at1.get('a')!;
+    let worst = 0;
+    for (let i = 0; i < half.length; i++) {
+      worst = Math.max(worst, Math.abs((half[i] ?? 0) - ((o[i] ?? 0) + (one[i] ?? 0)) / 2));
+    }
+    check(
+      '★★ t=0.5 는 3D 원본과 도면의 정확한 중점이다 (선형 보간)',
+      worst < 1e-4,
+      `최대 어긋남 ${worst.toExponential(2)}`,
+    );
+
+    check(
+      '★★ t 를 0 으로 되돌리면 3D 원본이 **비트 단위로** 돌아온다 (모핑이 원본을 갉아먹지 않는다)',
+      unf.apply(cloth.patterns, 1) && unf.apply(cloth.patterns, 0) && sameVertices(cloth, origin),
+    );
+    check(
+      '★ 범위 밖 t 는 잘라 넣는다 (t=5 는 t=1, t=−3 은 t=0)',
+      (() => {
+        unf.apply(cloth.patterns, 5);
+        const clampedHigh = sameVertices(cloth, at1);
+        unf.apply(cloth.patterns, -3);
+        return clampedHigh && sameVertices(cloth, origin);
+      })(),
+    );
+
+    // GPU 로 올라가는가. 이게 없으면 배열만 바뀌고 화면은 그대로다.
+    const v0 = cloth.patterns[0]!.position.version;
+    unf.apply(cloth.patterns, 1);
+    check(
+      '★★ position.version 이 오른다 (three 가 GPU 로 올리는 근거 — 없으면 배열만 바뀌고 화면은 멎는다)',
+      cloth.patterns[0]!.position.version > v0,
+      `${v0} → ${cloth.patterns[0]!.position.version}`,
+    );
+    check(
+      '★ 경계구를 다시 만든다 (프러스텀 컬링에 잘려 사라지지 않는다)',
+      (cloth.patterns[0]!.geometry.boundingSphere?.radius ?? 0) > 0,
+      String(cloth.patterns[0]!.geometry.boundingSphere?.radius?.toFixed(2)),
+    );
+    cloth.clear();
+  }
+
+  // ── ④ 배치를 모르는 패턴 — **실측으로는 못 태운 갈래다** ─────
+  //
+  // 두 실측 씬 모두 `unplaced = 0` 이라(24/24, 5/5 배치됨) 실제 워커로는 이
+  // 경로를 한 번도 지나간 적이 없다. 여기가 유일한 검증이다.
+  //
+  // 정해진 동작: 항등행렬로 **메우지 않고**, 숨기지도 않고, **모핑에서 뺀다.**
+  // t=1 에서 평평한 도면 옆에 그 패턴만 3D 로 떠 있어 눈에 띈다.
+  {
+    const cloth = new ClothObject();
+    cloth.setTopology([
+      unfoldPattern('placed', { positions: POS6, uvs: UV6, transform2d: T2D, transform: T3D }),
+      // 서피스가 없는 패턴 — 워커가 `transform2d` 키를 아예 안 싣는다
+      unfoldPattern('no2d', { positions: POS6, uvs: UV6, transform: T3D }),
+      // uv 가 없는 패턴 (topology 없이 온 경우)
+      unfoldPattern('nouv', { positions: POS6, transform2d: T2D, transform: T3D }),
+      // uv 길이가 어긋난 패턴 — 조용히 잘라 쓰면 정점 몇 개가 원점에 붙는다
+      unfoldPattern('baduv', { positions: POS6, uvs: [0, 0, 1, 1], transform2d: T2D, transform: T3D }),
+    ]);
+    const unf = new Unfolder();
+    unf.build(cloth.patterns);
+
+    check(
+      '★★ 배치를 모르는 패턴은 stats 에 unplaced 로 남는다 (조용히 사라지지 않는다)',
+      unf.stats.patterns === 4 && unf.stats.placed === 1 && unf.stats.unplaced === 3
+      && unf.stats.vertices === 6,
+      JSON.stringify({ patterns: unf.stats.patterns, placed: unf.stats.placed, unplaced: unf.stats.unplaced }),
+    );
+
+    const before = snapshotVertices(cloth);
+    unf.apply(cloth.patterns, 1);
+
+    const moved = cloth.patterns.filter((p) => {
+      const was = before.get(p.uuid)!;
+      const now = p.position.array as Float32Array;
+      for (let i = 0; i < now.length; i++) if (now[i] !== was[i]) return true;
+      return false;
+    }).map((p) => p.uuid);
+    check(
+      '★★★ t=1 에서 배치를 모르는 패턴의 정점은 **한 비트도** 안 움직인다 (3D 자리에 그대로 남는다)',
+      moved.length === 1 && moved[0] === 'placed',
+      `움직인 패턴 [${moved.join(', ')}]`,
+    );
+    check(
+      '★★ 항등행렬로 메우지 않았다 — 그랬다면 도면 원점 근처로 끌려갔을 것이다',
+      (() => {
+        const p = cloth.patterns.find((x) => x.uuid === 'no2d')!;
+        const a = p.position.array as Float32Array;
+        const w = new THREE.Vector3(a[0], a[1], a[2]).applyMatrix4(p.mesh.matrix);
+        // 항등행렬이었다면 uv(0,0) → 도면 (0,0,0) 으로 갔을 것이다.
+        return w.length() > 10;
+      })(),
+      xyz(vertexWorld(cloth, 'no2d', 0)),
+    );
+    check(
+      '★ 그 패턴들은 여전히 입체다 (숨기지 않는다 — 존재한다는 사실까지 지우면 안 된다)',
+      (() => {
+        const p = cloth.patterns.find((x) => x.uuid === 'no2d')!;
+        let min = Infinity; let max = -Infinity;
+        const a = p.position.array as Float32Array;
+        for (let i = 0; i + 2 < a.length; i += 3) {
+          const z = new THREE.Vector3(a[i], a[i + 1], a[i + 2]).applyMatrix4(p.mesh.matrix).z;
+          min = Math.min(min, z); max = Math.max(max, z);
+        }
+        return max - min > 1;
+      })(),
+    );
+    cloth.clear();
+  }
+
+  // 전부 배치가 없는 씬 — 슬라이더가 아예 안 움직여야 한다
+  {
+    const cloth = new ClothObject();
+    cloth.setTopology([
+      unfoldPattern('n1', { positions: POS6, uvs: UV6, transform: T3D }),
+      unfoldPattern('n2', { positions: POS6, uvs: UV6, transform: T3D }),
+    ]);
+    const unf = new Unfolder();
+    unf.build(cloth.patterns);
+    const before = snapshotVertices(cloth);
+    check(
+      '★★ 배치가 하나도 없으면 ready 가 false 이고 apply 가 아무 일도 안 한다',
+      !unf.ready && unf.stats.placed === 0 && unf.stats.bounds === null
+      && unf.apply(cloth.patterns, 1) === false && sameVertices(cloth, before),
+      JSON.stringify({ ready: unf.ready, placed: unf.stats.placed, bounds: unf.stats.bounds }),
+    );
+    cloth.clear();
+  }
+
+  // ── ⑤ sync 순서 — 재생 중 옷이 눌어붙지 않는가 ──────────────
+  //
+  // ⚠️ **이 절이 잡는 것은 `Unfolder` 가 아니라 그것을 부르는 순서다.**
+  //    `sync` 는 정점 버퍼에 3D 가 들어 있을 때만 불러야 한다. 뒤집히면 섞인
+  //    값을 원본으로 착각하고, 그 위에 또 섞으므로 옷이 프레임마다 도면 쪽으로
+  //    끌려가다 완전히 눌어붙는다 — 화면에서는 "재생하면 옷이 서서히
+  //    납작해진다" 로 보이고 원인이 어디에도 안 남는다.
+  //
+  //    실제 순서는 `main.ts` 의 rAF 안에 있어 DOM 이 필요하다. 여기서는 두
+  //    순서를 **둘 다** 돌려 오염 메커니즘 자체를 못박아 두고, 실제 배선이 어느
+  //    쪽인지는 `verify/ui.ts` §12 가 재생 중에 확인한다.
+  //
+  // ⚠️ **브라우저에서의 증상은 여기서 재현한 것과 다르다** (돌연변이로 확인했다).
+  //    실제 rAF 는 시뮬(~10fps)보다 훨씬 자주 돌아서, 프레임이 붙지 않은 rAF 가
+  //    사이사이 끼어든다. 그러면 `apply` 의 "같은 t 는 다시 쓰지 않는다" 가드가
+  //    시뮬 프레임과 맞물려, 오염이 누적되는 대신 **그 프레임만 3D 원본이 화면에
+  //    남는다** — 눌어붙는 대신 **덜덜 떤다**(실측: t=0.5 에서 두께가 12.2 ↔ 24.4
+  //    로 매 시뮬 프레임마다 튄다. 올바른 순서면 변동폭 0.86cm).
+  //    그래서 `verify/ui.ts` 는 최종 상태가 아니라 **프레임마다 표본을 떠서**
+  //    본다. 아래 대조군은 가드가 개입하지 않는 순수한 형태의 오염이다.
+  {
+    /** 프레임이 온 것처럼 3D 정점을 새로 써 넣는다 (진폭이 있는 흔들림) */
+    const feed = (cloth: ClothObject, k: number): void => {
+      const a = cloth.patterns[0]!.position.array as Float32Array;
+      for (let i = 0; i < POS6.length; i++) {
+        a[i] = (POS6[i] ?? 0) + (i % 3 === 2 ? Math.sin(k * 0.7) * 2 : 0);
+      }
+    };
+
+    // 올바른 순서: 프레임을 쓴다 → sync → apply
+    const good = buildSample();
+    for (let k = 0; k < 100; k++) {
+      feed(good.cloth, k);
+      good.unf.sync(good.cloth.patterns);
+      good.unf.apply(good.cloth.patterns, 0.5);
+    }
+    good.unf.apply(good.cloth.patterns, 0);
+    const goodSpan = worldZSpan(good.cloth);
+
+    // 뒤집힌 순서: apply → sync (섞인 값을 원본으로 착각한다)
+    const bad = buildSample();
+    for (let k = 0; k < 100; k++) {
+      feed(bad.cloth, k);
+      bad.unf.apply(bad.cloth.patterns, 0.5);
+      bad.unf.sync(bad.cloth.patterns);
+    }
+    bad.unf.apply(bad.cloth.patterns, 0);
+    const badSpan = worldZSpan(bad.cloth);
+
+    check(
+      '★★★ 올바른 순서(sync → apply)로 100프레임을 돌려도 t=0 으로 돌아오면 옷이 여전히 입체다',
+      goodSpan.span > 1,
+      `z 두께 ${goodSpan.span.toFixed(2)}cm`,
+    );
+    check(
+      '★★★ 대조군 — 순서를 뒤집으면 옷이 도면 쪽으로 눌어붙는다 (t=0 인데 납작하다)',
+      badSpan.span < goodSpan.span / 10,
+      `뒤집힌 순서 ${badSpan.span.toExponential(2)}cm vs 올바른 순서 ${goodSpan.span.toFixed(2)}cm`,
+    );
+    good.cloth.clear();
+    bad.cloth.clear();
+  }
+
+  // ── ⑥ 씬을 갈아 끼운다 ──────────────────────────────────────
+  {
+    const { cloth, unf } = buildSample();
+    unf.apply(cloth.patterns, 1);
+    unf.clear();
+    check(
+      '★ clear 뒤에는 stats 가 비고 apply 가 아무것도 안 한다 (옛 씬의 도면 좌표가 새 씬에 안 섞인다)',
+      unf.stats.placed === 0 && unf.stats.bounds === null && !unf.ready
+      && unf.apply(cloth.patterns, 1) === false,
+      JSON.stringify({ placed: unf.stats.placed, patterns: unf.stats.patterns }),
+    );
+    cloth.clear();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// §12-2. 펼침 컨트롤 — 화면이 말하는 것과 실제 (#15-b, control.ts)
+//
+// `panels/playback.ts` 와 같은 이유로 존재하는 절이다. ISSUE-009 는 재생 상태가
+// `main.ts` 의 불리언 두 개로 흩어져 있어서 "버튼은 정지인데 시뮬은 멈춰 있다"
+// 를 자동 테스트가 한 줄도 못 덮은 사건이었다. 여기서 보는 것도 같은 종류다 —
+// **슬라이더가 오른쪽에 있는데 화면은 3D** 같은 상태가 만들어지지 않는가.
+//
+// ⚠️ 문구를 통째로 박지 않는다. 계약은 **"이유가 있고, 몇 개인지 말한다"** 이고
+//    문장은 바뀔 수 있다. 문구를 박으면 다듬는 날 하네스가 빨간불이 되고,
+//    고치는 사람이 회귀부터 의심하게 된다 (#16-a 가 세운 기준).
+// ─────────────────────────────────────────────────────────────
+
+function statsOf(patterns: number, placed: number): UnfoldStats {
+  return {
+    patterns,
+    placed,
+    unplaced: patterns - placed,
+    vertices: placed * 6,
+    bounds: placed > 0
+      ? { minX: 0, minY: 0, maxX: 10, maxY: 20, width: 10, height: 20, centerX: 5, centerY: 10 }
+      : null,
+  };
+}
+
+function sectionUnfoldControl(): void {
+  section('§12-2. 2D 펼침 — 컨트롤 상태 (#15-b, viewer2d/control.ts)');
+
+  // ── ① 씬이 없다 ────────────────────────────────────────────
+  {
+    const c = new UnfoldController();
+    const v = c.view;
+    check(
+      '★ 씬이 없으면 만질 수 없고, **이유가 글자로 남는다**',
+      !v.enabled && v.t === 0 && v.is3d && !v.is2d
+      && v.reason !== null && v.reason.length > 0,
+      `enabled=${v.enabled} reason=${JSON.stringify(v.reason)}`,
+    );
+    c.set(1);
+    check(
+      '★★ 씬이 없을 때 밀어도 t 가 안 오른다 (만질 수 없는데 2D 로 보이는 상태를 만들지 않는다)',
+      c.t === 0 && c.effectiveT === 0 && c.view.t === 0,
+      `t=${c.t} effective=${c.effectiveT}`,
+    );
+  }
+
+  // ── ② 배치가 하나도 없다 — 워커가 서피스를 모르는 경우 ───────
+  {
+    const c = new UnfoldController();
+    c.setScene(true);
+    c.setStats(statsOf(24, 0));
+    const v = c.view;
+    check(
+      '★★ 배치가 0 이면 비활성 + 이유가 **몇 개인지까지** 말한다 (다음 사람이 워커를 볼 생각을 하게)',
+      !v.enabled && v.reason !== null && v.reason.includes('24') && v.reason.includes('배치'),
+      JSON.stringify(v.reason),
+    );
+    c.set(0.7);
+    check('★ 그 상태에서 밀어도 t 가 0 이다', c.t === 0 && c.effectiveT === 0);
+
+    // 패턴 자체가 없는 씬은 **다른 이유**여야 한다. 같은 문구면 워커를 의심할지
+    // 씬을 의심할지 알 수 없다.
+    c.setStats(statsOf(0, 0));
+    const empty = c.view;
+    check(
+      '★ 패턴이 0 인 씬은 배치가 없는 씬과 **다른 이유**를 말한다',
+      empty.reason !== null && empty.reason !== v.reason,
+      `${JSON.stringify(empty.reason)} ≠ ${JSON.stringify(v.reason)}`,
+    );
+  }
+
+  // ── ③ 정상 — 그리고 일부만 배치가 없다 ──────────────────────
+  {
+    const c = new UnfoldController();
+    c.setScene(true);
+    c.setStats(statsOf(24, 24));
+    check(
+      '★ 배치가 다 있으면 만질 수 있고 이유가 없다',
+      c.view.enabled && c.view.reason === null && c.view.is3d,
+      JSON.stringify(c.view),
+    );
+
+    c.set(0.5);
+    check('★ t 가 반영되고 라벨이 퍼센트를 말한다', c.view.t === 0.5 && c.view.label.includes('50'), c.view.label);
+    c.set(1);
+    check(
+      '★ 양 끝의 라벨은 퍼센트만으로는 모자란다 — 어느 쪽 끝인지 말한다',
+      c.view.is2d && /2D|도면/.test(c.view.label) && !c.view.is3d,
+      `t=1 → ${JSON.stringify(c.view.label)}`,
+    );
+    c.set(0);
+    check(
+      '★ 반대쪽 끝도 마찬가지',
+      c.view.is3d && /3D/.test(c.view.label),
+      `t=0 → ${JSON.stringify(c.view.label)}`,
+    );
+
+    // ★ 일부만 배치가 없다 — 그 사실은 t 와 무관하게 참이다.
+    c.setStats(statsOf(24, 22));
+    c.set(0);
+    const at0 = c.view;
+    c.set(1);
+    const at1 = c.view;
+    check(
+      '★★ 일부만 배치가 없으면 **만질 수는 있고**, 몇 개가 3D 에 남는지 말한다',
+      at1.enabled && at1.reason !== null && at1.reason.includes('2'),
+      JSON.stringify(at1.reason),
+    );
+    check(
+      '★★ 그 이유는 3D 로 돌아가 있어도 그대로다 (도면이 불완전하다는 사실은 t 와 무관하다)',
+      at0.reason === at1.reason && at0.reason !== null,
+      `t=0 ${JSON.stringify(at0.reason)} / t=1 ${JSON.stringify(at1.reason)}`,
+    );
+  }
+
+  // ── ④ 값을 다루는 손 ────────────────────────────────────────
+  {
+    const c = new UnfoldController();
+    c.setScene(true);
+    c.setStats(statsOf(5, 5));
+
+    c.set(3);
+    check('범위를 넘으면 잘라 넣는다 (위)', c.t === 1, String(c.t));
+    c.set(-2);
+    check('범위를 넘으면 잘라 넣는다 (아래)', c.t === 0, String(c.t));
+
+    c.set(0.4);
+    c.set(Number.NaN);
+    check('★ NaN 은 무시한다 (옛 값이 남는다 — 0 으로 튀지 않는다)', c.t === 0.4, String(c.t));
+    c.set(Number.POSITIVE_INFINITY);
+    check('★ Infinity 도 무시한다', c.t === 0.4, String(c.t));
+
+    // ★ 씬이 내려가면 t 가 0 으로 돌아간다. 남겨 두면 다음 씬이 뜨는 순간
+    //   사용자가 지시한 적 없는 2D 화면이 나온다.
+    c.set(1);
+    c.setScene(false);
+    check(
+      '★★ 씬이 내려가면 t 가 0 으로 돌아간다 (다음 씬이 2D 로 시작하지 않는다)',
+      c.t === 0 && c.effectiveT === 0 && !c.view.enabled,
+      `t=${c.t}`,
+    );
+
+    // ★ effectiveT 와 t 가 갈릴 수 있다 — 화면에 반영되는 것은 effectiveT 다.
+    c.setScene(true);
+    c.set(1);
+    check('되돌아오면 다시 만질 수 있다', c.view.enabled && c.t === 1);
+    c.setStats(null);
+    check(
+      '★★ stats 가 사라지면(로드 실패) effectiveT 가 0 이다 — 화면이 2D 라고 거짓말하지 않는다',
+      c.effectiveT === 0 && !c.view.enabled && c.view.t === 0,
+      `t=${c.t} effective=${c.effectiveT}`,
+    );
   }
 }
 
@@ -6806,6 +7452,8 @@ async function main(): Promise<void> {
   sectionClothFrames();
   sectionClothTransform();
   sectionCloth2D();
+  sectionUnfold();
+  sectionUnfoldControl();
   sectionFrameStreamQueue();
   sectionFrameStreamCloth();
   await sectionSnapshotMachine();

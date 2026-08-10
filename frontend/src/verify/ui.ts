@@ -708,6 +708,7 @@ async function main(): Promise<void> {
     await sectionExclusive(page, colors);
     await sectionPlaybackControls(page);
     await sectionParams(page, sent);
+    await sectionUnfold(page);
     await sectionConsole(page, logs);
     await sectionOpenIssues(page);
   } finally {
@@ -2444,23 +2445,51 @@ async function sectionParams(page: Page, sent: SentOp[]): Promise<void> {
 
       // ④ ★ 폴링이 생기지 않았는가 — **프레임이 흐르는 동안 왕복이 없어야 한다.**
       //    잠금을 되묻는 코드가 `paintPlayback` 에 붙었는데, 그 함수는 프레임
-      //    경로에서도 불린다. 조건을 잘못 잡으면 40/s 마다 `status` 왕복이 하나씩
-      //    생기고, 그건 새 결함이다. 선 위에서 직접 센다.
+      //    경로에서도 불린다. 조건을 잘못 잡으면 프레임 하나마다 `status` 왕복이
+      //    하나씩 생기고, 그건 새 결함이다. 선 위에서 직접 센다.
+      //
+      // ⚠️ **고정 3초로 재지 않는다 — 창을 시간이 아니라 프레임으로 닫는다.**
+      //    이 절이 쓰는 씬은 패턴 24개짜리라 초당 5~8프레임이고(가벼운
+      //    `sample.zls` 의 40/s 가 아니다), 3초 창에 담기는 프레임 수가 머신
+      //    부하에 따라 흔들린다 — 같은 트리에서 16·18·24·24·25건을 봤다. 전제가
+      //    `>= 20` 이라 문턱 위에 걸터앉아 있었고, 실제로 빨간불이 났다.
+      //    **문턱만 낮추는 것은 답이 아니다**: 다음에 또 걸치고, 그 사이 전제의
+      //    이빨("아무 일도 없는 구간을 잰 것이 아니다")이 같이 무뎌진다.
+      //    그래서 **프레임 20건이 쌓일 때까지 기다린다.** 전제가 조건이 아니라
+      //    **대기 종료 사유**가 되고, 본 단언은 그 창 안에서 재면 된다.
+      //    누수는 프레임당 1건이므로 창이 짧아도 20건이면 20건이 잡힌다 —
+      //    오히려 시간이 아니라 프레임에 묶여서 더 단단하다.
+      //    최소 3초는 그대로 둔다: 프레임과 무관한 시간 기반 폴링
+      //    (`setInterval` 로 status 를 되묻는 구현)도 같이 덮으려는 것이다.
+      //    20건이 25초 안에 안 쌓이면 그건 흔들림이 아니라 **시뮬이 멎은 것**이고,
+      //    그때는 전제가 빨간불이 되는 것이 맞다.
+      const NEED_FRAMES = 20;
+      const MIN_WINDOW_MS = 3_000;
+      const MAX_WINDOW_MS = 25_000;
       const statusBefore = sent.filter((s) => s.op === 'status').length;
       const appliedBefore = (await readStats(page)).applied;
-      await sleep(3_000);
+      const windowStart = Date.now();
+      let frames = 0;
+      let windowMs = 0;
+      for (;;) {
+        // `readStats` 는 화면 안의 계측기를 읽을 뿐 선 위로 아무것도 보내지
+        // 않는다 — 폴링하는 이 루프 자체가 `status` 왕복을 만들지는 않는다.
+        await sleep(250);
+        frames = (await readStats(page)).applied - appliedBefore;
+        windowMs = Date.now() - windowStart;
+        if (windowMs >= MAX_WINDOW_MS) break;
+        if (frames >= NEED_FRAMES && windowMs >= MIN_WINDOW_MS) break;
+      }
       const statusAfter = sent.filter((s) => s.op === 'status').length;
-      const appliedAfter = (await readStats(page)).applied;
-      const frames = appliedAfter - appliedBefore;
       check(
-        '전제 — 그 3초 동안 프레임이 실제로 흘렀다 (아무 일도 없는 구간을 잰 것이 아니다)',
-        frames >= 20,
-        `프레임 ${frames}건`,
+        '전제 — 그 창 동안 프레임이 실제로 흘렀다 (아무 일도 없는 구간을 잰 것이 아니다 — 프레임 20건이 쌓일 때까지 기다린 창이다)',
+        frames >= NEED_FRAMES,
+        `프레임 ${frames}건 / ${ms(windowMs)} (25초 안에 20건이 안 쌓이면 흔들림이 아니라 시뮬이 멎은 것이다)`,
       );
       check(
-        '★★★★ 재생 중에 status 왕복이 늘지 않는다 (잠금 되묻기가 프레임 경로로 새면 40/s 마다 왕복이 하나씩 생긴다)',
+        '★★★★ 재생 중에 status 왕복이 늘지 않는다 (잠금 되묻기가 프레임 경로로 새면 프레임 하나마다 왕복이 하나씩 생긴다)',
         statusAfter - statusBefore === 0,
-        `3초 · 프레임 ${frames}건 · status op ${statusAfter - statusBefore}건`,
+        `${ms(windowMs)} · 프레임 ${frames}건 · status op ${statusAfter - statusBefore}건`,
       );
 
       // ⑤ [⏸ 정지] — 시뮬은 여전히 초기화된 상태다. 잠금이 풀리면 안 된다.
@@ -2990,6 +3019,512 @@ async function sectionConsole(page: Page, logs: Collected): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────
+// §12. 2D 펼침 (#15-b) — 도면이 실제로 평평하고 겹치지 않는가
+//
+// **#15 의 통과 기준 "화면 확인" 이 이 절이다.** 좌표 변환 쪽은 두 곳이 이미
+// 덮었다: 워커가 실은 행렬이 옳은지는 backend 스모크 §5.7·§5.8 이 씬 파일의
+// 정답지로, 그 행렬로 만든 도면이 옳은지는 protocol 스모크 §12 가 모핑 계산으로
+// 본다. 여기 남는 것은 **브라우저에서만 참인 것들**이다:
+//
+//   - 투영이 정말 정사영 쪽으로 **이어지는가** (스냅이면 모핑이 아니라 전환이다)
+//   - 격자가 도면 평면에 눕고 한 칸이 10cm 인가 (재단 뷰의 자다)
+//   - 재생하는 동안 옷이 도면 쪽으로 **눌어붙지 않는가** — `main.ts` 의 rAF
+//     안의 호출 **순서**가 정하는 것이라 DOM 밖에서는 볼 수 없다
+//   - 그리고 실제 씬(패턴 24개, 정점 13,398개)에서 도면이 평평하고 안 겹치는가
+//
+// ── ⚠️ 평평한가를 **경계 상자로 재면 안 된다** ────────────────
+// `cloth.boundingBox()` 는 패턴마다 로컬 AABB 의 모서리 8개를 변환해 합친다.
+// 도면은 로컬 좌표계에서 기울어진 평면이라 그 상자는 부푼다 — 실측으로 t=1 에서
+// z 범위가 [−11.96, +10.43] 이다. **평면인데 22cm 두께라고 말한다.** ISSUE-011
+// 이 "상자는 회전을 거의 못 잡는다" 였는데 여기서 반대 방향으로 같은 함정이
+// 나왔다. 그래서 아래는 **점으로 잰다**, 그리고 상자가 거짓말한다는 사실 자체를
+// 한 줄로 못박아 둔다.
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 3D 격자의 한 칸 크기(cm). **§12 가 펼치기 전에** 재서 여기 남기고 §9 가 읽는다.
+ *
+ * §9 에서 직접 재면 안 된다 — 그때는 §12 가 이미 격자를 도면 쪽으로 옮겨 놓은
+ * 뒤라 배율이 보간된 값이다(실측으로 0.762 가 나왔다. 3D 자리의 값은 0.525 다).
+ */
+let grid3dCellCm = Number.NaN;
+
+/** 슬라이더를 밀고 화면이 따라올 때까지 기다린다 */
+async function setUnfoldSlider(page: Page, pct: number): Promise<void> {
+  await page.evaluate((v: number) => {
+    const s = document.getElementById('unfold') as HTMLInputElement | null;
+    if (!s) return;
+    s.value = String(v);
+    s.dispatchEvent(new Event('input', { bubbles: true }));
+  }, pct);
+  // rAF 가 정점을 옮기고 렌더가 한 번 더 돌 시간.
+  await sleep(400);
+}
+
+interface DraftMetrics {
+  /** 정점을 하나씩 월드로 옮겨 잰 z 범위. **이것이 "평평한가" 의 정본이다** */
+  pointZ: [number, number];
+  /** 같은 상태에서 경계 상자가 말하는 z 범위. 위와 갈린다 */
+  boxZ: [number, number];
+  vertices: number;
+  /** 0.25cm 격자에 삼각형을 칠해 센 것 */
+  coveredCells: number;
+  /** 두 장 이상이 덮은 칸 */
+  overlapCells: number;
+  /** 격자(GridHelper)의 X축 회전(도)과 배율 */
+  gridRotX: number;
+  gridScale: number;
+  /** 투영행렬의 [11] 성분. 원근이면 −1, 정사영이면 0 */
+  projW: number;
+  cameraType: string;
+  unfold: number;
+  mode: string;
+}
+
+/**
+ * 화면에 지금 서 있는 옷을 **월드 XY 평면에 칠해** 겹침을 센다.
+ *
+ * ★ AABB 로 세면 안 된다. 15-a 가 AABB 로 재서 "적용 후 276쌍 중 7쌍(2.5%)이
+ *   겹친다" 를 남겼는데, 그 7쌍이 **진짜 겹침인지는 AABB 로 알 수 없다**
+ *   (레깅스 가랑이 노치처럼 오목한 자리에 작은 조각이 들어앉으면 상자는 겹치고
+ *   형상은 안 겹친다). 여기서 삼각형 단위로 칠하면 그 물음이 끝난다.
+ *
+ * 0.25cm 격자는 도면 144 × 175cm 를 576 × 702 칸으로 덮는다. 삼각형 24,090개를
+ * 각자의 상자 안에서만 칠하므로 브라우저에서 수십 ms 다.
+ *
+ * ⚠️ 같은 패턴이 자기 삼각형으로 같은 칸을 두 번 칠하는 것은 겹침이 **아니다**
+ *    (인접한 삼각형은 변을 공유한다). 패턴별 표식으로 그것을 걸러낸다.
+ */
+function readDraftMetrics(page: Page): Promise<DraftMetrics> {
+  return page.evaluate((): DraftMetrics => {
+    const v = globalThis.cobalt.viewer;
+    v.cloth.group.updateMatrixWorld(true);
+
+    const CELL = 0.25;
+    let pMinZ = Infinity;
+    let pMaxZ = -Infinity;
+    let vertices = 0;
+
+    const worlds: Float64Array[] = [];
+    const indices: (Uint32Array | null)[] = [];
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const p of v.cloth.patterns) {
+      const a = p.position.array as Float32Array;
+      const m = p.mesh.matrixWorld.elements;
+      const w = new Float64Array(a.length);
+      for (let i = 0; i + 2 < a.length; i += 3) {
+        const x = a[i] ?? 0;
+        const y = a[i + 1] ?? 0;
+        const z = a[i + 2] ?? 0;
+        const wx = (m[0] ?? 0) * x + (m[4] ?? 0) * y + (m[8] ?? 0) * z + (m[12] ?? 0);
+        const wy = (m[1] ?? 0) * x + (m[5] ?? 0) * y + (m[9] ?? 0) * z + (m[13] ?? 0);
+        const wz = (m[2] ?? 0) * x + (m[6] ?? 0) * y + (m[10] ?? 0) * z + (m[14] ?? 0);
+        w[i] = wx; w[i + 1] = wy; w[i + 2] = wz;
+        if (wz < pMinZ) pMinZ = wz;
+        if (wz > pMaxZ) pMaxZ = wz;
+        if (wx < minX) minX = wx;
+        if (wx > maxX) maxX = wx;
+        if (wy < minY) minY = wy;
+        if (wy > maxY) maxY = wy;
+        vertices++;
+      }
+      worlds.push(w);
+      const idx = p.geometry.index;
+      indices.push(idx ? Uint32Array.from(idx.array as ArrayLike<number>) : null);
+    }
+
+    const cols = Math.max(1, Math.ceil((maxX - minX) / CELL) + 1);
+    const rows = Math.max(1, Math.ceil((maxY - minY) / CELL) + 1);
+    const grid = new Uint8Array(cols * rows);
+    const seen = new Int32Array(cols * rows).fill(-1);
+    let covered = 0;
+    let overlap = 0;
+
+    const paint = (
+      ax: number, ay: number, bx: number, by: number, cx: number, cy: number, mark: number,
+    ): void => {
+      const x0 = Math.max(0, Math.floor((Math.min(ax, bx, cx) - minX) / CELL));
+      const x1 = Math.min(cols - 1, Math.ceil((Math.max(ax, bx, cx) - minX) / CELL));
+      const y0 = Math.max(0, Math.floor((Math.min(ay, by, cy) - minY) / CELL));
+      const y1 = Math.min(rows - 1, Math.ceil((Math.max(ay, by, cy) - minY) / CELL));
+      const d = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+      if (Math.abs(d) < 1e-12) return;
+      for (let gy = y0; gy <= y1; gy++) {
+        const py = minY + gy * CELL;
+        for (let gx = x0; gx <= x1; gx++) {
+          const px = minX + gx * CELL;
+          const w0 = ((bx - px) * (cy - py) - (by - py) * (cx - px)) / d;
+          const w1 = ((px - ax) * (cy - ay) - (py - ay) * (cx - ax)) / d;
+          const w2 = 1 - w0 - w1;
+          if (w0 < -1e-9 || w1 < -1e-9 || w2 < -1e-9) continue;
+          const k = gy * cols + gx;
+          if (seen[k] === mark) continue;   // 같은 패턴이 이미 칠했다
+          seen[k] = mark;
+          const n = grid[k] ?? 0;
+          if (n === 0) { grid[k] = 1; covered++; } else if (n === 1) { grid[k] = 2; overlap++; }
+        }
+      }
+    };
+
+    worlds.forEach((w, pi) => {
+      const idx = indices[pi];
+      if (idx) {
+        for (let t = 0; t + 2 < idx.length; t += 3) {
+          const a = (idx[t] ?? 0) * 3;
+          const b = (idx[t + 1] ?? 0) * 3;
+          const c = (idx[t + 2] ?? 0) * 3;
+          paint(w[a] ?? 0, w[a + 1] ?? 0, w[b] ?? 0, w[b + 1] ?? 0, w[c] ?? 0, w[c + 1] ?? 0, pi);
+        }
+      } else {
+        for (let i = 0; i + 8 < w.length; i += 9) {
+          paint(w[i] ?? 0, w[i + 1] ?? 0, w[i + 3] ?? 0, w[i + 4] ?? 0, w[i + 6] ?? 0, w[i + 7] ?? 0, pi);
+        }
+      }
+    });
+
+    // 격자는 씬 그래프를 타고 찾는다 — 하네스를 위한 훅을 제품에 넣지 않는다.
+    const scene = v.cloth.group.parent;
+    let gridRotX = Number.NaN;
+    let gridScale = Number.NaN;
+    scene?.children.forEach((o) => {
+      if (o.type !== 'GridHelper') return;
+      gridRotX = (o.rotation.x * 180) / Math.PI;
+      gridScale = o.scale.x;
+    });
+
+    const box = v.cloth.boundingBox();
+    return {
+      pointZ: [pMinZ, pMaxZ],
+      boxZ: [box.min.z, box.max.z],
+      vertices,
+      coveredCells: covered,
+      overlapCells: overlap,
+      gridRotX,
+      gridScale,
+      projW: v.camera.projectionMatrix.elements[11] ?? Number.NaN,
+      cameraType: v.camera.type,
+      unfold: v.unfold,
+      mode: v.mode,
+    };
+  });
+}
+
+/**
+ * **rAF 안에서 프레임마다** 옷의 월드 z 두께를 잰다.
+ *
+ * ⚠️ 밖에서 몇 번 재는 것으로는 안 된다. `main.ts` 의 rAF 안 호출 순서가 어긋나면
+ *    두께가 **한 프레임씩 튄다** — 시뮬 프레임이 붙는 프레임에서만 옷이 3D 자세로
+ *    돌아갔다가 다음 프레임에 다시 접힌다. 밖에서 재면 그 순간을 만날 확률이
+ *    낮아 "가끔 이상한 값" 으로 보이고, 평균만 보면 멀쩡하다.
+ *
+ *    실측(t=0.5, 60프레임): 올바른 순서면 12.17~13.03(변동폭 0.86),
+ *    `sync` 를 `apply` 뒤로 옮기면 12.17~26.06(변동폭 13.89)으로 매 시뮬
+ *    프레임마다 24 쪽으로 튄다. 화면에서는 옷이 덜덜 떠는 것으로 보인다.
+ */
+function sampleThickness(page: Page, frames: number): Promise<number[]> {
+  return page.evaluate((n: number) => new Promise<number[]>((res) => {
+    const v = globalThis.cobalt.viewer;
+    const out: number[] = [];
+    const tick = (): void => {
+      v.cloth.group.updateMatrixWorld(true);
+      let mn = Infinity;
+      let mx = -Infinity;
+      for (const p of v.cloth.patterns) {
+        const a = p.position.array as Float32Array;
+        const m = p.mesh.matrixWorld.elements;
+        for (let i = 0; i + 2 < a.length; i += 3) {
+          const z = (m[2] ?? 0) * (a[i] ?? 0) + (m[6] ?? 0) * (a[i + 1] ?? 0)
+            + (m[10] ?? 0) * (a[i + 2] ?? 0) + (m[14] ?? 0);
+          if (z < mn) mn = z;
+          if (z > mx) mx = z;
+        }
+      }
+      out.push(mx - mn);
+      if (out.length < n) requestAnimationFrame(tick);
+      else res(out);
+    };
+    requestAnimationFrame(tick);
+  }), frames);
+}
+
+async function sectionUnfold(page: Page): Promise<void> {
+  section('§12. 2D 펼침 (#15-b) — 도면이 평평하고 겹치지 않는다');
+
+  await timed('§12 2D 펼침', async () => {
+    // 시작은 3D 다. 앞 절들이 무엇을 하고 왔든 여기서 기준을 세운다.
+    await ensurePlaying(page, false);
+    await setUnfoldSlider(page, 0);
+
+    const flat0 = await readDraftMetrics(page);
+    const span0 = flat0.pointZ[1] - flat0.pointZ[0];
+    check(
+      '★ 처음에는 3D 다 — 슬라이더가 0 이고 옷이 입체다',
+      flat0.unfold === 0 && span0 > 1,
+      `t=${flat0.unfold} · 정점 ${fmt(flat0.vertices)}개 · z 두께 ${span0.toFixed(2)}cm`,
+    );
+    check(
+      '★ 3D 에서는 투영이 원근이다 (projectionMatrix[11] = −1)',
+      Math.abs(flat0.projW + 1) < 1e-6,
+      `[11] = ${flat0.projW}`,
+    );
+    check(
+      '★★ 대조군 — 3D 드레이프를 도면과 같은 평면에 눌러 보면 천이 겹친다 (아래 판정에 이빨이 있다는 증거)',
+      flat0.overlapCells > flat0.coveredCells * 0.05,
+      `덮인 칸 ${fmt(flat0.coveredCells)} 중 겹친 칸 ${fmt(flat0.overlapCells)}`
+      + ` (${(flat0.overlapCells / Math.max(1, flat0.coveredCells) * 100).toFixed(1)}%)`,
+    );
+
+    const view0 = await page.evaluate(() => ({
+      enabled: globalThis.cobalt.unfoldControl.view.enabled,
+      stat: document.getElementById('unfoldStat')?.textContent ?? '',
+      why: document.getElementById('unfoldWhy')?.textContent ?? '',
+      disabled: (document.getElementById('unfold') as HTMLInputElement | null)?.disabled ?? true,
+      placed: globalThis.cobalt.unfolder.stats.placed,
+      unplaced: globalThis.cobalt.unfolder.stats.unplaced,
+    }));
+    check(
+      '★ 씬이 서 있으면 슬라이더를 만질 수 있고, 상태가 글자로 보인다',
+      !view0.disabled && view0.enabled && view0.stat.length > 0,
+      `"${view0.stat}" · 배치 ${view0.placed}/${view0.placed + view0.unplaced}`,
+    );
+    note(
+      '이 씬의 배치',
+      `placed ${view0.placed} · unplaced ${view0.unplaced}`
+      + ' — 실측 씬은 전부 배치가 있다. 빈 갈래의 모핑 동작은 스모크 §12 ④ 가 태운다',
+    );
+    // 아직 펼치기 전이다 = 격자가 3D 자리에 있는 유일한 시점. §9 가 이 값을 읽는다.
+    // (`GridHelper(400, 40)` 이라 한 칸이 10 단위이고, 거기 걸린 배율이 곧 칸 크기다)
+    grid3dCellCm = flat0.gridScale * 10;
+
+    // ── 도면으로 ─────────────────────────────────────────────
+    await setUnfoldSlider(page, 100);
+    const flat1 = await readDraftMetrics(page);
+    const pointSpan = flat1.pointZ[1] - flat1.pointZ[0];
+    const boxSpan = flat1.boxZ[1] - flat1.boxZ[0];
+
+    check(
+      '★★★ t=1 에서 도면이 **정말로 평평하다** — 정점 전부의 월드 z 가 0 이다',
+      pointSpan < 0.01 && Math.abs(flat1.pointZ[0]) < 0.01,
+      `정점 ${fmt(flat1.vertices)}개 · z ${flat1.pointZ[0].toExponential(2)} ~ ${flat1.pointZ[1].toExponential(2)}cm`
+      + ` (3D 일 때는 ${span0.toFixed(1)}cm 두께였다)`,
+    );
+    check(
+      '★★★ 같은 상태에서 **경계 상자는 평평하지 않다고 말한다** — 평평함을 상자로 재면 안 된다는 증거',
+      boxSpan > 1 && boxSpan > pointSpan * 100,
+      `상자 z ${flat1.boxZ[0].toFixed(2)} ~ ${flat1.boxZ[1].toFixed(2)} (${boxSpan.toFixed(1)}cm)`
+      + ` vs 점 ${pointSpan.toExponential(2)}cm — 로컬 AABB 모서리 8개를 변환해 합치기 때문이다`,
+    );
+
+    check(
+      '★★★ 도면 위에서 천이 겹치지 않는다 (0.25cm 격자에 삼각형 단위로 칠해서 센다)',
+      flat1.coveredCells > 1_000 && flat1.overlapCells === 0,
+      `덮인 칸 ${fmt(flat1.coveredCells)}개 · 두 장 이상 겹친 칸 ${fmt(flat1.overlapCells)}개`
+      + ' — 15-a 의 AABB 기준 "7쌍 겹침" 은 상자가 겹친 것이지 형상이 겹친 것이 아니다',
+    );
+    note(
+      '도면 면적',
+      `${(flat1.coveredCells * 0.25 * 0.25).toFixed(0)}cm² (0.25cm 칸 ${fmt(flat1.coveredCells)}개)`,
+    );
+
+    check(
+      '★★ 도면에서 투영이 정사영이다 (projectionMatrix[11] = 0 — 원근 왜곡이 없어야 치수가 자다)',
+      Math.abs(flat1.projW) < 1e-6,
+      `[11] = ${flat1.projW}`,
+    );
+    check(
+      '★★ 그런데 카메라 **객체**는 그대로 PerspectiveCamera 다 (갈아 끼우지 않았다 — 이 하네스가 읽는 viewer.camera 가 안 흔들린다)',
+      flat1.cameraType === 'PerspectiveCamera',
+      flat1.cameraType,
+    );
+    check(
+      '★★ 격자가 도면 평면으로 눕고 배율이 1 이다 — "격자 한 칸 = 10cm" 가 도면에서 글자 그대로 참이 된다',
+      Math.abs(flat1.gridRotX - 90) < 0.5 && Math.abs(flat1.gridScale - 1) < 1e-6,
+      `회전 ${flat1.gridRotX.toFixed(1)}° · 배율 ${flat1.gridScale}`,
+    );
+    check(
+      '★★ 배타 모드는 손대지 않았다 — 2D 는 세 번째 뷰가 아니라 실시간 옷의 다른 자세다',
+      flat1.mode === 'live',
+      `mode=${flat1.mode}`,
+    );
+
+    const sh1 = await shot(page, 'unfold-2d');
+    check(
+      '도면이 화면에 실제로 그려져 있다',
+      sh1.colors.saturated > sh1.colors.total * 0.01,
+      describe(sh1.colors),
+    );
+
+    // ── 모핑인가, 전환인가 ────────────────────────────────────
+    //
+    // ★ 여기가 "슬라이더" 라는 선택의 값어치다. t=0.5 에서 투영이 −1 이나 0 이면
+    //   그건 보간이 아니라 문턱에서 튀는 **전환**이고, 중간에서 멈춰 어느 조각이
+    //   어디로 가는지 보는 일이 불가능해진다.
+    await setUnfoldSlider(page, 50);
+    const mid = await readDraftMetrics(page);
+    const midSpan = mid.pointZ[1] - mid.pointZ[0];
+    check(
+      '★★★ t=0.5 의 투영이 원근과 정사영의 **중간**이다 (양 끝으로 스냅하면 모핑이 아니라 전환이다)',
+      mid.projW < -0.05 && mid.projW > -0.95,
+      `[11] = ${mid.projW.toFixed(4)} (원근 −1 / 정사영 0)`,
+    );
+    check(
+      '★★ 옷도 중간에 있다 — 3D 두께와 도면 사이에 있다',
+      midSpan > pointSpan + 0.1 && midSpan < span0,
+      `z 두께 ${midSpan.toFixed(2)}cm (3D ${span0.toFixed(2)} → 도면 ${pointSpan.toExponential(1)})`,
+    );
+
+    // ── 재생 중에 눌어붙지 않는가 ─────────────────────────────
+    //
+    // ⚠️ **이 절에서만 볼 수 있는 것이다.** `main.ts` 의 rAF 가 `sync` 를
+    //    `apply` 보다 **먼저** 불러야 한다는 계약이고, 뒤집히면 섞인 값을
+    //    원본으로 착각해 옷이 프레임마다 도면 쪽으로 끌려간다. 몇 초에 걸쳐
+    //    서서히 일어나 화면에서는 "원래 이런가" 로 보인다.
+    //
+    // 재는 법: t=0.5 로 두고 재생한 뒤 **t=0 으로 되돌려** 두께를 본다.
+    // 눌어붙었다면 원본 자체가 도면에 가까워져 있어서 3D 로 돌아가도 납작하다.
+    const applied0 = await page.evaluate(() => globalThis.cobalt.stats.applied);
+    await ensurePlaying(page, true);
+    const ran = await page.waitForFunction(
+      (n: number) => globalThis.cobalt.stats.applied > n + 20,
+      applied0,
+      { timeout: 40_000 },
+    ).then(() => true, () => false);
+    const samples = await sampleThickness(page, 60);
+    const applied1 = await page.evaluate(() => globalThis.cobalt.stats.applied);
+    await ensurePlaying(page, false);
+    await sleep(300);
+
+    check('★ 재생이 흘렀다 (아래 판정의 전제)', ran, `applied ${applied0} → ${applied1}`);
+
+    const sMin = Math.min(...samples);
+    const sMax = Math.max(...samples);
+    check(
+      '★★ 재생 중에도 3D 는 살아 있다 — t=0.5 에서 옷이 납작해지지 않았다',
+      sMin > 0.1,
+      `z 두께 최소 ${sMin.toFixed(2)}cm (표본 ${samples.length}개)`,
+    );
+    // ★★★ **호출 순서를 잡는 유일한 단언이다.** `main.ts` 의 rAF 가 `sync` 를
+    //   `apply` 보다 먼저 불러야 하는데, 뒤집으면 `apply` 의 "같은 t 는 다시 쓰지
+    //   않는다" 가드와 맞물려 **시뮬 프레임이 붙는 프레임에서만 3D 원본이 그대로
+    //   화면에 남는다.** 평균도 최종 상태도 멀쩡한데 매 프레임 튄다 — 사람 눈에는
+    //   옷이 덜덜 떠는 것으로 보이고, 스크린샷 한 장으로는 절대 안 보인다.
+    //   (Node 스모크 §12 ⑤ 는 그 오염 **메커니즘**을 못박는다. 실제 배선이 어느
+    //    쪽인지는 여기서만 알 수 있다.)
+    check(
+      '★★★ 재생 중 두께가 프레임마다 흔들리지 않는다 (main.ts 가 sync 를 apply 보다 먼저 부른다는 계약)',
+      sMax - sMin < span0 * 0.1,
+      `${samples.length}프레임 · ${sMin.toFixed(2)} ~ ${sMax.toFixed(2)}cm (변동폭 ${(sMax - sMin).toFixed(2)},`
+      + ` 문턱 ${(span0 * 0.1).toFixed(2)}) — 순서가 뒤집히면 시뮬 프레임마다 3D 로 튄다`,
+    );
+
+    await setUnfoldSlider(page, 0);
+    const back = await readDraftMetrics(page);
+    const backSpan = back.pointZ[1] - back.pointZ[0];
+    check(
+      '★★★ t 를 0 으로 되돌리면 옷이 다시 입체다 — 재생하는 동안 도면 쪽으로 눌어붙지 않았다'
+      + ' (sync 를 apply 보다 먼저 부른다는 계약)',
+      backSpan > span0 * 0.5,
+      `되돌린 뒤 ${backSpan.toFixed(2)}cm vs 펼치기 전 ${span0.toFixed(2)}cm`,
+    );
+    check(
+      '★ 투영도 원근으로 돌아왔다 (2D 를 안 쓰는 동안은 이 기능이 없는 것과 같다)',
+      Math.abs(back.projW + 1) < 1e-6 && back.unfold === 0,
+      `[11] = ${back.projW} · t=${back.unfold}`,
+    );
+    // ★ **이 줄은 한때 빨간불이었다 — 15-b 가 만든 회귀를 여기서 잡았다.**
+    //
+    //   그때의 `Viewer3D.setUnfold()` 는 `next === 0` 에서 카메라만 되돌리고
+    //   조기 반환했다 — 격자를 되돌리는 사람이 없었다. 렌더 루프도
+    //   `if (this.#unfold > 0)` 라 t=0 에서는 아무 일도 안 한다. 그래서 격자가
+    //   **마지막으로 t>0 이었을 때의 자세에 멎었다.**
+    //
+    //   화살표로 한 칸씩 내려오면 마지막이 t=0.01 이라 0.9° 로 눈에 안 띈다.
+    //   **점프하면 드러났다** — 슬라이더에 포커스를 두고 Home 키(또는 트랙 왼쪽
+    //   끝 클릭)를 누르면 회전 90°·배율 1·위치 (44.5, 73.4, −0.5) 에 그대로
+    //   남았다. 바닥 격자가 수직으로 선 채 옷 뒤에 서 있게 된다.
+    //   **씬을 새로 로드해도 안 풀렸다** — `frameCamera()` 가 위치·배율은
+    //   되돌리지만 `rotation` 은 건드리지 않기 때문이다.
+    //
+    //   지금은 `setUnfold` 의 t=0 분기가 `#restoreGrid()` 를 부르고, 이 줄은
+    //   초록이다. **이 단언에 이빨이 있다는 것은 돌연변이로 확인했다**:
+    //   `#restoreGrid()` 한 줄을 지우면 이 줄만 정확히 빨간불이 되고
+    //   (verify:ui 199/200), Node 스모크는 651건 전부 초록으로 남는다 —
+    //   격자는 `viewer3d/` 안에 있어 DOM 밖에서는 볼 수 없다.
+    //   **줄이면 안 되는 단언이다.**
+    check(
+      '★★ 3D 로 되돌아오면 격자도 3D 자리로 돌아온다 (setUnfold 의 t=0 조기 반환이 #driveGrid(0) 을 건너뛴다)',
+      Math.abs(back.gridRotX) < 0.5 && Math.abs(back.gridScale - flat0.gridScale) < 1e-6,
+      `회전 ${back.gridRotX.toFixed(1)}° (3D 는 0°) · 배율 ${back.gridScale.toFixed(3)} (3D 는 ${flat0.gridScale.toFixed(3)})`,
+    );
+
+    // ── 배치를 모르는 패턴 — **화면이 그 사실을 말하는가** ─────
+    //
+    // 실측 씬은 24/24 가 전부 배치돼 있어 이 갈래를 지나갈 수 없다. 모핑 쪽
+    // 동작(그 패턴만 3D 에 남는다)은 스모크 §12 ④ 가 태우고, 여기서는
+    // **배선**만 본다: 판정이 바뀌면 화면의 글자가 실제로 따라오는가.
+    // 창구(`unfoldControl.setStats`)는 공개 메서드다 — 하네스를 위해 제품에
+    // 넣은 훅이 아니다.
+    //
+    // ⚠️ 문구를 통째로 박지 않는다. 계약은 **"이유가 있고, 몇 개인지 말한다"**
+    //    이고 문장은 다듬을 수 있다 (#16-a 가 세운 기준).
+    const forced = await page.evaluate(() => {
+      const c = globalThis.cobalt;
+      const real = c.unfolder.stats;
+      const nudge = (): void => {
+        document.getElementById('unfold')?.dispatchEvent(new Event('input', { bubbles: true }));
+      };
+      const read = (): { why: string; disabled: boolean } => ({
+        why: document.getElementById('unfoldWhy')?.textContent ?? '',
+        disabled: (document.getElementById('unfold') as HTMLInputElement | null)?.disabled ?? true,
+      });
+
+      // ① 일부만 배치가 없다 — 만질 수는 있고, 이유가 보인다
+      c.unfoldControl.setStats({ ...real, placed: real.patterns - 3, unplaced: 3 });
+      nudge();
+      const partial = read();
+
+      // ② 전부 배치가 없다 — 만질 수 없고, 왜인지가 보인다
+      c.unfoldControl.setStats({ ...real, placed: 0, unplaced: real.patterns, bounds: null });
+      nudge();
+      const none = read();
+
+      // 원상복구. 남겨 두면 뒤따르는 절이 가짜 상태를 본다.
+      c.unfoldControl.setScene(true);
+      c.unfoldControl.setStats(real);
+      nudge();
+      return { partial, none, restored: read(), patterns: real.patterns };
+    });
+
+    check(
+      '★★★ 배치가 없는 패턴이 생기면 화면이 **글자로** 말한다 (회색으로만 두지 않는다 — #16 이 세운 규칙)',
+      forced.partial.why.length > 0 && forced.partial.why.includes('3') && !forced.partial.disabled,
+      `"${forced.partial.why}" · 슬라이더 ${forced.partial.disabled ? '비활성' : '활성'}`,
+    );
+    check(
+      '★★★ 전부 배치가 없으면 슬라이더가 잠기고, **왜 잠겼는지**가 화면에 남는다',
+      forced.none.disabled && forced.none.why.length > 0
+      && forced.none.why.includes(String(forced.patterns)),
+      `"${forced.none.why}" · 슬라이더 ${forced.none.disabled ? '비활성' : '활성'}`,
+    );
+    check(
+      '★ 되돌리면 화면도 되돌아온다 (하네스가 가짜 상태를 남기지 않는다)',
+      forced.restored.why === '' && !forced.restored.disabled,
+      `why="${forced.restored.why}" · 슬라이더 ${forced.restored.disabled ? '비활성' : '활성'}`,
+    );
+
+    const shBack = await shot(page, 'unfold-back-to-3d');
+    check(
+      '되돌아온 화면에도 옷이 있다',
+      shBack.colors.saturated > shBack.colors.total * 0.01,
+      describe(shBack.colors),
+    );
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
 // §9. 열려 있는 이슈 — **단언하지 않고 값만 남긴다**
 //
 // ISSUE-009·010 은 아직 안 고쳤다. 지금 동작을 단언으로 박으면 고치는 날
@@ -3032,10 +3567,21 @@ async function sectionOpenIssues(page: Page): Promise<void> {
       + ' ② step op 이 no-op 이라 버튼·SPACE 를 화면에 올리지 않았다'
       + ' (스모크 §10-8·§10-10 이 관찰한다)',
     );
+    // ★ 3D 격자의 한 칸은 10cm 가 아니다 — 그런데 화면 힌트는 그렇다고 단언한다.
+    //   #15-b 에서 2D 쪽을 정확히 10cm 로 맞추면서 드러난 **기존 동작**이라
+    //   여기서는 재현만 하고 판정하지 않는다(§9 의 규칙 그대로).
+    note(
+      '3D 격자의 한 칸이 10cm 가 아니다 (기존 동작 · 판정하지 않음)',
+      `이번 실행에서 한 칸 ${grid3dCellCm.toFixed(1)}cm (§12 가 펼치기 전에 잰 값).`
+      + ' 화면 아래 힌트는 "격자 한 칸 = 10cm" 라고 단언한다.'
+      + ' frameCamera() 가 scale = cells·10/400 을 거는데 cells 가 옷 크기를 따라가서,'
+      + ' 씬마다 값이 변한다. 2D 도면(§12)에서는 배율 1 = 정확히 10cm 로 맞췄다 —'
+      + ' 재단 치수를 재는 뷰라 자가 어긋나면 안 되기 때문이다. 3D 는 이번 단위가 손대지 않았다',
+    );
     note(
       '덮지 못하는 것',
-      '2D 펼침(#15) · 업로드 경로 · 재연결(끊겼다 붙는 것). 화면이 생기면 절을 추가할 것'
-      + ' (파라미터(#16)는 §11 로 들어왔다)',
+      '업로드 경로 · 재연결(끊겼다 붙는 것). 화면이 생기면 절을 추가할 것'
+      + ' (파라미터(#16)는 §11, 2D 펼침(#15)은 §12 로 들어왔다)',
     );
   });
 }
