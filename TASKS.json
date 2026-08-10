@@ -1,6 +1,6 @@
 {
   "project": "zelusSandBox_Cobalt 웹 서비스화",
-  "updated": "2026-08-06",
+  "updated": "2026-08-10",
   "source": "DESIGN.md §10 구현 순서를 테스트 가능한 단위로 분할한 것",
   "principle": "작은 단위 → 테스트 작성 → 통과 → 커밋 → 다음. 단위 크기 기준은 '최소'가 아니라 '테스트가 원인을 지목할 수 있는 최소'.",
 
@@ -197,13 +197,14 @@
       "id": 15,
       "group": "frontend",
       "title": "2D 펼침 뷰 + 모핑",
-      "detail": "추가 데이터가 필요 없다. 같은 indices에 위치만 vertices → uvs로 바꾸고 정사영 카메라를 쓴다. 두 값을 보간하면 3D↔2D 모핑이 나온다.",
+      "detail": "⚠️ 전제가 뒤집혔다. 원래 여기에는 \"추가 데이터가 필요 없다 — 같은 indices에 위치만 vertices → uvs로 바꾸고 정사영 카메라를 쓰면 된다\"고 적혀 있었고, 그게 틀렸다. uvs는 각 패턴의 로컬 평면 좌표 그 자체라 24개가 원점에 겹쳐 쌓인다(AABB 쌍 227/276 = 82.2% 겹침, 개별 면적 합이 전체 상자의 2.05배). 배치는 ztDesignSurface::GetTransform()에 있고 데스크톱 2D 뷰도 그걸 곱해 그리는데 우리 워커가 그 값을 안 싣고 있었다 — ISSUE-018로 기록했다. Builder가 구현 전에 실측하고 멈춘 덕에 한 줄도 쓰기 전에 잡혔고, 그래서 단위가 둘로 쪼개졌다: be8f83d가 워커의 transform2d(행 우선 3×3), 03cb5a2가 2D 뷰와 모핑이다. 적용 후 겹침 82.2% → 2.5%, 면적비 2.05배 → 0.55배. 남은 2.5%는 AABB만 겹치고 천은 겹치지 않는다 — 0.25cm 격자 실측에서 덮인 칸 138,109개 중 2개 이상이 겹친 칸이 0개다. 오목한 자리에 조각을 끼운 실제 마커 배치다. 전치가 이 단위의 최대 함정이었다: zsMatrix33은 저장이 열 우선인데 GetElement(i,j)는 e[j][i]를 돌려줘 (행,열) 접근이다(note 참고). 전치해 읽어도 패턴이 흩어진 \"그럴듯한\" 도면이 나오기 때문에 화면으로는 못 가른다 — .zls의 평문 JSON에서 GetMatrix33() 합성 규칙을 재구현해 행렬 집합끼리 대조해 갈랐고, 두 씬에서 24/24·5/5 일치에 전치본 0건이었다. 2D 평면은 월드 XY(z=0)이고 y 뒤집힘은 uv.y = p.y 성질로 확정했다(24/24 비트 일치). 정점은 M3d⁻¹를 곱해 메시 로컬로 되돌려 넣는다 — ISSUE-011의 메시 변환을 안 건드리려는 것이다. 카메라를 갈아 끼우지 않고 투영행렬을 성분별로 보간한다. 배타 모드(live|snapshot)는 그대로 뒀다 — 2D는 세 번째 뷰가 아니라 실시간 옷의 자세다. 배치를 모르는 패턴은 모핑에서 빼고 그 이유를 화면에 글자로 남긴다. 재생 중에도 3D를 얼리지 않는다. 테스트: frontend 스모크 609 → 651, verify:ui 176 → 200, backend 스모크 31 → 50. 돌연변이 9건이 두 하네스의 경계를 갈랐다 — 좌표·산술은 스모크가 정본이고 배선·카메라·격자는 UI가 정본이다. apply2d를 전치해도 UI는 200/200으로 초록불이다. 미완 넷: (1) transform2d === null 갈래를 실측으로 못 태웠다 — 두 씬 모두 배치가 완전해(unplaced: 0) 가짜 패턴으로만 덮었다. (2) 3D 격자 한 칸이 10cm가 아니다 — 기존 코드가 scale = cells/40을 걸어 실제 5.3cm(하네스 실측)인데 화면 힌트는 \"격자 한 칸 = 10cm\"라고 단언한다. 2D 도면은 정확히 10cm다. 기존 동작이라 이번엔 안 건드렸다. (3) m01↔m10 부분 전치는 sample.zls로 원리적으로 관측 불가다(서피스 회전이 전부 0) — 회전이 있는 씬(backend/data/, gitignore)이 있을 때만 태울 수 있다. (4) t=1에서 회전 잠금이 맞는지 미확정이다(팬·줌은 살렸다). 백로그 C그룹(디자인 기반 2D — 봉제선·커브·노치·시접)이 이 위에 얹힌다.",
       "test": "좌표 변환 자동 검증 + 화면 확인",
       "verify": "auto",
-      "files": ["frontend/src/viewer2d/"],
+      "note": "zsMatrix33은 저장이 열 우선인데 GetElement(i,j)가 e[j][i]를 돌려줘 (행,열) 접근이다 — 워커가 싣는 transform2d는 행 우선 3×3이다. 그리고 sync는 정점 버퍼에 3D가 있을 때만 부를 것",
+      "files": ["backend/native/src/protocol.cpp", "backend/src/sdk/protocol.ts", "backend/src/sdk/session.ts", "backend/src/sdk/smoke.ts", "frontend/src/protocol/decode.ts", "frontend/src/protocol/types.ts", "frontend/src/protocol/index.ts", "frontend/src/viewer2d/unfold.ts", "frontend/src/viewer2d/control.ts", "frontend/src/viewer2d/index.ts", "frontend/src/viewer3d/cloth.ts", "frontend/src/viewer3d/viewer.ts", "frontend/src/main.ts", "frontend/src/protocol/smoke.ts", "frontend/src/verify/ui.ts", "frontend/index.html"],
       "depends": [12],
-      "status": "todo",
-      "commit": null
+      "status": "done",
+      "commit": "be8f83d, 03cb5a2"
     },
     {
       "id": 16,
