@@ -269,6 +269,40 @@
         "items": [
           { "ui": [8], "op": "saveZls", "zest": "SaveZls" }
         ]
+      },
+
+      {
+        "key": "parity",
+        "title": "E. 실시간 뷰를 스냅샷 그림에 맞춘다 — 계획 밖 (2026-08-07 조사)",
+        "cost": "중간. 엔진에 전부 있고 프로토콜 노출과 화면 배선만 남았다",
+        "why": "실시간 뷰에 아바타가 없고 색이 패턴 구분용 임의 5색이다. 스냅샷(glTF)에만 진짜 그림이 있다. 둘을 맞추면 이후 작업의 눈 확인이 전부 빨라진다",
+        "origin": "데스크톱 68개 기능 표가 아니라 사용자가 데스크톱 스크린샷을 주며 '이렇게 나와야 돼'라고 한 데서 나왔다. 그래서 A~D와 달리 ui 번호가 없다",
+        "status": "착수함 — materials-a 완료(6673613), 나머지 보류 (2026-08-10)",
+        "blocked": "GPU 드라이버 불안정으로 npm run verify:ui 를 못 돌린다. 화면을 바꾸는 항목은 그 하네스 없이는 검증이 반쪽이다 — #16에서 12건, #15에서 3건이 그 하네스에서만 잡혔다",
+        "items": [
+          {
+            "what": "materials-b — 받아온 색을 화면에 칠한다",
+            "status": "todo",
+            "note": "워커·디코딩은 materials-a(6673613)로 끝났고 색이 cloth.ts 까지 와 있다. three 머티리얼에 물리는 배선만 남았다. ⚠️ sample.zls 는 5패턴이 전부 흰색이라 임의 팔레트를 폴백으로 남겨야 한다 — 언제 어느 쪽을 쓸지 정하는 것이 이 단위의 판단이다. verify:ui 가 이미 민트/노랑을 픽셀로 판정할 줄 안다"
+          },
+          {
+            "what": "avatarMesh-a — 워커가 아바타 메시를 낸다",
+            "status": "todo",
+            "zest": "ztSceneQueryInterface::GetAvatars() → ztDesignAvatar::GetMeshes()/GetRenderMeshs() → zsTriMesh",
+            "note": "GPU 불필요. 옷과 같은 자료구조라 MeshData() 재포장 로직을 그대로 쓴다. ⚠️ IsUpdateRenderMesh()/IsForceUpdatedMesh() 를 부르지 마라 — const 인데 읽는 순간 mutable 플래그를 지워 시뮬 동작이 바뀐다. ⚠️ 아바타 메시는 이중버퍼 보호가 없어 ztGlobalMutex 를 직접 잡아야 한다. 25,357정점(사용자 씬 28,564)으로 옷의 3.3배, 프레임당 304KB라 매 프레임 밀 물건이 아니다"
+          },
+          {
+            "what": "avatarMesh-b — 실시간 뷰에 아바타를 세운다",
+            "status": "todo",
+            "note": "⚠️ 좌표계를 먼저 확인할 것. 옷은 패턴 로컬이라 변환이 따로 필요했다(ISSUE-011). 아바타도 그런지 안 쟀다 — 틀리면 옷과 아바타가 어긋난 채 두 벌 보인다"
+          },
+          {
+            "what": "아바타 체형 조절",
+            "status": "todo",
+            "zest": "ztAvatarManager::SetMeasurementParam(치수, 체형, ...) · ztAvatarShaper::GuessParams(치수) 가 치수→체형을 역산한다",
+            "note": "2026-08-10 확인: 엔진에 완비돼 있다. ztAvatarBodyParam 29개(살집·키·어깨·팔길이·배·힙·가슴·허벅지…), ztAvatarMeasurePart 25개(허리둘레·가슴둘레·키…). 데스크톱 앱이 UI 로 안 열 뿐이다. avatarMesh-b 가 선행돼야 확인이 빠르다 — 지금은 스냅샷에서만 보여서 체형을 바꿔도 확인이 느리다"
+          }
+        ]
       }
     ],
     "deferred": [
