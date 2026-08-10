@@ -55,7 +55,7 @@
 
 import * as THREE from 'three';
 
-import type { DecodedPattern, PatternTransform2D } from '../protocol/index.ts';
+import type { DecodedPattern, PatternMaterial, PatternTransform2D } from '../protocol/index.ts';
 
 /** 패턴 하나에 대응하는 three 객체 묶음 */
 export interface PatternMesh {
@@ -85,6 +85,17 @@ export interface PatternMesh {
    * 않는다(원점에 배치된 것과 구분할 수 있어야 한다).
    */
   readonly transform2d: PatternTransform2D | null;
+  /**
+   * 씬이 정한 **진짜** 재질. 없으면 null.
+   *
+   * ⚠️ **아직 화면에 반영되지 않는다.** `mesh.material` 은 여전히 아래
+   *    `PALETTE` 의 임의 색이다 — 배선은 materials-b 의 몫이고, 여기까지는
+   *    워커가 실어 준 값을 손실 없이 들고 있는 것까지다.
+   *
+   * null 인 경우(재질 없는 패턴, 구버전 워커)에 흰색으로 메우지 않는다 —
+   * 진짜 흰 옷과 구분할 수 없게 된다. 그때 쓸 것이 `PALETTE` 폴백이다.
+   */
+  readonly material: PatternMaterial | null;
 }
 
 /**
@@ -93,6 +104,18 @@ export interface PatternMesh {
  * 단색으로 두면 패턴 경계가 안 보여서, 화면만 보고는 "제대로 그려진 것"과
  * "패턴 하나가 통째로 뒤집힌 것"을 구분할 수 없다. 사람이 눈으로 판정하는
  * 단위(#12 는 `verify: manual`)라 색이 곧 검증 도구다.
+ *
+ * ★ materials-a 이후로 이것은 **폴백이 될 예정이다.** 워커가 씬의 진짜 색을
+ *   실어 주지만(`PatternMesh.material`), 재질이 없는 패턴이 있고 그때는
+ *   여기로 돌아와야 한다. `sample.zls` 는 5개 패턴이 **전부 흰색**이라 진짜
+ *   색만 쓰면 옷이 흰 덩어리 하나로 보인다 — 그 씬에서는 폴백이 오히려
+ *   정답이다. 무엇을 언제 쓸지는 materials-b 가 정한다. 지우지 말 것.
+ *
+ * ⚠️ `verify/ui.ts` 의 `LIVE_PALETTE_BUCKETS` 가 이 다섯 색의 색상 칸을
+ *    베껴 두고 "이 칸에 없는 민트/노랑이면 진짜 텍스처에서 온 것"이라는
+ *    배제 논증에 쓴다. materials-b 가 진짜 색을 칠하는 순간 **이 팔레트는
+ *    더 이상 실시간 옷이 낼 수 있는 색의 전부가 아니게 되고** 그 논증이
+ *    조용히 깨진다. 지금은 아직 성립한다(색이 화면에 반영되지 않으므로).
  */
 const PALETTE = [0x7ea8d8, 0xd8a87e, 0x8fc9a0, 0xc98f9e, 0xb0a8d8] as const;
 
@@ -222,6 +245,11 @@ export class ClothObject {
         uvs: p.uvs ? new Float32Array(p.uvs) : null,
         // 복사해서 우리가 소유한다 — `uvs`·`positions` 와 같은 이유다.
         transform2d: p.transform2d ? ([...p.transform2d] as PatternTransform2D) : null,
+        // 같은 이유로 복사한다. color 배열까지 새로 만들어야 디코더가 준
+        // 객체를 나중에 누가 건드려도 여기가 안 흔들린다.
+        material: p.material
+          ? { ...p.material, color: [...p.material.color] as [number, number, number] }
+          : null,
       });
 
       this.#vertices += p.vertices;

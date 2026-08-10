@@ -34,6 +34,7 @@ export type {
   Op,
   PatternData,
   PatternInfo,
+  PatternMaterial,
   PatternTransform,
   PatternTransform2D,
   SetParamsResult,

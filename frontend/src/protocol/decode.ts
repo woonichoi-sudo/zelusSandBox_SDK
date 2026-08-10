@@ -23,6 +23,7 @@
 import type {
   FrameMesh,
   PatternData,
+  PatternMaterial,
   PatternTransform,
   PatternTransform2D,
 } from './types.ts';
@@ -129,6 +130,18 @@ export interface DecodedPattern {
    * `wy = m[3]*x + m[4]*y + m[5]`. 단위 cm.
    */
   transform2d?: PatternTransform2D;
+  /**
+   * 패턴의 **진짜** 재질. **topology:true 로 받았을 때만.**
+   *
+   * 실시간 3D 뷰는 여태 패턴 구분용 임의 팔레트로 칠했고, 진짜 색은
+   * 스냅샷(glTF)에만 나왔다 — 사용자가 움직이는 옷을 보면서 색을 믿을 수
+   * 없는 상태였다. 이 필드가 그 출처다.
+   *
+   * ⚠️ **없을 수 있고, 그건 오류가 아니다.** 재질이 없는 패턴이 그렇다.
+   *    그때 흰색으로 대신하면 안 된다 — 그리는 쪽은 임의 팔레트로 폴백해
+   *    패턴 경계를 보이게 유지해야 한다(`cloth.ts` 의 `PALETTE`).
+   */
+  material?: PatternMaterial;
   vertices: number;
   triangles: number;
 }
@@ -210,6 +223,79 @@ function decodeTransform2D(uuid: string, raw: unknown): PatternTransform2D | und
 }
 
 /**
+ * `material` 검증 — 위 두 변환과 **같은 이유로 같은 일**을 한다.
+ *
+ * 다만 실패 양상이 다르다. 변환이 `NaN` 이면 패턴이 통째로 사라져서 최소한
+ * 눈에는 띈다. 색은 그렇지 않다 — `NaN` 이나 문자열이 섞인 색을 three 에
+ * 넘기면 그 패턴만 **검게** 그려지고, 그건 "어두운 천"과 구분되지 않는다.
+ * 화면만 보고는 재질 문제인지 조명 문제인지 알 수 없으므로 여기서 끊는다.
+ *
+ * 0~1 범위는 **검사하지 않는다.** 범위를 벗어난 값은 씬이 그렇게 정한 것일
+ * 수 있고(HDR 색), 그 판정은 디코더의 권한이 아니다. 유한성만 본다 —
+ * 그건 확실히 틀린 것이다.
+ *
+ * ⚠️ 없는 것(`undefined`)은 오류가 아니다. `topology:false` 로 받은 프레임
+ *    이벤트의 mesh 와, 재질이 없는 패턴이 그렇다. 그 경우 색을 **모르는
+ *    것**이고, 흰색으로 대신하지 않는다 — 진짜 흰 옷과 구분할 수 없게 된다.
+ */
+function decodeMaterial(uuid: string, raw: unknown): PatternMaterial | undefined {
+  if (raw === undefined || raw === null) return undefined;
+
+  if (typeof raw !== 'object') {
+    throw new Error(`패턴 ${uuid}: material 이 객체가 아닙니다 (${typeof raw})`);
+  }
+
+  const src = raw as Record<string, unknown>;
+
+  const color = src['color'];
+  if (!Array.isArray(color) || color.length !== 3) {
+    throw new Error(
+      `패턴 ${uuid}: material.color 는 길이 3 의 배열이어야 합니다 `
+      + `(${Array.isArray(color) ? `길이 ${color.length}` : typeof color})`,
+    );
+  }
+  for (const v of color) {
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      throw new Error(`패턴 ${uuid}: material.color 에 숫자가 아닌 값이 있습니다`);
+    }
+  }
+
+  const profile = src['colorProfile'];
+  if (profile !== 'srgb' && profile !== 'linear') {
+    // 여기서 sRGB 로 넘겨짚지 않는다. 틀린 쪽으로 짚으면 색이 눈에 띄게
+    // 어긋나는데 아무도 예외를 못 본다 — 화면이 "좀 칙칙하다"로만 보인다.
+    throw new Error(
+      `패턴 ${uuid}: material.colorProfile 은 'srgb' | 'linear' 여야 합니다 `
+      + `(${JSON.stringify(profile)})`,
+    );
+  }
+
+  const scalar = (key: 'opacity' | 'roughness' | 'metalness'): number => {
+    const v = src[key];
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      throw new Error(`패턴 ${uuid}: material.${key} 가 유한한 숫자가 아닙니다`);
+    }
+    return v;
+  };
+
+  const fabricUuid = src['fabricUuid'];
+  if (typeof fabricUuid !== 'string') {
+    throw new Error(`패턴 ${uuid}: material.fabricUuid 가 문자열이 아닙니다`);
+  }
+
+  const [r, g, b] = color as [number, number, number];
+
+  return {
+    fabricUuid,
+    color: [r, g, b],
+    colorProfile: profile,
+    opacity: scalar('opacity'),
+    roughness: scalar('roughness'),
+    metalness: scalar('metalness'),
+  };
+}
+
+/**
  * 패턴 하나를 푼다.
  *
  * **길이를 검증하는 것이 이 함수의 본체다.** 디코딩 자체는 세 줄이고, 값진 것은
@@ -272,6 +358,14 @@ export function decodePattern(p: PatternData): DecodedPattern {
   //  translateX=64.9046783 / translateY=102.6260376 과 일치했다).
   const transform2d = decodeTransform2D(p.uuid, p.transform2d);
   if (transform2d) out.transform2d = transform2d;
+
+  // 재질도 평문이다 — 패턴당 숫자 5개와 문자열 2개뿐이라 압축 이득이 없고,
+  // 사람이 읽을 수 있어야 씬 파일의 basecolor 와 대조할 수 있다
+  // (실측 대조: `W_Bra top & Leggings.zls` 의 노랑
+  //  [0.9254902, 0.8117647, 0.4705882] ×16, 민트
+  //  [0.7333333, 0.8862745, 0.8156863] ×8 이 워커 출력과 자릿수까지 일치했다).
+  const material = decodeMaterial(p.uuid, p.material);
+  if (material) out.material = material;
 
   return out;
 }

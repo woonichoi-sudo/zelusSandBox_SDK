@@ -6,6 +6,7 @@
 
 #include <ztDesign2DTransform.h>   // 서피스 2D 배치 (MeshData의 transform2d)
 #include <ztDesignClothPattern.h>
+#include <ztDesignMaterial.h>      // 패턴 색 (MeshData의 material)
 #include <ztDesignSurface.h>       // GetTransform() — 전방선언만으론 부족하다
 #include <ztDesignTriMesh.h>
 #include <ztLiveEditUtil.h>
@@ -428,6 +429,105 @@ json MeshData(ZestManager& manager, bool includeTopology)
                     m.GetElement(1, 0), m.GetElement(1, 1), m.GetElement(1, 2),
                     m.GetElement(2, 0), m.GetElement(2, 1), m.GetElement(2, 2),
                 });
+            }
+
+            // ── 패턴 머티리얼 (실시간 뷰의 진짜 색) ──────────────────
+            //
+            // 실시간 뷰는 여태 패턴 구분용 임의 5색을 칠했다. 스냅샷(glTF)만
+            // 진짜 색이 나오는 상태라, 사용자가 움직이는 옷을 보면서 색을
+            // 믿을 수 없었다. 그 출처를 여기서 싣는다.
+            //
+            // ★ 왜 패턴에 인라인인가 (별도 materials op이 아니라) — 실측했다.
+            //   머티리얼 객체는 패턴과 **1:1**이다. 두 씬 모두에서 어떤
+            //   머티리얼도 패턴 둘에게 공유되지 않는다:
+            //     W_Bra top & Leggings.zls  패턴 24 : 머티리얼 24 (참조 각 1회)
+            //     sample.zls                패턴  5 : 머티리얼 15 (front/back/
+            //                                        side 슬롯마다 하나씩, 각 1회)
+            //   즉 머티리얼 uuid로 묶는 별도 op을 만들어도 엔트리 수가 줄지
+            //   않는다. 왕복만 하나 늘고 받는 쪽은 두 응답을 상관시켜야 한다.
+            //
+            //   진짜 N:1인 축은 **직물 에셋**이다(위 24개가 assetUuid 2개로
+            //   묶인다 — 노랑 16 / 민트 8). 그래서 `fabricUuid`를 같이 싣는다.
+            //   패턴을 직물별로 묶는 일(직물 목록 UI, setFabric의 대상 지정)은
+            //   이 키 하나로 클라이언트에서 된다.
+            //
+            // ★ 왜 includeTopology 안인가 — transform2d와 **같은 근거**다.
+            //   이 워커에 머티리얼을 바꿀 수 있는 op이 하나도 없고, 시뮬레이션은
+            //   정점만 움직인다. 따라서 한 세션 안에서 상수다.
+            //
+            //   ⚠️ 다만 이 근거는 transform2d보다 먼저 깨질 예정이다 — 백로그의
+            //   `setFabric`이 바로 이 값을 바꾸는 op이다. 그때 어떻게 드러나는가:
+            //   클라이언트는 최초 1회 받은 색을 계속 쓰므로 **직물을 바꿔도
+            //   화면 색이 그대로다.** 크래시도 에러도 없고, "적용 버튼이 안
+            //   먹는다"로 보여서 UI 배선 문제로 오진하기 쉽다. 그때 할 일은 이
+            //   블록을 밖으로 꺼내는 게 아니라(프레임마다 보낼 이유가 없다)
+            //   **머티리얼 변경 이벤트를 따로 내는 것**이다.
+            //
+            // ⚠️ 머티리얼이 없는 패턴이 있을 수 있다(GetFrontMaterial()이 널).
+            //    그때는 키를 아예 싣지 않는다 — 흰색을 대신 보내면 받는 쪽이
+            //    "흰 옷"과 "색을 모름"을 구분할 수 없고, 임의 팔레트로 폴백할
+            //    기회를 잃는다. sample.zls가 실제로 전부 흰색이라 이 구분이
+            //    화면에서 바로 문제가 된다.
+            //
+            // 앞면만 읽는다. 익스포터도 기본 경로에서는 GetFrontMaterial()
+            // 하나만 쓴다(zwGltfExporterImpl.cpp:477 — 뒷면/옆면은 thickness와
+            // splitMesh가 둘 다 켜졌을 때만 갈라진다). 게다가 three.js의
+            // MeshStandardMaterial은 DoubleSide여도 면마다 다른 색을 못 준다.
+            if (const ztDesignMaterial* material = pattern->GetFrontMaterial())
+            {
+                const ztDesignMaterialData& d = material->GetMaterialData();
+
+                // 씬의 값을 그대로 읽는다. 익스포터는 여기서 한 단계 더 가서
+                // zwMaterialManager::LoadWithAssetUuid(assetUuid)로 에셋
+                // 라이브러리의 사본을 다시 읽는데, 우리는 그러지 않는다.
+                // 두 가지 이유다: (1) zwMaterialManager는 헤드리스에서 GL
+                // 텍스처 생성에 닿는 알려진 위험 경로다(main.cpp:7-8 참고),
+                // (2) 씬을 읽어야 사용자가 실제로 편집한 값이 나온다.
+                // 실측상 두 출처는 일치한다 — 아래 색이 스냅샷과 같은 값이다.
+
+                // 익스포터가 glTF에 쓰는 것과 **같은 네 가지**다
+                // (zwGltfExporterImpl.cpp:1282, :1391-1392):
+                //   baseColorFactor = { basecolor.xyz, alpha }
+                //   roughnessFactor = roughness / metallicFactor = metalness
+                // 그래서 실시간 뷰가 스냅샷과 같은 재질로 보일 수 있다. 이보다
+                // 좁게 실으면 두 화면이 원리적으로 못 맞는다.
+                //
+                // 익스포터가 읽고도 glTF에 **안 쓰는** 값들(sheen, specular,
+                // occlusion, anisotropy, displacement)은 여기서도 뺐다.
+                // three.js MeshStandardMaterial에 대응하는 자리가 없다.
+                // isDoubleSided도 뺐다 — 익스포터조차 이 필드를 무시하고
+                // 자기 멤버를 쓰며(zwGltfExporterImpl.cpp:1395), 옷은 두께
+                // 없는 껍질이라 클라이언트가 항상 양면으로 그려야 한다.
+                //
+                // ⚠️ 실측 기준: 두 씬에서 **color와 roughness만 값이 갈렸다**
+                //    (roughness 1.0 / 0.3). opacity와 metalness는 양쪽 다
+                //    1.0과 0.0으로 고정이었다. 그럼에도 싣는 이유는 위의
+                //    "익스포터와 같은 네 가지"이지, 변화를 관측해서가 아니다.
+                //    이 둘이 끝내 안 쓰인다면 지울 근거는 그때 생긴다.
+                //
+                // base64로 싸지 않는다 — 패턴당 숫자 5개뿐이라 압축 이득이
+                // 없고, 사람이 읽을 수 있어야 씬 파일·익스포트 산출물과
+                // 대조할 수 있다(transform / transform2d와 같은 규약).
+                json m{
+                    { "fabricUuid", ztUuidSaver::Convert(d.assetUuid) },
+                    { "color",      { d.basecolor.x, d.basecolor.y, d.basecolor.z } },
+                    { "opacity",    d.alpha },
+                    { "roughness",  d.roughness },
+                    { "metalness",  d.metalness },
+                };
+
+                // ★ 색공간을 같이 보낸다. basecolor.w가 아니라 alpha가 불투명도인
+                //   것처럼(익스포터도 basecolor.w는 버린다), 이 값도 혼자서는
+                //   해석이 안 된다. 실측한 노랑은 [0.9254902, 0.8117647,
+                //   0.4705882] = 정확히 236/255, 207/255, 120/255 — 8비트
+                //   색선택기에서 나온 sRGB 값이다. 이걸 선형으로 착각해 칠하면
+                //   눈에 띄게 어둡고 진해진다. 두 씬 다 SRGB였지만, 값이 아니라
+                //   **해석 규칙**이라 상수처럼 보여도 빼면 안 된다 — 받는 쪽이
+                //   추측하면 틀렸을 때 화면만 조용히 어긋난다.
+                m["colorProfile"] =
+                    (d.colorProfile == ztColorProfile::Linear) ? "linear" : "srgb";
+
+                p["material"] = std::move(m);
             }
 
             if (mesh.indices.size() > 0)

@@ -7,7 +7,7 @@
  *   node --experimental-strip-types src/sdk/smoke.ts
  */
 
-import { createReadStream, existsSync, readdirSync } from 'node:fs';
+import { createReadStream, existsSync, readdirSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import { SessionPool } from './pool.ts';
@@ -264,6 +264,263 @@ async function findRotatedScene(): Promise<{ path: string; truth: SurfaceTransfo
   }
   return null;
 }
+
+// ─────────────────────────────────────────────────────────────
+// 패턴 재질의 **정답지** — 같은 씬 파일에서 직접 읽는다 (materials-a)
+//
+// ⚠️ 위 `transform2d` 와 **똑같은 이유로** 필요하다. "색이 왔다 / 0~1 이다 /
+//    유한하다" 만 보는 단언은 **채널 순서를 RGB→BGR 로 바꿔도 전부 통과한다.**
+//    화면 쪽도 못 잡는다 — 노랑이 보라가 되어도 "이 씬은 원래 이런 색인가" 로만
+//    보이고, 크래시도 예외도 없다. 가르는 유일한 방법은 바깥의 정답지다.
+//
+// `.zls` 는 8바이트 접두사 뒤에 **압축 없이(STORED)** 들어간 ZIP 이라 씬 JSON 이
+// 평문으로 그대로 들어 있다(위 `readSceneTransforms` 가 이미 쓰는 성질이다).
+// 그래서 zip 을 풀지 않고도 두 블록을 통째로 꺼낼 수 있다:
+//
+//   "materials": { "<머티리얼 uuid>": { "basecolor": [r,g,b,a], "colorProfile": 1,
+//                                       "roughness": …, "metalness": …,
+//                                       "textures": { "assetUuid": "<직물>" } }, … }
+//   "clothPatterns": { "<패턴 uuid>": { "frontMaterial": "<머티리얼 uuid>", … } }
+//
+// 둘을 이으면 **패턴 uuid → 색** 표가 나온다. 집합 대조가 아니라 패턴별 대조라,
+// 색을 통째로 뒤섞어 실어도(패턴 A 에 B 의 색) 여기서 걸린다.
+//
+// ★ 왜 별도 프로브 도구를 만들지 않았나 — `readSceneTransforms` 와 같은 자리에
+//   같은 방식으로 두는 편이 낫다. 이 값을 쓰는 곳이 여기뿐이고, 도구로 빼면
+//   "정답지가 테스트 바깥에 있다" 는 상태가 되어 갱신이 뒤처진다.
+// ─────────────────────────────────────────────────────────────
+
+interface MaterialTruth {
+  /** basecolor 의 앞 세 성분. 넷째(`basecolor.w`)는 익스포터도 우리도 버린다 */
+  color: [number, number, number];
+  /** `ztColorProfile`: 0 = Linear, 1 = SRGB (`SDK/include/ztColor.h:7-11`) */
+  colorProfile: number;
+  /** 별도 필드다. 옛 포맷에는 아예 없어서(sample.zls) 그때는 구조체 기본값 1.0 */
+  alpha: number;
+  roughness: number;
+  metalness: number;
+  /** `textures` 섹션 안에 직렬화된다 (`ztDesignMaterial.cpp:62`) */
+  fabricUuid: string;
+}
+
+/**
+ * 씬 파일에서 이름 붙은 JSON 객체 블록들을 통째로 꺼낸다.
+ *
+ * 103~145MB 를 한 문자열로 만들지 않는다. 청크마다 `indexOf` 로 키를 찾고
+ * (네이티브라 빠르다), 찾은 자리부터만 문자 단위로 중괄호 짝을 맞춘다 —
+ * 블록 하나는 30~60KB 라 이 부분만 느려도 상관없다. 블록이 청크 경계를 넘으면
+ * 다음 청크에서 이어 받는다(`cap` 상태가 청크를 가로질러 산다).
+ *
+ * ⚠️ `.zls` 안에는 텍스처 같은 바이너리 엔트리도 들어 있어서, 우연히 키 문자열이
+ *    바이너리에 나타나면 짝이 안 맞는 `{` 를 물고 끝없이 자랄 수 있다. 그래서
+ *    상한을 두고 넘으면 그 후보를 버린다. 진짜 블록인지는 호출자가 `JSON.parse`
+ *    로 최종 판정한다.
+ */
+async function readSceneBlocks(
+  file: string,
+  keys: readonly string[],
+): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>(keys.map((k) => [k, []]));
+  const MAX_BLOCK = 8 << 20;
+  /** 키가 청크 경계에 걸리는 것만 막으면 된다 — 가장 긴 키보다 넉넉히 */
+  const TAIL = 64;
+
+  let carry = '';
+  let cap: null | { key: string; buf: string; depth: number; inStr: boolean; esc: boolean } = null;
+
+  await new Promise<void>((res, rej) => {
+    // latin1: 바이트 → 코드포인트 1:1. 찾는 것이 전부 ASCII 라 이걸로 충분하고,
+    // UTF-8 디코딩이 청크 경계에서 깨지는 것도 피한다.
+    const s = createReadStream(file, { encoding: 'latin1', highWaterMark: 1 << 22 });
+    s.on('data', (chunk) => {
+      let text = carry + String(chunk);
+      carry = '';
+      let i = 0;
+      while (i < text.length) {
+        if (cap) {
+          for (; i < text.length; i++) {
+            const ch = text[i]!;
+            cap.buf += ch;
+            if (cap.inStr) {
+              if (cap.esc) cap.esc = false;
+              else if (ch === '\\') cap.esc = true;
+              else if (ch === '"') cap.inStr = false;
+            } else if (ch === '"') cap.inStr = true;
+            else if (ch === '{') cap.depth++;
+            else if (ch === '}') {
+              cap.depth--;
+              if (cap.depth === 0) {
+                out.get(cap.key)!.push(cap.buf);
+                cap = null;
+                i++;
+                break;
+              }
+            }
+            if (cap.buf.length > MAX_BLOCK) { cap = null; i++; break; }  // 바이너리 오검출
+          }
+          if (cap) return;   // 청크가 다 떨어졌다. 다음 청크에서 이어 받는다
+          continue;
+        }
+
+        let best = -1;
+        let bestKey = '';
+        for (const k of keys) {
+          const j = text.indexOf(`"${k}"`, i);
+          if (j >= 0 && (best < 0 || j < best)) { best = j; bestKey = k; }
+        }
+        if (best < 0) {
+          carry = text.slice(Math.max(i, text.length - TAIL));
+          return;
+        }
+        const open = text.indexOf('{', best);
+        if (open < 0) { carry = text.slice(best); return; }
+        cap = { key: bestKey, buf: '', depth: 0, inStr: false, esc: false };
+        i = open;
+      }
+    });
+    s.on('end', () => res());
+    s.on('error', rej);
+  });
+  return out;
+}
+
+/**
+ * 씬 파일 → **패턴 uuid → 재질** 표. 못 세우면 null.
+ *
+ * ⚠️ 블록은 파일 안에 여러 벌 있다. 그리고 **첫 번째를 고르면 안 된다** —
+ *    실측: `sample.zls` 의 네 벌은 사본 두 벌이 아니라 **서로 다른 uuid 대역 두
+ *    개**가 각각 두 번씩 들어 있는 것이다(`566024…` 계열과 `1023457615…` 계열).
+ *    값은 같지만 키가 겹치지 않아서, 워커가 실제로 쓰는 쪽이 어느 것인지 파일만
+ *    봐서는 모른다. 그래서 전부 합친다 — uuid 가 겹치지 않으므로 합집합이
+ *    안전하고, 겹치는데 값이 다르면 그건 진짜 충돌이라 `copiesAgree` 로 알린다.
+ *
+ * 패턴 uuid 로 짝을 짓기 때문에, 쓰지 않는 대역이 표에 섞여 있어도 해가 없다.
+ */
+async function readSceneMaterials(file: string): Promise<{
+  byPattern: Map<string, MaterialTruth>;
+  materialCount: number;
+  copies: number;
+  copiesAgree: boolean;
+} | null> {
+  const blocks = await readSceneBlocks(file, ['materials', 'clothPatterns']);
+
+  const parse = (list: readonly string[]): Record<string, Record<string, unknown>>[] => {
+    const ok: Record<string, Record<string, unknown>>[] = [];
+    for (const j of list) {
+      try {
+        const o: unknown = JSON.parse(j);
+        if (o !== null && typeof o === 'object' && !Array.isArray(o)) {
+          ok.push(o as Record<string, Record<string, unknown>>);
+        }
+      } catch { /* 바이너리 오검출. 버린다 */ }
+    }
+    return ok;
+  };
+
+  const mats = parse(blocks.get('materials') ?? []);
+  const pats = parse(blocks.get('clothPatterns') ?? []);
+  if (mats.length === 0 || pats.length === 0) return null;
+  const M: Record<string, Record<string, unknown>> = Object.assign({}, ...mats) as never;
+
+  const truthOf = (raw: Record<string, unknown> | undefined): MaterialTruth | null => {
+    if (!raw) return null;
+    const c = raw['basecolor'];
+    if (!Array.isArray(c) || c.length < 3) return null;
+    const tex = raw['textures'];
+    const fab = tex !== null && typeof tex === 'object'
+      ? (tex as Record<string, unknown>)['assetUuid'] : undefined;
+    if (typeof fab !== 'string') return null;
+    return {
+      color: [Number(c[0]), Number(c[1]), Number(c[2])],
+      colorProfile: Number(raw['colorProfile'] ?? 1),
+      // 옛 포맷(sample.zls)에는 `alpha` 키가 없다 → 구조체 기본값
+      // (`ztDesignMaterial.h:44`). 없는 것과 0 을 구분해야 한다.
+      alpha: typeof raw['alpha'] === 'number' ? raw['alpha'] : 1,
+      roughness: Number(raw['roughness'] ?? 0.3),
+      metalness: Number(raw['metalness'] ?? 0),
+      fabricUuid: fab,
+    };
+  };
+
+  const byPattern = new Map<string, MaterialTruth>();
+  /** 같은 패턴 uuid 가 사본마다 **다른** 재질을 말하면 합집합이 거짓말이 된다 */
+  let copiesAgree = true;
+  for (const P of pats) {
+    for (const [uuid, p] of Object.entries(P)) {
+      const front = p['frontMaterial'];
+      if (typeof front !== 'string') continue;
+      const t = truthOf(M[front]);
+      if (!t) continue;
+      const had = byPattern.get(uuid);
+      if (had && JSON.stringify(had) !== JSON.stringify(t)) copiesAgree = false;
+      byPattern.set(uuid, t);
+    }
+  }
+  if (byPattern.size === 0) return null;
+
+  return { byPattern, materialCount: Object.keys(M).length, copies: pats.length, copiesAgree };
+}
+
+/** 재질 하나를 대조 키로. float32 왕복 오차보다 크고 8비트 색 간격(1/255)보다는 작다 */
+function colorKey(c: readonly number[]): string {
+  return c.slice(0, 3).map((v) => v.toFixed(5)).join('|');
+}
+
+/**
+ * 색이 **채널마다 다른** 씬 하나. 없으면 null.
+ *
+ * sample.zls 는 다섯 패턴이 전부 흰색 `[1,1,1]` 이다 — 회색축이라 채널 순서를
+ * RGB→BGR 로 바꿔도 **값이 문자 그대로 같아서** 어떤 단언도 그 손을 잡을 수
+ * 없다. §5.7 의 "회전이 0이라 부분 전치가 관측 불가" 와 정확히 같은 구멍이다.
+ *
+ * 게다가 색이 한 종류뿐이라 `fabricUuid` 그룹화도 1개짜리 자명한 답이 되어,
+ * 그룹화가 거짓인지 참인지 구분되지 않는다. 두 구멍 모두 색이 갈리는 씬이
+ * 있어야 메워진다. 그런 씬은 저장소에 없다(`backend/data/` 는 .gitignore).
+ */
+async function findMultiColorScene(): Promise<
+  { path: string; truth: Map<string, MaterialTruth> } | null
+> {
+  for (const dir of SCENE_DIRS) {
+    if (!existsSync(dir)) continue;
+    for (const name of readdirSync(dir)) {
+      if (!name.toLowerCase().endsWith('.zls')) continue;
+      const path = resolve(dir, name);
+      const g = await readSceneMaterials(path);
+      if (!g) continue;
+      const colors = new Set([...g.byPattern.values()].map((t) => colorKey(t.color)));
+      const chromatic = [...g.byPattern.values()].some(
+        (t) => Math.abs(t.color[0] - t.color[1]) > 1e-3 || Math.abs(t.color[1] - t.color[2]) > 1e-3,
+      );
+      if (colors.size >= 2 && chromatic) return { path, truth: g.byPattern };
+    }
+  }
+  return null;
+}
+
+/**
+ * 2026-08-07 조사에서 **씬 JSON 을 직접 읽어** 확정한 값. 위 정답지 리더와
+ * 완전히 독립된 출처라, 리더가 틀리면 여기서 갈린다(리더가 자기 자신을
+ * 증명하는 순환을 끊는 유일한 못이다).
+ *
+ * 파일 이름과 **바이트 수**로 잠근다 — 다른 기계의 같은 이름 다른 씬에는
+ * 적용되지 않아야 한다.
+ */
+const KNOWN_SCENES: readonly {
+  name: string;
+  bytes: number;
+  patterns: number;
+  colors: readonly { label: string; rgb: readonly [number, number, number]; count: number }[];
+}[] = [
+  {
+    name: 'W_Bra top & Leggings.zls',
+    bytes: 144_611_136,
+    patterns: 24,
+    colors: [
+      { label: '노랑', rgb: [0.9254902, 0.8117647, 0.4705882], count: 16 },
+      { label: '민트', rgb: [0.7333333, 0.8862745, 0.8156863], count: 8 },
+    ],
+  },
+];
 
 async function main(): Promise<void> {
   for (const [label, p] of [['exe', EXE], ['sample.zls', ZLS]] as const) {
@@ -563,6 +820,8 @@ async function main(): Promise<void> {
     // 엔진이 쓴 값이므로, 워커와 우리 재구현이 **함께** 틀리지 않는 한 통과할 수
     // 없다.
     let t2dAtRest: string | null = null;
+    /** 같은 것을 재질에 대해서도 (materials-a) */
+    let matAtRest: string | null = null;
     {
       const tGround = performance.now();
       const truthList = await readSceneTransforms(ZLS);
@@ -692,6 +951,182 @@ async function main(): Promise<void> {
         && mdNoTopo.patterns.every((p) => !('transform2d' in (p as unknown as Record<string, unknown>))),
         `패턴 ${mdNoTopo.patterns.length}개`,
       );
+
+      // ── 5.9 패턴 재질 (materials-a) ─────────────────────
+      //
+      // 실시간 3D 뷰는 여태 패턴 구분용 **임의 5색**을 칠했다. 진짜 색은
+      // 스냅샷(glTF)에만 나왔고, 그래서 사용자는 움직이는 옷을 보면서 색을
+      // 믿을 수 없었다. 이 절은 그 출처가 **씬의 값과 같은가**를 본다.
+      // (화면에 칠하는 일은 materials-b 몫이다 — 여기서는 아직 배선되지 않는다.)
+      //
+      // ★ §5.7 과 같은 함정이 있다. "색이 실렸다 / 0~1 이다 / 유한하다" 는
+      //   **채널 순서를 RGB→BGR 로 바꿔도 전부 통과한다.** 색은 틀려도 예외가
+      //   안 나고, 화면에서도 "이 씬은 원래 이런 색인가" 로만 보인다. 그래서
+      //   여기서도 지표가 아니라 **씬 파일의 정답지**와 패턴별로 대조한다.
+      //
+      // ⚠️ 다만 sample.zls 는 다섯 패턴이 **전부 흰색 [1,1,1]** 이다. 회색축이라
+      //    채널을 어떻게 섞어도 값이 같아서, 채널 순서는 이 씬에서 **관측 불가**다
+      //    (§5.7 의 "회전이 0이라 부분 전치가 안 보인다" 와 같은 구멍). §5.10 이
+      //    그 구멍을 맡는다.
+      {
+        const tGround = performance.now();
+        const ground = await readSceneMaterials(ZLS);
+        const truth = ground?.byPattern ?? new Map<string, MaterialTruth>();
+        const mats = pats.map((p) => p.material).filter((m) => m !== undefined);
+        matAtRest = JSON.stringify(pats.map((p) => p.material));
+
+        check(
+          '★ 재질 정답지가 성립한다 — .zls 안의 materials·clothPatterns 블록을 이어 패턴→색 표를 세웠다',
+          truth.size > 0,
+          ground
+            ? `패턴 ${truth.size}개 ← 머티리얼 ${ground.materialCount}개, 씬 사본 ${ground.copies}벌 (${ms(performance.now() - tGround)})`
+            : '블록을 못 읽었다 — 이 씬이 STORED zip 이 아니거나 포맷이 바뀌었다',
+        );
+        // ⚠️ 실측: sample.zls 안에는 **서로 다른 uuid 대역 두 개**가 각각 두 번씩
+        //    들어 있다(`566024…` / `1023457615…`). 값은 같지만 키가 겹치지 않아,
+        //    "첫 블록" 을 정답지로 고르면 워커가 쓰는 대역이 아닐 수 있다. 그래서
+        //    전부 합치고, 같은 패턴 uuid 가 두 값을 말하는 경우만 여기서 막는다.
+        check(
+          '★ 사본들이 같은 패턴에 같은 재질을 말한다 (여러 벌을 합쳐 정답지를 만든 근거)',
+          ground?.copiesAgree === true,
+          `clothPatterns 블록 ${ground?.copies ?? 0}벌 → 패턴 ${truth.size}개 (겹치는 uuid 에 다른 값이 있으면 실패)`,
+        );
+
+        check(
+          '★ topology:true 의 모든 패턴에 material 이 실린다 (materials-a)',
+          pats.length > 0 && mats.length === pats.length,
+          `${mats.length}/${pats.length}개`,
+        );
+        check(
+          '★★★ 패턴마다 색이 씬 정답지와 일치한다 — 패턴 uuid 로 짝지어 본다 (색을 뒤섞어 실으면 여기서 걸린다)',
+          pats.length > 0 && pats.every((p) => {
+            const t = truth.get(p.uuid);
+            return t !== undefined && p.material !== undefined
+              && colorKey(p.material.color) === colorKey(t.color);
+          }),
+          pats.map((p) => {
+            const t = truth.get(p.uuid);
+            return `${p.uuid.slice(-5)}:${p.material ? colorKey(p.material.color) : '없음'}${t ? '' : '(정답지에 없다)'}`;
+          }).join(' '),
+        );
+        check(
+          '★★ roughness·metalness·opacity 도 정답지와 같다 (색만 맞고 나머지가 밀리면 스냅샷과 재질이 갈린다)',
+          pats.length > 0 && pats.every((p) => {
+            const t = truth.get(p.uuid);
+            const m = p.material;
+            return t !== undefined && m !== undefined
+              && Math.abs(m.roughness - t.roughness) < 1e-5
+              && Math.abs(m.metalness - t.metalness) < 1e-5
+              && Math.abs(m.opacity - t.alpha) < 1e-5;
+          }),
+          pats.map((p) => `r${p.material?.roughness}/m${p.material?.metalness}/a${p.material?.opacity}`).join(' '),
+        );
+        // ⚠️ roughness 는 두 씬에서 **값이 갈리는 유일한 스칼라**다
+        //    (sample 0.3 / 위 §5.10 씬 1.0). 그래서 이 자리가 "스칼라 셋을
+        //    서로 바꿔 실었는가" 를 실제로 가른다 — metalness·opacity 는 양쪽 다
+        //    0·1 고정이라 자기들끼리는 못 가른다.
+        note(
+          '스칼라 정답지',
+          [...truth.values()].slice(0, 1).map((t) => `roughness=${t.roughness}, metalness=${t.metalness}, alpha=${t.alpha}`).join('')
+          || '없음',
+        );
+
+        check(
+          '★★ colorProfile 이 씬의 값과 같다 (0=Linear / 1=SRGB — 틀리면 색이 조용히 어두워진다)',
+          pats.length > 0 && pats.every((p) => {
+            const t = truth.get(p.uuid);
+            return t !== undefined && p.material?.colorProfile === (t.colorProfile === 0 ? 'linear' : 'srgb');
+          }),
+          `씬 ${[...new Set([...truth.values()].map((t) => t.colorProfile))].join(',')} → 워커 ${[...new Set(mats.map((m) => m.colorProfile))].join(',')}`,
+        );
+
+        check(
+          '★★ fabricUuid 가 씬의 textures.assetUuid 와 같다 (그룹화의 키다 — 틀리면 직물 목록이 통째로 거짓이 된다)',
+          pats.length > 0 && pats.every((p) => truth.get(p.uuid)?.fabricUuid === p.material?.fabricUuid),
+          [...new Set(mats.map((m) => m.fabricUuid))].join(' '),
+        );
+        check(
+          '★★ fabricUuid 가 패턴 uuid 와 하나도 겹치지 않는다 (패턴 uuid 를 그대로 실으면 그룹이 전부 1개짜리가 된다)',
+          pats.length > 0 && pats.every((p) => p.material?.fabricUuid !== p.uuid),
+          `패턴 ${pats[0]?.uuid} vs 직물 ${pats[0]?.material?.fabricUuid}`,
+        );
+
+        check(
+          '★★ 색 채널이 0~1 범위다 (0~255 로 내면 여기서 걸린다 — three 는 1 초과를 잘라내서 화면은 흰색으로만 보인다)',
+          mats.length > 0 && mats.every((m) => m.color.every((v) => v >= 0 && v <= 1)),
+          mats.map((m) => `[${m.color.map((v) => v.toFixed(3)).join(',')}]`).join(' '),
+        );
+
+        // ── 세 필드가 서로 안 섞이는가 ───────────────────────
+        //
+        // 같은 패턴 객체에 `transform`(3D TRS 객체) · `transform2d`(숫자 9개) ·
+        // `material`(객체) 셋이 앉았다. 한쪽 자리에 다른 쪽을 실으면 타입은
+        // 통과하고 화면만 조용히 틀린다 (ISSUE-011 을 그대로 다시 겪는다).
+        const one = pats[0];
+        check(
+          '★★ 세 필드가 각자 제 모양으로 온다 (TRS 객체 / 숫자 9개 / 재질 객체)',
+          one?.transform !== undefined && Array.isArray(one.transform2d)
+          && one.material !== undefined && !Array.isArray(one.material)
+          && Array.isArray(one.material.color) && one.material.color.length === 3,
+          `transform=${typeof one?.transform} / transform2d=${Array.isArray(one?.transform2d) ? `배열 ${one.transform2d.length}` : typeof one?.transform2d} / material=${Array.isArray(one?.material) ? '배열!' : typeof one?.material}`,
+        );
+        check(
+          '★★★ material 이 transform2d 자리에 앉지 않았다 — 2D 배열 9개는 여전히 씬의 배치 행렬이다',
+          pats.every((p) => {
+            const t2 = p.transform2d;
+            const c = p.material?.color;
+            if (!t2 || !c) return false;
+            // 색이 행렬 앞 세 자리로 새어 들어오지 않았는가
+            return colorKey([t2[0], t2[1], t2[2]]) !== colorKey(c);
+          }),
+          pats.map((p) => `2D[${p.transform2d?.slice(0, 3).map((v) => v.toFixed(2)).join(',')}] vs 색[${p.material?.color.map((v) => v.toFixed(2)).join(',')}]`).join(' '),
+        );
+        check(
+          '★★ 색이 3D translation 도 아니다 (transform 을 material 로 착각한 워커)',
+          pats.every((p) => {
+            const t3 = p.transform;
+            const c = p.material?.color;
+            return t3 !== undefined && c !== undefined && colorKey(t3.translation) !== colorKey(c);
+          }),
+          pats.map((p) => `3D[${p.transform?.translation.map((v) => v.toFixed(1)).join(',')}]`).join(' '),
+        );
+
+        // ── topology 게이팅 ────────────────────────────────
+        check(
+          '★★ 프레임 이벤트의 mesh 에는 material 키가 아예 없다 (topology:true 에만 실린다)',
+          framePats.length > 0
+          && framePats.every((p) => !('material' in (p as unknown as Record<string, unknown>))),
+          `패턴 ${framePats.length}개 중 ${framePats.filter((p) => 'material' in (p as unknown as Record<string, unknown>)).length}개에 실렸다`,
+        );
+        check(
+          '★ topology:false 응답에도 material 이 없다 (uvs·indices·transform2d 와 같은 갈래)',
+          mdNoTopo.patterns.length > 0
+          && mdNoTopo.patterns.every((p) => !('material' in (p as unknown as Record<string, unknown>))),
+          `패턴 ${mdNoTopo.patterns.length}개`,
+        );
+
+        // ── ★ 게이팅의 근거가 살아 있는가 (미래를 지키는 자리) ──
+        //
+        // `material` 을 topology 안에 둔 근거는 "이 워커에 재질을 바꿀 op 이
+        // 하나도 없다" 이다. 백로그의 `setFabric` 이 정확히 그 근거를 깬다 —
+        // 그때 증상은 **원단을 바꿔도 색이 그대로**이고, 크래시도 에러도 없어서
+        // "적용 버튼이 안 먹는다"로 보인다. UI 배선 문제로 오진하기 딱 좋다.
+        //
+        // 그 미래를 테스트로 지킬 방법은 "없는 것을 단언하는 것" 뿐이다. 워커가
+        // `setFabric` 을 아직 모른다는 사실 자체를 못박아 두면, 그 op 이 생기는
+        // 순간 이 줄이 **빨간불**이 되어 게이팅을 다시 보게 만든다. 값도 화면도
+        // 아무것도 안 바뀌는 변경을 잡을 수 있는 유일한 자리다.
+        {
+          const probe = await session.worker
+            .request('setFabric' as never, { patterns: [], fabricUuid: 'x' })
+            .then(() => '성공해버렸다', (e: unknown) => (e instanceof Error ? e.message : String(e)));
+          check(
+            '★★★ 워커가 아직 setFabric 을 모른다 — 이 op 이 생기는 순간 material 의 topology 게이팅을 다시 봐야 한다',
+            probe.includes('알 수 없는 op'),
+            probe,
+          );
+        }
+      }
     }
 
     // 시뮬을 더 돌린 뒤 다시 물어 본다. "한 세션 안에서 상수" 가 topology 안에
@@ -706,6 +1141,14 @@ async function main(): Promise<void> {
       check(
         '★★ 시뮬을 더 돌린 뒤에도 transform2d 가 한 글자도 안 바뀐다 (topology 에 둔 근거)',
         t2dAtRest !== null && JSON.stringify(md2.patterns.map((p) => p.transform2d)) === t2dAtRest,
+        `frame ${session.worker.lastFrame} 까지 돌린 뒤 ${md2.patterns.length}개 비교`,
+      );
+      // 재질도 같은 근거로 topology 안에 있다. 다만 근거가 다르다 — 2D 배치는
+      // "배치를 바꿀 op 이 없다", 재질은 "재질을 바꿀 op 이 없다"이고, 뒤쪽이
+      // 백로그의 `setFabric` 때문에 **먼저 깨진다**(위 §5.9 의 마지막 단언 참고).
+      check(
+        '★★ 시뮬을 더 돌린 뒤에도 material 이 한 글자도 안 바뀐다 (topology 에 둔 근거)',
+        matAtRest !== null && JSON.stringify(md2.patterns.map((p) => p.material)) === matAtRest,
         `frame ${session.worker.lastFrame} 까지 돌린 뒤 ${md2.patterns.length}개 비교`,
       );
     }
@@ -757,6 +1200,138 @@ async function main(): Promise<void> {
           before.pct > 50 && after.pct < before.pct / 2 && after.density < before.density,
           `${before.pct.toFixed(1)}% → ${after.pct.toFixed(1)}%, 밀집도 ${before.density.toFixed(2)} → ${after.density.toFixed(2)}`,
         );
+      }
+    }
+
+    // ── 5.10 색이 갈리는 씬 (있으면) ──────────────────────
+    //
+    // sample.zls 는 다섯 패턴이 **전부 흰색 [1,1,1]** 이다. 그 씬에서는
+    //   ① 채널 순서를 RGB→BGR 로 바꿔도 값이 문자 그대로 같고,
+    //   ② `fabricUuid` 그룹이 1개뿐이라 그룹화가 참인지 거짓인지 구분이 안 된다.
+    // 둘 다 §5.9 가 못 잡는 구멍이고, 색이 갈리는 씬이 있어야 메워진다.
+    // 그런 씬은 저장소에 없다(`backend/data/` 는 .gitignore). 있으면 태우고,
+    // 없으면 **무엇을 못 덮었는지 화면에 남긴다.**
+    {
+      const multi = await findMultiColorScene();
+      if (!multi) {
+        note(
+          '§5.10 생략',
+          '색이 갈리는 씬을 찾지 못했다 — 채널 순서(RGB↔BGR)와 fabricUuid 그룹화는 이번 실행에서 미검증',
+        );
+      } else {
+        const truth = multi.truth;
+        const file = multi.path.split(/[\\/]/).pop() ?? multi.path;
+        if (session.loadedPath !== multi.path) {
+          await session.clear();
+          await session.load(multi.path);
+        }
+        const pats = (await session.meshData(true)).patterns;
+        const mats = pats.map((p) => p.material).filter((m) => m !== undefined);
+
+        note('§5.10 씬', `${file} — 패턴 ${pats.length}개, 정답지 ${truth.size}개`);
+
+        // 전제: 이 씬에서 채널 순서가 **관측 가능한가**. 회색축뿐이면 아래
+        // 단언에 이빨이 없다 (§5.8 의 `spun > 0` 과 같은 자리다).
+        const chromatic = [...truth.values()].filter(
+          (t) => Math.abs(t.color[0] - t.color[1]) > 1e-3 || Math.abs(t.color[1] - t.color[2]) > 1e-3,
+        ).length;
+        check(
+          '★ 이 씬에는 채널이 서로 다른 색이 있다 (아래 단언에 이빨이 있다는 전제)',
+          chromatic > 0,
+          `${chromatic}/${truth.size}개 — 0이면 채널 순서는 여기서도 관측 불가다`,
+        );
+
+        check(
+          '★★★ 패턴마다 색이 정답지와 일치한다 (24개짜리 씬에서 하나만 어긋나도 걸린다)',
+          pats.length > 0 && pats.every((p) => {
+            const t = truth.get(p.uuid);
+            return t !== undefined && p.material !== undefined
+              && colorKey(p.material.color) === colorKey(t.color);
+          }),
+          `${pats.filter((p) => {
+            const t = truth.get(p.uuid);
+            return t && p.material && colorKey(p.material.color) === colorKey(t.color);
+          }).length}/${pats.length}개 일치`,
+        );
+        // 위 단언이 **채널 순서를 실제로 가른다**는 증거. 같은 자로 BGR 사본을
+        // 재서, 하나도 안 맞아야 한다 (§5.7 의 전치본 대조와 같은 논법).
+        const bgrHits = pats.filter((p) => {
+          const t = truth.get(p.uuid);
+          const c = p.material?.color;
+          if (!t || !c) return false;
+          return colorKey([c[2], c[1], c[0]]) === colorKey(t.color);
+        }).length;
+        check(
+          '★★★ 채널을 뒤집은(BGR) 사본은 정답지와 단 하나도 짝이 안 지어진다',
+          bgrHits === 0,
+          `BGR 일치 ${bgrHits}개 / 채널 비대칭 ${chromatic}개`,
+        );
+
+        // ── fabricUuid 그룹화가 거짓이 아닌가 ────────────────
+        //
+        // Builder 가 이 필드를 넣은 근거가 "진짜 N:1 축은 직물"이다. 그 근거가
+        // 참이려면 **같은 직물이면 색도 같아야** 한다. 안 그러면 직물 목록 UI 가
+        // 한 줄에 서로 다른 색을 묶어 보여주게 된다.
+        const byFabric = new Map<string, Set<string>>();
+        for (const p of pats) {
+          if (!p.material) continue;
+          const k = p.material.fabricUuid;
+          if (!byFabric.has(k)) byFabric.set(k, new Set());
+          byFabric.get(k)!.add(colorKey(p.material.color));
+        }
+        const truthFabrics = new Set([...truth.values()].map((t) => t.fabricUuid));
+        check(
+          '★★ fabricUuid 로 묶은 그룹 수가 정답지와 같다 (패턴 uuid 를 실으면 그룹이 패턴 수만큼 생긴다)',
+          byFabric.size === truthFabrics.size && byFabric.size < pats.length,
+          `워커 ${byFabric.size}종 / 씬 ${truthFabrics.size}종 (패턴 ${pats.length}개)`,
+        );
+        check(
+          '★★★ 같은 fabricUuid 면 색이 정확히 같다 (아니면 그룹화가 거짓이다)',
+          byFabric.size > 0 && [...byFabric.values()].every((s) => s.size === 1),
+          [...byFabric.entries()].map(([f, s]) => `${f.slice(-9)}:색${s.size}종`).join(' '),
+        );
+        check(
+          '★★ 그룹마다 패턴 수가 정답지와 같다 (어느 패턴에 어느 색인지가 맞아야 개수가 맞는다)',
+          [...byFabric.keys()].every((f) => {
+            const mine = pats.filter((p) => p.material?.fabricUuid === f).length;
+            const want = [...truth.entries()].filter(([, t]) => t.fabricUuid === f).length;
+            return mine === want && want > 0;
+          }),
+          [...byFabric.keys()].map((f) => `${f.slice(-9)}×${pats.filter((p) => p.material?.fabricUuid === f).length}`).join(' '),
+        );
+
+        // ── 밖에서 들고 온 못 (2026-08-07 조사) ──────────────
+        //
+        // 위 단언은 전부 **내 정답지 리더**를 믿는다. 리더가 틀리면 워커와 함께
+        // 조용히 틀릴 수 있다. 그 순환을 끊으려면 리더와 무관한 출처가 하나
+        // 필요하고, 그게 이 표다 — 조사 때 손으로 확인한 숫자다.
+        const known = KNOWN_SCENES.find(
+          (k) => k.name === file && k.bytes === statSync(multi.path).size,
+        );
+        if (!known) {
+          note(
+            '§5.10 절대값 생략',
+            `${file} 은 알려진 씬이 아니다 — 리더와 독립된 대조는 이번 실행에서 미검증`,
+          );
+        } else {
+          const tally = new Map<string, number>();
+          for (const m of mats) {
+            const k = m.color.map((v) => v.toFixed(7)).join(',');
+            tally.set(k, (tally.get(k) ?? 0) + 1);
+          }
+          check(
+            '★★★ 조사 때 손으로 확인한 색과 개수가 그대로다 (정답지 리더와 독립된 유일한 못)',
+            pats.length === known.patterns
+            && known.colors.every((c) => tally.get(c.rgb.map((v) => v.toFixed(7)).join(',')) === c.count)
+            && tally.size === known.colors.length,
+            known.colors.map((c) => `${c.label} 기대 ${c.count}개 / 실제 ${tally.get(c.rgb.map((v) => v.toFixed(7)).join(',')) ?? 0}개`).join(', ')
+            + ` — 서로 다른 색 ${tally.size}종`,
+          );
+          note(
+            '§5.10 실측 색',
+            [...tally.entries()].map(([c, n]) => `[${c}]×${n}`).join(' '),
+          );
+        }
       }
     }
 

@@ -146,7 +146,7 @@ import {
 } from './index.ts';
 // 변환 타입 둘. ISSUE-018 부터는 배럴(`index.ts`)도 이 둘을 재export 하지만,
 // 정의가 사는 곳은 `types.ts`(→ `sdk/protocol.ts`)이므로 여기서 직접 꺼낸다.
-import type { PatternTransform, PatternTransform2D } from './types.ts';
+import type { PatternMaterial, PatternTransform, PatternTransform2D } from './types.ts';
 
 // ── 하네스 ───────────────────────────────────────────────────
 
@@ -795,6 +795,188 @@ function sectionDecodeLength(): void {
     check(
       '★★ 2D 만 틀렸을 때 오류가 2D 를 지목한다 (3D 를 탓하면 엉뚱한 곳을 판다)',
       which.includes('transform2d') && !which.includes('transform.'),
+      which || '던지지 않았다',
+    );
+  }
+
+  // ── material (materials-a) — 패턴의 진짜 재질 ────────────────
+  //
+  // 위 두 변환과 **같은 일**을 하지만 실패 양상이 다르다. 변환이 `NaN` 이면
+  // 그 패턴이 화면에서 통째로 사라져서 최소한 눈에는 띈다. 색은 그렇지 않다 —
+  // `NaN` 이나 문자열이 섞인 색을 three 에 넘기면 그 패턴만 **검게** 그려지고,
+  // 그건 "어두운 천"과 구분되지 않는다. 화면만 보고는 재질 문제인지 조명
+  // 문제인지 알 수 없다. 그래서 디코더가 끊어야 한다.
+  //
+  // ⚠️ 여기서 보는 것은 **모양뿐**이다. 색이 씬의 값과 같은가는 바깥의 정답지가
+  //    있어야 알 수 있고, 그건 backend 스모크 §5.9·§5.10 이 `.zls` 안의
+  //    materials·clothPatterns 블록과 패턴별로 대조해서 본다. 이 절이 그것까지
+  //    본다고 착각하면 **채널 순서가 뒤집힌 것을 놓친다** (RGB→BGR 은 이 절의
+  //    모든 단언을 통과한다).
+  const withMat = (raw: unknown): PatternData =>
+    ({ ...tBase, material: raw } as unknown as PatternData);
+  const goodMat = {
+    fabricUuid: '356924893322900/1500000',
+    color: [0.9254902, 0.8117647, 0.4705882],
+    colorProfile: 'srgb',
+    opacity: 1,
+    roughness: 0.3,
+    metalness: 0,
+  };
+
+  {
+    const m = decodePattern(withMat(goodMat)).material;
+    check(
+      'material 왕복 — 여섯 필드가 그대로 실린다',
+      m !== undefined
+      && m.fabricUuid === goodMat.fabricUuid
+      && m.color.join(',') === '0.9254902,0.8117647,0.4705882'
+      && m.colorProfile === 'srgb'
+      && m.opacity === 1 && m.roughness === 0.3 && m.metalness === 0,
+      JSON.stringify(m),
+    );
+    check(
+      '★ 색 배열을 복사한다 (워커 응답 객체를 나중에 재사용해도 값이 안 새어 나간다)',
+      (() => {
+        const raw = { ...goodMat, color: [0.1, 0.2, 0.3] };
+        const out = decodePattern(withMat(raw)).material;
+        raw.color[0] = 999;
+        return out?.color[0] === 0.1;
+      })(),
+    );
+    check(
+      "★★ colorProfile 'linear' 도 통과한다 (씬이 선형이면 그렇게 온다 — srgb 로 넘겨짚지 않는다)",
+      decodePattern(withMat({ ...goodMat, colorProfile: 'linear' })).material?.colorProfile === 'linear',
+    );
+  }
+
+  // 없는 것은 오류가 아니다 — 재질 없는 패턴, topology:false 프레임.
+  // ★ 흰색으로 메우면 안 된다: `sample.zls` 는 다섯 패턴이 **진짜로 전부 흰색**
+  //   이라, 메우는 순간 "흰 옷"과 "색을 모름"이 화면에서 같아진다. 그러면
+  //   `cloth.ts` 의 임의 팔레트로 폴백할 기회가 사라지고 옷이 흰 덩어리가 된다.
+  const absentMat = (label: string, p: PatternData): { ok: boolean; detail: string } => {
+    try {
+      const d = decodePattern(p);
+      return {
+        ok: d.material === undefined && !('material' in d),
+        detail: 'material' in d ? `${label}: 키가 남았다 ${JSON.stringify(d.material)}` : `${label}: 키 자체가 없다`,
+      };
+    } catch (err: unknown) {
+      return { ok: false, detail: `${label}: 던졌다 — ${messageOf(err)}` };
+    }
+  };
+  const noMatKey = absentMat('키 없음', tBase);
+  const nullMatKey = absentMat('null', withMat(null));
+  check(
+    '★★ material 이 없으면 undefined 다 — 흰색으로 메우지 않는다 (진짜 흰 옷과 구분해야 팔레트로 폴백할 수 있다)',
+    noMatKey.ok, noMatKey.detail,
+  );
+  check(
+    '★ null 도 오류가 아니다 (topology:false·재질 없는 패턴 → "색을 모른다")',
+    nullMatKey.ok, nullMatKey.detail,
+  );
+
+  const badMat: [string, unknown, string][] = [
+    ['★★ color 가 4개다 (basecolor 를 알파까지 그대로 실은 워커 — 가장 있을 법한 사고)',
+      { ...goodMat, color: [1, 1, 1, 1] }, '길이 4'],
+    ['★★ color 가 2개다',
+      { ...goodMat, color: [1, 1] }, '길이 2'],
+    ['★ color 가 빈 배열',
+      { ...goodMat, color: [] }, '길이 0'],
+    ['★★ color 에 NaN 이 섞였다 (three 가 그 패턴만 검게 그린다 — "어두운 천"과 구분이 안 된다)',
+      { ...goodMat, color: [1, Number.NaN, 1] }, 'material.color 에 숫자가 아닌 값'],
+    ['★ color 에 Infinity 가 섞였다',
+      { ...goodMat, color: [1, 1, Number.POSITIVE_INFINITY] }, 'material.color 에 숫자가 아닌 값'],
+    ['★ color 를 문자열로 실었다 ("#ecCF78" 같은 hex 를 보낸 워커)',
+      { ...goodMat, color: '#ecCF78' }, 'string'],
+    ['★ color 원소가 문자열이다 (JSON 직렬화 사고)',
+      { ...goodMat, color: ['1', 1, 1] }, 'material.color 에 숫자가 아닌 값'],
+    ['★ color 원소가 null 이다',
+      { ...goodMat, color: [1, null, 1] }, 'material.color 에 숫자가 아닌 값'],
+    ['★ color 를 {r,g,b} 객체로 실었다',
+      { ...goodMat, color: { r: 1, g: 1, b: 1 } }, 'object'],
+    ['★ color 키가 아예 없다',
+      { fabricUuid: 'f', colorProfile: 'srgb', opacity: 1, roughness: 1, metalness: 0 }, 'undefined'],
+    ["★★ colorProfile 이 'sRGB' 다 (대소문자를 흘려 쓴 워커 — 통과시키면 색이 조용히 어긋난다)",
+      { ...goodMat, colorProfile: 'sRGB' }, 'colorProfile'],
+    ['★★ colorProfile 을 숫자로 실었다 (엔진 enum 을 그대로 — 0/1 중 뭐가 뭔지 받는 쪽이 모른다)',
+      { ...goodMat, colorProfile: 1 }, 'colorProfile'],
+    ['★★ colorProfile 키가 없다 (구버전 워커 — srgb 로 넘겨짚으면 아무도 예외를 못 본다)',
+      { fabricUuid: 'f', color: [1, 1, 1], opacity: 1, roughness: 1, metalness: 0 }, 'colorProfile'],
+    ['★ opacity 가 NaN',
+      { ...goodMat, opacity: Number.NaN }, 'material.opacity'],
+    ['★ roughness 가 문자열',
+      { ...goodMat, roughness: '0.3' }, 'material.roughness'],
+    ['★ metalness 키가 없다',
+      { fabricUuid: 'f', color: [1, 1, 1], colorProfile: 'srgb', opacity: 1, roughness: 1 }, 'material.metalness'],
+    ['★★ fabricUuid 를 숫자로 실었다 (그룹화 키가 문자열이 아니면 Map 이 조용히 갈린다)',
+      { ...goodMat, fabricUuid: 356924893322900 }, 'fabricUuid'],
+    ['★ fabricUuid 키가 없다',
+      { color: [1, 1, 1], colorProfile: 'srgb', opacity: 1, roughness: 1, metalness: 0 }, 'fabricUuid'],
+    ['★★ material 을 숫자로 실었다',
+      42, 'material 이 객체가 아닙니다'],
+    ['★ material 을 문자열로 실었다',
+      '#ecCF78', 'material 이 객체가 아닙니다'],
+    ['★★ material 자리에 색 배열만 실었다 ([r,g,b] — 필드 이름을 헷갈린 워커)',
+      [1, 1, 1], 'material.color'],
+    ['★★ material 자리에 transform2d 를 실었다 (필드가 셋이 되면서 생긴 새 사고)',
+      [1, 0, 0, 0, 1, 0, 0, 0, 1], 'material.color'],
+  ];
+  for (const [label, raw, expect] of badMat) {
+    let msg = '';
+    try {
+      decodePattern(withMat(raw));
+    } catch (err: unknown) {
+      msg = messageOf(err);
+    }
+    check(
+      `${label} → 던진다`,
+      msg.includes(expect) && msg.includes('material') && msg.includes('p-t'),
+      msg || '조용히 통과해버렸다 — 그 패턴만 검게 그려지고 화면에서 원인을 못 읽는다',
+    );
+  }
+
+  // ★ 범위(0~1)는 **일부러 안 본다.** 계약이므로 못박는다 — 여기 검사를 넣으면
+  //   HDR 색을 쓰는 씬이 통째로 안 열린다. 대신 "0~255 로 냈다" 같은 사고는
+  //   backend 스모크 §5.9 가 씬 정답지와 대조해서 잡는다. 이 줄이 깨진다면
+  //   그건 회귀가 아니라 **계약 변경**이고, 그때 저쪽 단언도 같이 봐야 한다.
+  check(
+    '★★ 범위 밖 값은 통과시킨다 (음수·1 초과 — 디코더는 씬의 색을 판정할 권한이 없다)',
+    (() => {
+      const m = decodePattern(withMat({ ...goodMat, color: [-0.2, 1.8, 0], opacity: 2 })).material;
+      return m?.color.join(',') === '-0.2,1.8,0' && m.opacity === 2;
+    })(),
+  );
+
+  // 세 필드가 서로의 검증을 건드리지 않는다. 한쪽만 틀린 응답에서 **틀린 쪽**을
+  // 지목해야 원인을 읽을 수 있다 — 이제 후보가 셋이라 더 중요해졌다.
+  {
+    const all3 = decodePattern({
+      ...tBase,
+      transform: { translation: [1, 2, 3], rotation: [0, 0, 0, 1], scale: [1, 1, 1] },
+      transform2d: [9, 8, 7, 6, 5, 4, 0, 0, 1],
+      material: goodMat,
+    } as unknown as PatternData);
+    check(
+      '★★ 한 패턴이 3D·2D·재질을 동시에 들 수 있다 (topology:true 응답의 실제 모양)',
+      all3.transform?.translation.join(',') === '1,2,3'
+      && all3.transform2d?.join(',') === '9,8,7,6,5,4,0,0,1'
+      && all3.material?.color.join(',') === '0.9254902,0.8117647,0.4705882',
+      `${JSON.stringify(all3.transform2d)} / ${JSON.stringify(all3.material)}`,
+    );
+    let which = '';
+    try {
+      decodePattern({
+        ...tBase,
+        transform: { translation: [1, 2, 3], rotation: [0, 0, 0, 1], scale: [1, 1, 1] },
+        transform2d: [9, 8, 7, 6, 5, 4, 0, 0, 1],
+        material: { ...goodMat, color: [1, 1] },
+      } as unknown as PatternData);
+    } catch (err: unknown) {
+      which = messageOf(err);
+    }
+    check(
+      '★★ 재질만 틀렸을 때 오류가 재질을 지목한다 (변환을 탓하면 엉뚱한 곳을 판다)',
+      which.includes('material.color') && !which.includes('transform'),
       which || '던지지 않았다',
     );
   }
@@ -1730,6 +1912,8 @@ async function sectionRealWorker(): Promise<void> {
       let transformsAtLoad: string | null = null;
       /** 같은 것을 2D 배치에 대해서도 (ISSUE-018) */
       let transform2dAtLoad: string | null = null;
+      /** 그리고 재질에 대해서도 (materials-a) */
+      let materialAtLoad: string | null = null;
       try {
         const patterns = decodePatterns(md);
         decoded = patterns.length;
@@ -1845,6 +2029,63 @@ async function sectionRealWorker(): Promise<void> {
           return m ? `[${m[2].toFixed(1)},${m[5].toFixed(1)}]` : '없음';
         }).join(' '));
 
+        // ── 패턴 재질 (materials-a) — 워커가 무엇을 실었나 ────────
+        //
+        // 값이 씬의 색과 같은가는 **여기서 못 본다** — 정답지가 `.zls` 안에
+        // 있고 이 파일에는 그것을 읽는 손이 없다(backend 스모크 §5.9·§5.10 이
+        // 맡는다). 여기서 보는 것은 "실제 워커가 보낸 바이트가 디코더의 모양
+        // 계약을 통과하는가", 그리고 **합성 데이터로는 절대 안 나오는 사고**
+        // 두 가지다: 0~255 로 냈는가, 패턴 uuid 를 fabricUuid 자리에 실었는가.
+        const rawMats = md.patterns.map((p) => (p as unknown as Record<string, unknown>)['material']);
+        materialAtLoad = JSON.stringify(rawMats);
+        check(
+          '★ topology:true 응답의 모든 패턴에 material 이 실려 있다 (materials-a)',
+          rawMats.length > 0 && rawMats.every((m) => m !== null && typeof m === 'object'),
+          `${rawMats.filter((m) => m !== null && typeof m === 'object').length}/${rawMats.length}개`,
+        );
+        check(
+          '★ decodePattern 이 실제 워커의 재질을 통과시킨다 (여섯 필드가 전부 계약대로다)',
+          patterns.length > 0 && patterns.every((p) => p.material !== undefined),
+          `${patterns.filter((p) => p.material).length}/${patterns.length}개`,
+        );
+        check(
+          '★★ 색 채널이 0~1 이다 (0~255 로 내면 three 가 1 초과를 잘라내서 옷이 통째로 흰색이 된다)',
+          patterns.length > 0 && patterns.every(
+            (p) => p.material !== undefined && p.material.color.every((v) => v >= 0 && v <= 1),
+          ),
+          patterns.map((p) => `[${p.material?.color.map((v) => v.toFixed(3)).join(',')}]`).join(' '),
+        );
+        check(
+          "★★ colorProfile 이 'srgb' 다 (선형으로 착각해 칠하면 눈에 띄게 어두워진다)",
+          patterns.length > 0 && patterns.every((p) => p.material?.colorProfile === 'srgb'),
+          [...new Set(patterns.map((p) => p.material?.colorProfile))].join(','),
+        );
+        check(
+          '★★ fabricUuid 가 패턴 uuid 가 아니다 (그대로 실으면 그룹이 전부 1개짜리가 되어 직물 목록이 무의미해진다)',
+          patterns.length > 0 && patterns.every(
+            (p) => typeof p.material?.fabricUuid === 'string'
+              && p.material.fabricUuid.length > 0 && p.material.fabricUuid !== p.uuid,
+          ),
+          `패턴 ${patterns.length}개 → 직물 ${new Set(patterns.map((p) => p.material?.fabricUuid)).size}종`,
+        );
+        check(
+          '★★★ 세 필드가 서로 다른 모양으로, 서로 안 섞여서 온다 (TRS 객체 / 숫자 9개 / 재질 객체)',
+          patterns.length > 0 && patterns.every((p) => {
+            const t2 = p.transform2d;
+            const c = p.material?.color;
+            if (!p.transform || !t2 || !c || Array.isArray(p.material)) return false;
+            // 색이 2D 행렬 앞 세 자리로도, 3D translation 으로도 새지 않았는가
+            const same = (a: readonly number[], b: readonly number[]): boolean =>
+              a.every((v, i) => Math.abs(v - b[i]!) < 1e-6);
+            return !same(c, [t2[0], t2[1], t2[2]]) && !same(c, p.transform.translation);
+          }),
+          patterns.map((p) => `색[${p.material?.color.map((v) => v.toFixed(2)).join(',')}]`).join(' '),
+        );
+        note('재질', patterns.map((p) => {
+          const m = p.material;
+          return m ? `[${m.color.map((v) => v.toFixed(3)).join(',')}] r${m.roughness} m${m.metalness} a${m.opacity}` : '없음';
+        }).join(' | '));
+
         const stats = meshStats(md);
         note('메시 규모', `패턴 ${stats.patterns}, 정점 ${stats.vertices}, 삼각형 ${stats.triangles}, base64 ${stats.base64Bytes}바이트`);
       } catch (err: unknown) {
@@ -1930,6 +2171,19 @@ async function sectionRealWorker(): Promise<void> {
         framePatterns.length > 0 && with2dKey === 0,
         `패턴 ${framePatterns.length}개 중 ${with2dKey}개에 실렸다`,
       );
+      // 재질도 같은 갈래다. 근거는 "이 워커에 재질을 바꿀 op 이 하나도 없다"인데,
+      // ⚠️ **2D 배치보다 먼저 깨진다** — 백로그의 `setFabric` 이 정확히 이 값을
+      // 바꾸는 op 이다. 그때 증상은 원단을 바꿔도 색이 그대로라 "적용 버튼이 안
+      // 먹는다"로 보인다. 그 순간을 잡는 파수꾼은 backend 스모크 §5.9 의
+      // "워커가 아직 setFabric 을 모른다" 단언이다.
+      const withMatKey = framePatterns.filter(
+        (p) => 'material' in (p as unknown as Record<string, unknown>),
+      ).length;
+      check(
+        '★★ 프레임 이벤트의 mesh 에는 material 키도 아예 없다 (materials-a — topology 게이팅)',
+        framePatterns.length > 0 && withMatKey === 0,
+        `패턴 ${framePatterns.length}개 중 ${withMatKey}개에 실렸다`,
+      );
 
       // ── 프레임 불변 — 워커가 "한 번만 보낸다"는 근거 ────────
       //
@@ -1956,6 +2210,16 @@ async function sectionRealWorker(): Promise<void> {
         transform2dAtLoad === null ? '로드 직후 값을 못 받았다'
           : raws2d2 === transform2dAtLoad ? `${md2.patterns.length}개 동일 (frame ${reached}+)`
             : `달라졌다: ${raws2d2.slice(0, 160)}`,
+      );
+      const rawsMat2 = JSON.stringify(
+        md2.patterns.map((p) => (p as unknown as Record<string, unknown>)['material']),
+      );
+      check(
+        '★★ 시뮬을 돌린 뒤에도 material 이 한 글자도 안 바뀐다 (materials-a — 한 번만 보내는 근거)',
+        materialAtLoad !== null && rawsMat2 === materialAtLoad,
+        materialAtLoad === null ? '로드 직후 값을 못 받았다'
+          : rawsMat2 === materialAtLoad ? `${md2.patterns.length}개 동일 (frame ${reached}+)`
+            : `달라졌다: ${rawsMat2.slice(0, 160)}`,
       );
       check(
         '대조군 — 그 사이 정점은 실제로 움직였다 (아무것도 안 변한 것이 아니다)',
@@ -2667,6 +2931,220 @@ function sectionCloth2D(): void {
       '★★ 같은 uv 를 든 두 패턴이 배치를 곱하면 갈라진다 (uvs 만 쓰면 완전히 포개진다)',
       a.x1 <= b.x0,
       `p1 x [${a.x0}, ${a.x1}] / p2 x [${b.x0}, ${b.x1}] — 배치 없이는 둘 다 [0, 10]`,
+    );
+    cloth.clear();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// §8-13. 패턴 재질이 3D 뷰까지 실려 온다 (materials-a, cloth.ts, DOM 없이)
+//
+// ★ 이번 단위의 계약은 **"들고만 있는다"** 이다. 색을 실제로 칠하는 것은
+//   materials-b 이고, 지금 `mesh.material.color` 는 여전히 임의 팔레트다.
+//   그래서 이 절이 못박는 것은 두 방향이다:
+//
+//   ① 워커가 실은 값이 **손실 없이** 여기까지 온다 (materials-b 가 읽을 자리)
+//   ② 그런데 아직 **화면에 새지 않았다** — 지금 화면이 바뀌면 그건 이 단위의
+//      범위 밖이고, `verify/ui.ts` 의 `LIVE_PALETTE_BUCKETS`(팔레트 색상 칸에
+//      없는 색이면 스냅샷에서 온 것이라는 배제 논증)가 조용히 깨진다.
+//
+// ⚠️ 그리고 **팔레트는 살아남아야 한다.** `sample.zls` 는 다섯 패턴이 진짜로
+//    전부 흰색이라, 진짜 색만 칠하면 옷이 흰 덩어리 하나가 되어 패턴 경계가
+//    안 보인다. 폴백이 없으면 #12 의 눈 판정이 통째로 불가능해진다.
+// ─────────────────────────────────────────────────────────────
+
+/** 재질을 든 패턴 하나. 값은 `W_Bra top & Leggings.zls` 의 실측 노랑이다 */
+function patternMat(uuid: string, material?: Partial<PatternMaterial> | null): DecodedPattern {
+  const p: DecodedPattern = {
+    uuid,
+    positions: Float32Array.from([0, 0, 0, 1, 1, 1, 2, 2, 2]),
+    vertices: 3,
+    triangles: 0,
+  };
+  // 인자를 생략하면 기본 재질, **null 을 넘기면 재질 없음**. 두 경우를 다
+  // 써야 해서 `undefined` 와 `null` 이 서로 다른 뜻이다.
+  if (material !== null) {
+    p.material = {
+      fabricUuid: '356924893322900/1500000',
+      color: [0.9254902, 0.8117647, 0.4705882],
+      colorProfile: 'srgb',
+      opacity: 1,
+      roughness: 1,
+      metalness: 0,
+      ...material,
+    } as PatternMaterial;
+  }
+  return p;
+}
+
+function sectionClothMaterial(): void {
+  section('§8-13. 패턴 재질 (materials-a, cloth.ts, DOM 없이)');
+
+  // ── ① 실려 오고, 우리 것이 된다 ─────────────────────────────
+  {
+    const decoded = patternMat('a');
+    const cloth = new ClothObject();
+    cloth.setTopology([decoded]);
+    const p = cloth.patterns[0];
+    check(
+      '★ PatternMesh 가 material 을 든다 (materials-b 가 여기서 읽는다)',
+      p?.material?.color.join(',') === '0.9254902,0.8117647,0.4705882'
+      && p.material.fabricUuid === '356924893322900/1500000'
+      && p.material.colorProfile === 'srgb'
+      && p.material.roughness === 1 && p.material.metalness === 0 && p.material.opacity === 1,
+      JSON.stringify(p?.material),
+    );
+
+    // ⚠️ 디코더가 준 **그 객체**를 건드려야 한다. 사본을 넘겨 놓고 통과했다고
+    //    믿으면 얕은 복사(색 배열은 공유)를 놓친다 — §8-12 에서 실제로 겪었다.
+    decoded.material!.color[0] = 999;
+    decoded.material!.fabricUuid = '바뀜';
+    check(
+      '★★ 깊은 복사다 — 디코더가 준 그 객체의 **색 배열까지** 나중에 건드려도 화면 쪽이 안 바뀐다',
+      cloth.patterns[0]?.material?.color[0] === 0.9254902
+      && cloth.patterns[0].material.fabricUuid === '356924893322900/1500000',
+      `${cloth.patterns[0]?.material?.color[0]} / ${cloth.patterns[0]?.material?.fabricUuid} (원본은 ${decoded.material!.color[0]} 로 바꿨다)`,
+    );
+    cloth.clear();
+  }
+
+  // ── ② 없으면 null. 그리고 남지 않는다 ───────────────────────
+  //
+  // 흰색으로 메우면 "진짜 흰 옷"과 "색을 모름"이 구분되지 않고, 폴백할 기회가
+  // 사라진다. sample.zls 가 실제로 흰옷 씬이라 이 구분이 화면에서 바로 문제다.
+  {
+    const cloth = new ClothObject();
+    cloth.setTopology([patternMat('n', null)]);
+    check(
+      '★★ material 이 없으면 null 이다 (흰색 [1,1,1] 로 메우지 않는다)',
+      cloth.patterns[0]?.material === null,
+      JSON.stringify(cloth.patterns[0]?.material),
+    );
+
+    // 재질이 있는 씬 → 없는 씬 (재연결·다른 씬·구버전 워커)
+    cloth.setTopology([patternMat('n')]);
+    cloth.setTopology([patternMat('n', null)]);
+    check(
+      '★ 옛 씬의 재질이 새 씬에 남지 않는다 (setTopology 는 통째로 새로 만든다)',
+      cloth.patterns[0]?.material === null,
+      JSON.stringify(cloth.patterns[0]?.material),
+    );
+    cloth.clear();
+  }
+
+  // ── ③ 아직 화면에 안 걸린다 (이번 단위의 경계) ───────────────
+  //
+  // ★★★ 이 절에서 가장 중요한 자리다. 여기가 통과해야 "materials-a 는 워커
+  //      쪽만 고쳤다"가 참이고, `verify/ui.ts` 의 팔레트 배제 논증이 아직
+  //      성립한다. materials-b 가 배선하는 순간 이 단언이 **의도적으로**
+  //      빨간불이 되고, 그때 `LIVE_PALETTE_BUCKETS` 도 같이 고쳐야 한다.
+  {
+    const cloth = new ClothObject();
+    cloth.setTopology([patternMat('x')]);
+    const p = cloth.patterns[0];
+    const mm = p?.mesh.material as THREE.MeshStandardMaterial | undefined;
+    check(
+      '★★★ 진짜 색이 mesh 에 아직 안 걸린다 — 첫 패턴은 여전히 팔레트 0번(0x7ea8d8)이다 (배선은 materials-b)',
+      mm?.color.getHex() === 0x7ea8d8,
+      `mesh 색 #${mm?.color.getHex().toString(16)} / 실린 재질 [${p?.material?.color.join(',')}]`,
+    );
+    check(
+      '★★ roughness·metalness 도 mesh 로 안 샌다 (씬은 1.0 인데 뷰는 여전히 0.78 이다)',
+      mm?.roughness === 0.78 && mm.metalness === 0,
+      `mesh r${mm?.roughness}/m${mm?.metalness} vs 재질 r${p?.material?.roughness}/m${p?.material?.metalness}`,
+    );
+    cloth.clear();
+  }
+
+  // ── ④ 팔레트가 살아 있다 (회귀) ──────────────────────────────
+  //
+  // ⚠️ 이 다섯 색이 곧 #12 의 검증 도구다. `sample.zls` 가 전부 흰색이라
+  //    폴백이 없으면 옷이 흰 덩어리가 되고, "제대로 그려진 것"과 "패턴 하나가
+  //    통째로 뒤집힌 것"을 사람이 구분할 수 없게 된다.
+  {
+    const cloth = new ClothObject();
+    // 6개를 넣어 **되감기는지**까지 본다 — 5개만 보면 배열을 잘라도 안 걸린다.
+    cloth.setTopology([0, 1, 2, 3, 4, 5].map((i) => patternMat(`p${i}`)));
+    const hexes = cloth.patterns.map(
+      (p) => (p.mesh.material as THREE.MeshStandardMaterial).color.getHex(),
+    );
+    check(
+      '★★★ 임의 5색 팔레트가 그대로다 — 6번째가 0번으로 되감긴다 (진짜 색이 실려 있어도 화면은 팔레트다)',
+      hexes.join(',') === [0x7ea8d8, 0xd8a87e, 0x8fc9a0, 0xc98f9e, 0xb0a8d8, 0x7ea8d8].join(','),
+      hexes.map((h) => `#${h.toString(16)}`).join(' '),
+    );
+    check(
+      '★★ 다섯 색이 서로 다르다 (한 색으로 뭉개지면 패턴 경계가 안 보여 눈 판정이 불가능해진다)',
+      new Set(hexes.slice(0, 5)).size === 5,
+      `${new Set(hexes.slice(0, 5)).size}종`,
+    );
+    // 재질이 **없는** 패턴도 같은 팔레트를 받는다. materials-b 가 폴백을 쓸 때
+    // 색이 갑자기 달라지면 안 되므로, 지금 기준선을 못박아 둔다.
+    const bare = new ClothObject();
+    bare.setTopology([0, 1, 2].map((i) => patternMat(`q${i}`, null)));
+    check(
+      '★ 재질 없는 패턴도 같은 팔레트 색을 받는다 (폴백의 기준선)',
+      bare.patterns.map((p) => (p.mesh.material as THREE.MeshStandardMaterial).color.getHex())
+        .join(',') === [0x7ea8d8, 0xd8a87e, 0x8fc9a0].join(','),
+      bare.patterns.map((p) => `#${(p.mesh.material as THREE.MeshStandardMaterial).color.getHex().toString(16)}`).join(' '),
+    );
+    cloth.clear();
+    bare.clear();
+  }
+
+  // ── ⑤ 세 필드가 서로의 자리를 안 밟는다 ──────────────────────
+  //
+  // `transform`(3D) · `transform2d`(2D 배치) · `material` 이 같은 객체에
+  // 앉았다. 한 번이라도 섞이면 ISSUE-011 을 그대로 다시 겪는다.
+  {
+    const p = patternMat('m');
+    p.transform = { translation: [7, 8, 9], rotation: [0, 0, 0, 1], scale: [1, 1, 1] };
+    p.transform2d = [1, 0, 111, 0, 1, 222, 0, 0, 1] as unknown as PatternTransform2D;
+    const cloth = new ClothObject();
+    cloth.setTopology([p]);
+    const q = cloth.patterns[0];
+    check(
+      '★★★ 셋이 각자 제자리에 간다 (3D 는 mesh, 2D 는 transform2d, 재질은 material)',
+      q !== undefined
+      && q.mesh.position.x === 7 && q.mesh.position.y === 8
+      && q.transform2d?.[2] === 111 && q.transform2d[5] === 222
+      && q.material?.color.join(',') === '0.9254902,0.8117647,0.4705882',
+      q ? `mesh ${q.mesh.position.toArray().join(',')} / 2D [${q.transform2d?.slice(0, 3).join(',')}…] / 색 [${q.material?.color.join(',')}]` : '패턴 없음',
+    );
+    check(
+      '★★ 색이 2D 행렬 자리로도, 3D 위치로도 안 샌다',
+      q !== undefined
+      && q.transform2d?.slice(0, 3).join(',') !== q.material?.color.join(',')
+      && q.mesh.position.toArray().join(',') !== q.material?.color.join(','),
+    );
+    cloth.clear();
+  }
+
+  // ── ⑥ 프레임 갱신이 재질을 지우지 않는다 ─────────────────────
+  //
+  // 프레임 이벤트에는 `material` 이 안 온다. `updatePositions()` 가 그때 필드를
+  // 건드리면 **첫 프레임 뒤에 색이 통째로 사라진다** — materials-b 가 배선한
+  // 다음에는 "재생을 누르면 옷이 회색이 된다"로 나타난다.
+  {
+    const cloth = new ClothObject();
+    cloth.setTopology([patternMat('f')]);
+    const frame: DecodedPattern = {
+      uuid: 'f',
+      positions: Float32Array.from([9, 9, 9, 8, 8, 8, 7, 7, 7]),
+      vertices: 3,
+      triangles: 0,
+    };
+    let ok = cloth.updatePositions([frame]);
+    for (let i = 0; i < 50; i++) ok = cloth.updatePositions([frame]) && ok;
+    check(
+      '★★ material 없는 프레임을 50번 먹여도 재질이 남는다',
+      ok && cloth.patterns[0]?.material?.color.join(',') === '0.9254902,0.8117647,0.4705882',
+      JSON.stringify(cloth.patterns[0]?.material?.color),
+    );
+    check(
+      '★ 그 사이 정점은 실제로 갈렸다 (아무 일도 안 일어난 것과 구분한다)',
+      (cloth.patterns[0]?.position.array as Float32Array)[0] === 9,
+      String((cloth.patterns[0]?.position.array as Float32Array)[0]),
     );
     cloth.clear();
   }
@@ -7452,6 +7930,7 @@ async function main(): Promise<void> {
   sectionClothFrames();
   sectionClothTransform();
   sectionCloth2D();
+  sectionClothMaterial();
   sectionUnfold();
   sectionUnfoldControl();
   sectionFrameStreamQueue();

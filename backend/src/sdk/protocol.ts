@@ -167,6 +167,57 @@ export type PatternTransform2D = [
   number, number, number,
 ];
 
+/**
+ * 패턴의 **진짜** 재질. 실시간 3D 뷰가 임의 팔레트 대신 쓸 값이다.
+ *
+ * 워커가 `ztDesignClothPattern::GetFrontMaterial()` 의 데이터를 그대로 싣는다.
+ * 앞면만 읽는 이유는 익스포터도 기본 경로에서 그러기 때문이고
+ * (`zwGltfExporterImpl.cpp:477` — 뒷면/옆면은 thickness+splitMesh 가 둘 다
+ * 켜졌을 때만 갈라진다), three.js 가 DoubleSide 에서 면별로 다른 색을 못 주는
+ * 것과도 맞는다.
+ *
+ * ── 왜 패턴마다 인라인인가 (별도 materials op 이 아니라) ────
+ * 머티리얼 **객체**는 패턴과 **1:1** 이다. 두 씬 실측에서 어떤 머티리얼도
+ * 패턴 둘에게 공유되지 않았다 — `W_Bra top & Leggings.zls` 는 패턴 24 : 머티리얼
+ * 24(참조 각 1회), `sample.zls` 는 패턴 5 : 머티리얼 15(front/back/side 슬롯마다
+ * 하나씩, 각 1회). 머티리얼 uuid 로 묶는 별도 op 을 만들어도 엔트리가 줄지
+ * 않고 왕복만 늘어난다.
+ *
+ * 진짜 N:1 인 축은 **직물 에셋**(`fabricUuid`)이다 — 위 24개가 2개로 묶인다.
+ */
+export interface PatternMaterial {
+  /**
+   * 직물 에셋 uuid. **패턴을 직물별로 묶는 유일한 키다.**
+   *
+   * `W_Bra top & Leggings.zls` 실측: 패턴 24개가 2개로 묶인다(노랑 16 / 민트 8).
+   * 익스포터가 glTF 머티리얼을 합칠 때 쓰는 것과 같은 키다
+   * (`zwGltfExporterImpl.cpp` 의 `mUuidToGltfMaterial`, `assetUuid` 기준).
+   */
+  fabricUuid: string;
+  /**
+   * 베이스 색 `[r, g, b]`, 각 0~1. **알파는 여기 없다** — `opacity` 를 볼 것
+   * (익스포터도 `basecolor.w` 를 버리고 `alpha` 를 쓴다).
+   *
+   * ⚠️ `colorProfile` 없이 해석하면 안 된다. 아래 참고.
+   */
+  color: [number, number, number];
+  /**
+   * `color` 의 색공간. 거의 항상 `'srgb'` 지만 **상수로 가정하면 안 된다.**
+   *
+   * 실측한 노랑 `[0.9254902, 0.8117647, 0.4705882]` 은 정확히
+   * `236/255, 207/255, 120/255` — 8비트 색선택기에서 나온 sRGB 값이다.
+   * 선형으로 착각해 칠하면 눈에 띄게 어둡고 진해진다. three.js 라면
+   * `Color.setRGB(r, g, b, SRGBColorSpace)` 처럼 색공간을 명시해야 한다.
+   */
+  colorProfile: 'srgb' | 'linear';
+  /** 0~1. `ztDesignMaterialData::alpha`. 1 미만이면 반투명하게 그려야 한다. */
+  opacity: number;
+  /** 0~1. 실측: `W_Bra top & Leggings.zls` 1.0 / `sample.zls` 0.3 — 씬마다 다르다. */
+  roughness: number;
+  /** 0~1. 실측상 두 씬 모두 0 이었다. */
+  metalness: number;
+}
+
 export interface PatternData {
   uuid: string;
   vertices: number;
@@ -204,6 +255,19 @@ export interface PatternData {
    *    하나도 없다**는 것이다. 2D 저작 기능이 붙으면 깨진다.
    */
   transform2d?: PatternTransform2D;
+  /**
+   * 패턴의 진짜 재질. **topology:true 일 때만.**
+   *
+   * 머티리얼이 없는 패턴에는 아예 오지 않는다(흰색을 대신 보내지 않는다 —
+   * "흰 옷" 과 "색을 모름" 을 구분할 수 있어야 임의 팔레트로 폴백할 수 있다.
+   * `sample.zls` 가 실제로 전부 흰색이라 이 구분이 화면에서 바로 문제가 된다).
+   *
+   * ⚠️ topology 안에 있는 근거는 2D `transform2d` 와 같다 — 워커에 재질을 바꿀
+   *    op 이 하나도 없다는 것. **다만 이쪽이 먼저 깨진다**: 백로그의
+   *    `setFabric` 이 바로 이 값을 바꾸는 op 이다. 그때는 이 필드를 프레임마다
+   *    보낼 게 아니라 **재질 변경 이벤트를 따로** 내야 한다.
+   */
+  material?: PatternMaterial;
 }
 
 export interface MeshDataResult {
