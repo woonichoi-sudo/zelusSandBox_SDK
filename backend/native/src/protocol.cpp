@@ -11,6 +11,10 @@
 #include <windows.h>
 
 #include <ztAvatarCommon.h>        // ztAvatarBodyParam·ztAvatarMeasurePart + 이름 함수
+#include <ztAvatarMeasurement.h>   // GetMeasuredLength — 적용 뒤 치수를 다시 잰다
+#include <ztAvatarShaper.h>        // ztAvatarShaperEx::MeasurementInfos (치수 목표값 배열)
+#include <ztDesignZeta.h>          // SetMeasurementParam / UpdateBodyParams (치수→체형)
+#include <ztSimulationManager.h>   // 체형 단계마다 Step / Pause
 #include <ztDesignSurface.h>       // ztDesignSurfaceData::name (옷 사이즈)
 #include <ztDesign2DTransform.h>   // 서피스 2D 배치 (MeshData의 transform2d)
 #include <ztDesignAvatar.h>        // ztDesignAvatarData·ztDesignZetaData (체형)
@@ -33,11 +37,14 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <deque>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -285,6 +292,408 @@ bool WriteAvatarBody(ZestManager& manager, const json& body,
 
     if (!applied.empty()) qi->UpdateAvatar(uuid, next);
     return true;
+}
+
+// ── 치수 기반 체형 변형 (회사 consoleApplication 이식) ───────
+//
+// **위의 `WriteAvatarBody` 와 다른 경로다.** 저쪽은 셰이퍼 파라미터 29개를
+// `ztDesignAvatarData` 에 직접 써 넣고 `UpdateAvatar` 로 되돌리는데, 그것이
+// 엔진의 체형 갱신까지 내려가는지가 미지수로 남아 있다(위 머리말 참고).
+// 이쪽은 회사가 새로 추가한 CLI 타깃
+// (`consoleApplication/ZestManager.cpp:403-602`, `UpdateBodyParameter`)이
+// 쓰는 **정식 경로**를 그대로 옮긴 것이다:
+//
+//     simManager->Pause()
+//     → qi->GetAvatars()[qi->GetCurrentAvatar()] → dynamic_cast<ztDesignZeta*>
+//     → (목표 치수 − 현재 실측치) 중 최대 변화량 / stepCm = 중간 단계 수
+//     → 단계마다  zeta->SetMeasurementParam(measures, true)
+//                 zeta->UpdateBodyParams(true, true)
+//                 simManager->Step(true) × simulationIterations
+//     → simManager->Pause()
+//
+// ★ 왜 한 번에 안 밀고 단계를 쪼개는가 — 치수를 크게 바꾸면 몸이 이미 입혀진
+//   옷을 뚫고 나간다. 몸을 조금씩 키우면서 매 단계 시뮬을 돌려 옷이 따라오게
+//   하는 것이 이 루프의 전부다. 그래서 `bodyDimensionStepCm` 는 정밀도가
+//   아니라 **관통 회피 여유**를 정하는 값이다.
+//
+// ⚠️ **이 op 은 그 자리에서 시뮬레이션을 돌린다.** 단계 수 ×
+//    simulationIterations 번의 `Step(true)` 가 동기로 실행되고, 그동안
+//    프로토콜 루프는 stdin 을 읽지 않으므로 워커가 다른 요청에 응답하지
+//    못한다(프레임 이벤트도 그동안 나가지 않는다 — 루프가 돌지 않으니
+//    `maxFrame` 만 올라가고 이벤트는 op 이 끝난 뒤 한 번에 따라잡는다).
+//
+// ⚠️ **두 경로를 둘 다 남겨 둔다.** `setAvatarBody` 를 지우지 않았다.
+//    어느 쪽이 실제로 반영되는지는 실측이 가르며, 그 판단은 여기서 하지 않는다.
+
+/** ApplyAvatarMeasurements 의 실패 사유. 문자열로 바꾸는 일은 호출부가 한다 */
+enum class MeasureApplyError
+{
+    None = 0,
+    NoScene,        // 씬/쿼리 인터페이스 없음
+    NoSimManager,   // 시뮬레이션 매니저 없음
+    NoAvatar,       // 현재 아바타가 저장소에 없음
+    NotZeta,        // ztDesignZeta 가 아님 (FBX/USD 아바타는 치수 변형이 없다)
+    NoChange,       // 보낸 치수가 **전부 틀렸다** (모르는 이름 / 못 쓰는 값)
+                    // ⚠️ "바꿀 것이 없다" 는 여기 안 온다 — null 뿐인 요청은 성공이다
+};
+
+struct MeasureApplyReport
+{
+    std::vector<std::string> applied;    // 반영한 치수 이름
+    std::vector<std::string> unknown;    // 그런 치수 이름이 엔진에 없다
+    std::vector<std::string> rejected;   // 이름은 맞지만 값을 쓸 수 없다
+    int skipped  = 0;   // null(= "지정 안 함")이라 건너뛴 항목 수
+    int steps    = 0;   // 중간 단계 수 (마지막 목표값 단계 포함)
+    int simSteps = 0;   // 실제로 부른 Step 횟수
+
+    // ★ 적용 뒤 **다시 잰** 치수. 이름 → cm.
+    //
+    //   `ReadAvatarBody` 의 `measurements[*].real` 로는 이 op 의 결과를 볼 수
+    //   없다 — 그쪽은 `qi->GetAvatarData()` 가 주는 **씬 데이터의 사본**
+    //   (`ztDesignAvatarData::zetaData::measurementRealValues`)인데 쓰기는
+    //   `ztDesignZeta` 객체로 가고 둘이 동기화되지 않는다. 실측 2026-08-11:
+    //   Δ15cm 를 걸고 Step 을 96번 돌려도 61.647 → 61.647 로 그대로였고,
+    //   그런데도 glTF 해시는 바뀌었다(= 몸은 진짜 다시 만들어졌다).
+    //
+    //   여기서는 그 객체에서 직접 잰다: `ztDesignZeta::GetMeasurement()`
+    //   → `ztAvatarMeasurement::GetMeasuredLength(part)`.
+    std::map<std::string, float> measured;
+};
+
+/**
+ * 치수를 목표값까지 단계적으로 밀면서 매 단계 시뮬을 돌린다.
+ *
+ * `measurements` 의 키는 **엔진이 정한 치수 이름**이다("WaistCircum",
+ * "Stature", …). `avatarBody` 응답의 `measurements` 키와 같은 이름이며,
+ * `ztAvatarMeasureUtils::GetMeasurePartIdx` 가 정본이다 — 우리가 이름을
+ * 새로 만들면 읽는 op 과 쓰는 op 의 어휘가 갈라진다.
+ */
+MeasureApplyError ApplyAvatarMeasurements(ZestManager& manager,
+                                          const json&  measurements,
+                                          int          simulationIterations,
+                                          float        bodyDimensionStepCm,
+                                          MeasureApplyReport& report)
+{
+    ztSceneQueryInterface* qi = QueryInterface(manager);
+    if (!qi) return MeasureApplyError::NoScene;
+
+    ztSimulationManager* simManager = manager.GetSceneManager()->GetSimulationManager();
+    if (!simManager) return MeasureApplyError::NoSimManager;
+
+    // ── 1단계: 읽기만 하는 검증. **여기서는 Pause 하지 않는다** ──
+    //
+    // 원본은 이 앞에서 `simManager->Pause()` 를 부른다. 1회성 CLI 에서는
+    // 무해했지만 우리는 상주 워커다 — 아바타가 없거나 zeta 가 아니거나 치수
+    // 이름이 전부 틀리면 클라이언트는 "에러" 를 받는데 **재생 중이던 시뮬은
+    // 이미 멈춘 뒤**가 된다. 화면은 이유 없이 조용히 선다.
+    // (실측 2026-08-11: mode=play, frame 322→324 로 도는 중에 모르는 치수만
+    //  보냈더니 요청은 실패하고 mode=pause 로 떨어졌다.)
+    //
+    // 이 단계가 만지는 것은 (a) 아바타 저장소 map 과 (b) 치수 **이름표**뿐이다.
+    // 둘 다 시뮬 스레드가 쓰지 않는다 — 아바타의 추가·삭제는 이 프로토콜
+    // 루프에서만 일어나고(단일 스레드), 이름표는 정적 테이블이다. 시뮬이
+    // 건드릴 수 있는 아바타 **데이터**(measurementRealValues 등)는 일부러
+    // 여기서 읽지 않고 Pause 뒤로 미룬다.
+    const ztUuid avatarUuid = qi->GetCurrentAvatar();
+    {
+        const ztDesignAvatarStorage& avatars = qi->GetAvatars();
+
+        const auto probe = avatars.find(avatarUuid);
+        if (probe == avatars.end()) return MeasureApplyError::NoAvatar;
+        if (!dynamic_cast<ztDesignZeta*>(probe->second.get()))
+            return MeasureApplyError::NotZeta;
+    }
+
+    // 이름·값 검사는 아바타 데이터가 전혀 필요 없다 — `GetMeasurePartIdx` 는
+    // 문자열 → 인덱스 변환일 뿐이다. 덕분에 "보낸 것이 전부 틀렸다" 까지
+    // Pause 없이 판정된다.
+    std::vector<std::pair<int, double>> wanted;      // (치수 인덱스, 목표 cm)
+    std::vector<std::string>            wantedKeys;  // 같은 순서의 이름
+
+    for (auto it = measurements.begin(); it != measurements.end(); ++it)
+    {
+        const std::string& key = it.key();
+
+        const int idx = ztAvatarMeasureUtils::GetMeasurePartIdx(key);
+        if (idx < 0) { report.unknown.push_back(key); continue; }
+
+        // ★ `null` 은 "지정 안 함" 이다. 잘못된 값이 아니다.
+        //
+        //   엔진팀 문서: "모든 항목이 존재해야 함. 값은 치수(cm) or null,
+        //   null인 경우 자연스러운 임의 값으로 계산됨". 즉 클라이언트는 치수
+        //   키 25개를 **전부** 보내고 안 바꿀 것을 null 로 둔다. 회사 리더도
+        //   `isNumeric()` 이 false 면 -1 로 두어 조용히 건너뛴다.
+        //
+        //   ⚠️ 이걸 `rejected` 에 넣으면 실제 파일을 그대로 보냈을 때 23개가
+        //      rejected 로 뜨고, 전부 null 이면 요청 전체가 에러가 된다.
+        //   → **키를 아예 안 보낸 경우와 똑같이 다룬다.** 센 수만 보고한다
+        //      (조용히 삼키지 않는다 — ISSUE-014 의 교훈).
+        if (it.value().is_null()) { ++report.skipped; continue; }
+
+        // 숫자도 null 도 아니면 그건 클라이언트의 실수다(문자열·불리언·객체).
+        if (!it.value().is_number()) { report.rejected.push_back(key); continue; }
+
+        const double value = it.value().get<double>();
+
+        // 원본의 `-1 < value` 를 그대로 지킨다. 파일 리더에서 "필드 없음"이
+        // -1 이었기 때문에 생긴 조건이지만, 음수 치수를 엔진에 밀어 넣지
+        // 않는다는 안전장치이기도 하다. 걸린 키는 조용히 버리지 않고
+        // `rejected` 로 보고한다(ISSUE-014 의 교훈).
+        if (!(-1 < value)) { report.rejected.push_back(key); continue; }
+
+        wanted.emplace_back(idx, value);
+        wantedKeys.push_back(key);
+    }
+
+    if (wanted.empty())
+    {
+        // 바꿀 것이 하나도 없다. **실패인지 아닌지는 "왜 없는지" 가 가른다.**
+        //
+        //  · 전부 null / 미지정  → 클라이언트가 "바꿀 것 없음" 을 보낸 것이다.
+        //                          바꿀 것이 없는 것은 실패가 아니다 →
+        //                          `applied:[]` · `steps:0` 으로 **성공**.
+        //  · unknown/rejected 만  → 클라이언트가 틀렸다. 에러로 알려 준다
+        //                          (호출부가 그 키 목록을 에러 문장에 붙인다).
+        if (report.unknown.empty() && report.rejected.empty())
+            return MeasureApplyError::None;
+
+        return MeasureApplyError::NoChange;
+    }
+
+    // ── 2단계: 여기서부터 실제로 바꾼다 ─────────────────────
+    //
+    // 원본과 같은 이유로 멈춘다. 시뮬 스레드가 도는 중에 체형을 바꾸면
+    // 같은 데이터를 두 스레드가 만진다.
+    simManager->Pause();
+
+    // Pause 앞에서 본 것을 **다시 확인한다.** 포인터를 Pause 너머로 들고
+    // 가지 않는다 — 검증과 사용 사이에 시뮬이 멈추는 지점이 끼어 있다.
+    const ztDesignAvatarStorage& avatars = qi->GetAvatars();
+
+    const auto found = avatars.find(avatarUuid);
+    if (found == avatars.end()) return MeasureApplyError::NoAvatar;
+
+    ztDesignAvatar* avatar = found->second.get();
+    ztDesignZeta*   zeta   = dynamic_cast<ztDesignZeta*>(avatar);
+    if (!zeta) return MeasureApplyError::NotZeta;
+
+    // ── 목표 치수 모으기 ────────────────────────────────────
+    //
+    // ⚠️ 기준선은 **실측치**(`measurementRealValues`)다. 목표치
+    //    (`measurementExpectedValues`)가 아니다. 원본에서는 이 값을 담는
+    //    변수 이름이 `orgMeasurementExpectedValues` 라 이름과 내용이
+    //    어긋나 있는데, 이름이 아니라 동작을 옮긴다.
+    const ztAvatarShaperEx::Measures org =
+        avatar->GetData().zetaData.measurementRealValues;
+
+    // ★ 목표는 **씬의 기존 목표값이 아니라 현재 실측치에서** 출발한다.
+    //
+    //   씬의 `measurementExpectedValues` 에는 예전에 걸어 둔 목표값과 잠금이
+    //   남아 있다. 그것을 출발점으로 삼으면 **사용자가 보내지도 않은 부위가
+    //   낡은 목표로 끌려간다** — 허리만 바꿨는데 팔이 짧아지는 식이다.
+    //   회사도 같은 버그를 냈고 `8d73f85 "Modify arm length"` 로 고쳤다.
+    //
+    //   보내지 않은(또는 null 인) 치수는 `isLock=false` + 현재 실측치로 두어
+    //   셰이퍼가 자유롭게 계산하게 한다. 엔진팀 문서의 *"null 인 경우
+    //   자연스러운 임의 값으로 계산됨"* 이 성립하려면 잠금이 없어야 한다.
+    ztAvatarShaperEx::MeasurementInfos dest;
+    for (int i = 0; i < (int)ztAvatarMeasurePart::Count; ++i)
+    {
+        dest[i].isLock = false;
+        dest[i].value  = org[i];
+    }
+
+    std::map<ztAvatarMeasurePart, float> lockItems;
+    float maxDest = 0.0f;
+
+    for (std::size_t i = 0; i < wanted.size(); ++i)
+    {
+        const int    idx   = wanted[i].first;
+        const double value = wanted[i].second;
+
+        dest[idx].isLock = true;
+        dest[idx].value  = (float)value;
+
+        const float delta = (float)value - org[idx];
+        lockItems[(ztAvatarMeasurePart)idx] = delta;
+        maxDest = (std::max)(maxDest, std::abs(delta));
+
+        report.applied.push_back(wantedKeys[i]);
+    }
+
+    // ── 중간 단계 만들기 ────────────────────────────────────
+    //
+    // 단계 수는 **가장 많이 변하는 항목** 기준이다(`maxDest / stepCm`, 정수
+    // 나눗셈). 각 단계에서 잠근 항목이 전부 같은 `offsetCm` 만큼 움직이고,
+    // 목표를 넘어선 항목은 목표값에 클램프된다. 그래서 변화가 작은 항목은
+    // 먼저 도착해 멈춰 있고 큰 항목만 계속 간다.
+    std::vector<ztAvatarShaperEx::MeasurementInfos> stepValues;
+
+    const float stepCm = bodyDimensionStepCm;
+    const int   step   = (int)(maxDest / stepCm);
+
+    for (int i = 0; i < step; ++i)
+    {
+        ztAvatarShaperEx::MeasurementInfos cur = dest;
+
+        for (const auto& lockItem : lockItems)
+        {
+            const int   itemIdx  = (int)lockItem.first;
+            const bool  isPlus   = (0.0 <= lockItem.second);
+            const float offsetCm = (float)(i + 1) * stepCm;
+            const float newValue = org[itemIdx] + (isPlus ? offsetCm : -offsetCm);
+
+            const bool isOverValue = isPlus ? (dest[itemIdx].value <= newValue)
+                                            : (newValue <= dest[itemIdx].value);
+
+            cur[itemIdx].value = isOverValue ? dest[itemIdx].value : newValue;
+        }
+
+        stepValues.push_back(cur);
+    }
+
+    // 마지막 단계는 항상 목표값 그대로다. 위 루프가 정수 나눗셈으로 잘려
+    // 목표에 못 미친 채 끝날 수 있기 때문이다(변화량 < stepCm 이면 위
+    // 루프가 아예 돌지 않고 이 한 단계만 남는다).
+    stepValues.push_back(dest);
+
+    // ── 단계마다 체형 갱신 + 시뮬 ───────────────────────────
+    const int total = (int)stepValues.size();
+    report.steps = total;
+
+    for (int i = 0; i < total; ++i)
+    {
+        // 원본은 std::cout 으로 찍는다. 우리는 cout 이 프로토콜 스트림이
+        // 아니라 stderr 로 돌려져 있지만(OutputChannels), 사람이 읽는 로그는
+        // 이 파일의 규약대로 LogLine 을 쓴다.
+        LogLine("체형 단계 [" + std::to_string(i + 1) + "/" + std::to_string(total) + "]");
+
+        zeta->SetMeasurementParam(stepValues[i], true);
+        zeta->UpdateBodyParams(true, true);
+
+        for (int j = 0; j < simulationIterations; ++j)
+        {
+            simManager->Step(true);
+            ++report.simSteps;
+        }
+    }
+
+    simManager->Pause();
+
+    // ── 되읽기: 쓴 객체에서 직접 잰다 ───────────────────────
+    //
+    // 요청값을 메아리치지 않는다는 이 파일의 규약을 지키려면 **갱신되는**
+    // 값을 실어야 한다. 위 struct 주석 참고 — 씬 데이터 사본은 안 움직인다.
+    if (const std::shared_ptr<ztAvatarMeasurement> m = zeta->GetMeasurement())
+    {
+        for (int i = 0; i < (int)ztAvatarMeasurePart::Count; ++i)
+        {
+            const ztAvatarMeasurePart part = (ztAvatarMeasurePart)i;
+            report.measured[ztAvatarMeasureUtils::GetMeasurePartName(part)] =
+                m->GetMeasuredLength(part);
+        }
+    }
+
+    return MeasureApplyError::None;
+}
+
+/** 실패 사유를 사람이 읽는 문장으로. 빈 문자열이면 성공이다 */
+std::string MeasureApplyErrorText(MeasureApplyError err)
+{
+    switch (err)
+    {
+    case MeasureApplyError::None:         return {};
+    case MeasureApplyError::NoScene:      return "씬이 없습니다";
+    case MeasureApplyError::NoSimManager: return "시뮬레이션 매니저가 없습니다";
+    case MeasureApplyError::NoAvatar:     return "씬에 아바타가 없습니다";
+    case MeasureApplyError::NotZeta:      return "이 아바타는 치수 변형을 지원하지 않습니다 (ztDesignZeta 아님)";
+    case MeasureApplyError::NoChange:     return "적용할 치수가 없습니다";
+    }
+    return "알 수 없는 실패";
+}
+
+// ── 자동 드레이핑 ───────────────────────────────────────────
+//
+// `.zls` 는 펼쳐진 패턴만이 아니라 **입혀진 상태(드레이프)** 도 같이 담는다.
+// 우리 워커는 여태 `LoadZls` 만 했기 때문에 옷이 펼쳐진 채로 나왔다. 회사의
+// `consoleApplication/main.cpp:41-61` 이 그 뒤에 하는 일이 이것이다:
+// 드레이핑 아이템 중 `ztDrapingItem::AUTO_ITEM_UUID` 인 항목을 찾아
+// `LoadDrapingItem` 으로 적용한다.
+//
+// ★ 크래시 방지용 `ztSimulationManager::Reset()` 은 **우리가 부를 필요가
+//   없다.** 우리가 컴파일하는 `zelusSandBox/ZestManager.cpp:435-437` 의
+//   `LoadDrapingItem` 안에 이미 들어 있고(원본 주석까지 동일),
+//   `consoleApplication` 쪽 구현과 바이트 단위로 같은 코드다. 즉 이 op 은
+//   호출만 하면 된다.
+//
+// ⚠️ 아이템이 **없는 씬도 있다.** 그때는 에러가 아니다 — 씬이 잘못된 것이
+//    아니라 저장된 드레이프가 없을 뿐이고, 화면은 그 상태로도 정상 동작해야
+//    한다. `ok:true` + `applied:false` + `reason:"noAutoItem"` 으로 답한다.
+//    에러로 만들면 게이트웨이가 로드 실패와 구분하지 못한다.
+
+/** 드레이핑 아이템 목록과 지금 활성인 것. 되읽기용이므로 부작용이 없다 */
+json ReadDraping(ZestManager& manager)
+{
+    json items = json::array();
+
+    for (const auto& entry : manager.GetDrapingItems())
+    {
+        items.push_back(json{
+            { "uuid",   entry.first.GetString() },
+            { "name",   entry.second },
+            { "isAuto", entry.first == ztDrapingItem::AUTO_ITEM_UUID },
+        });
+    }
+
+    json out{
+        { "items", items },
+        { "count", (int)items.size() },
+    };
+
+    // 엔진이 말하는 활성 아이템. **이것이 적용 여부의 증거다** — 요청한
+    // uuid 를 메아리치면 엔진이 아무 일도 안 했을 때조차 성공으로 보인다.
+    if (ztSceneQueryInterface* qi = QueryInterface(manager))
+    {
+        out["activeUuid"] = qi->GetActiveDrapingItemUuid().GetString();
+
+        if (const ztDrapingItem* active = qi->GetActiveDrapingItem())
+        {
+            out["activeName"] = active->name.toStdString();
+        }
+    }
+
+    return out;
+}
+
+/**
+ * 자동 드레이핑 아이템을 적용한다.
+ *
+ * 응답은 **적용 후 상태를 되읽어** 싣는다(setAvatarBody·setSurfaceSize 와
+ * 같은 규약). 실패해도 예외를 던지지 않고 `applied:false` + 사유로 답한다.
+ */
+json ApplyAutoDraping(ZestManager& manager)
+{
+    const auto items = manager.GetDrapingItems();
+
+    const auto it = std::find_if(items.begin(), items.end(),
+        [](const std::pair<ztUuid, std::string>& p) {
+            return p.first == ztDrapingItem::AUTO_ITEM_UUID;
+        });
+
+    if (it == items.end())
+    {
+        json out = ReadDraping(manager);
+        out["applied"] = false;
+        out["reason"]  = "noAutoItem";   // 씬에 자동 드레이프가 저장돼 있지 않다
+        return out;
+    }
+
+    const bool loaded = manager.LoadDrapingItem(it->first, it->second);
+
+    json out = ReadDraping(manager);
+    out["applied"] = loaded;
+    if (!loaded) out["reason"] = "loadFailed";
+    return out;
 }
 
 // ── 옷 사이즈 (L-3b) ────────────────────────────────────────
@@ -1327,6 +1736,115 @@ int RunProtocolLoop(ZestManager& manager)
                             { "unknown", unknown },
                             { "avatar",  ReadAvatarBody(manager) },
                         };
+                    }
+                }
+            }
+            else if (op == "setAvatarMeasurements")
+            {
+                // ⚠️ 오래 걸린다. 단계 수 × simulationIterations 번의 Step 을
+                //    동기로 돌린다(위 머리말 참고).
+                const json measurements = req.value("measurements", json::object());
+
+                // ⚠️ **기본값이 회사 struct 와 다르다 — 일부러 그렇다.**
+                //
+                //   회사 `BodyParameterReader.h:38-39` 의 struct 초기값은
+                //   `simulationIterations = 1`, `bodyDimensionStepCm = 100` 이다.
+                //   그런데 엔진팀이 전달한 **문서의 기본값은 6 과 1.0** 이다.
+                //   둘이 어긋나 있고, 우리는 문서 쪽을 정본으로 삼는다.
+                //
+                //   근거: stepCm=100 이면 `(int)(maxDest / 100)` 이 0 이라 중간
+                //   단계가 통째로 사라지고 몸이 한 번에 변한다 — **옷이 몸을
+                //   뚫는다.** 단계 쪼개기의 존재 이유가 기본값에서 죽는다.
+                //   회사 struct 값은 파일에 필드가 없을 때의 자리채움이지
+                //   권장값이 아니라고 본다.
+                //
+                //   대가: 기본값 호출이 훨씬 느려진다. Debug 빌드 실측에서
+                //   허리둘레 +15cm 가 16단계 × 6회 = Step 96번, **142초**였다
+                //   (게이트웨이 요청 타임아웃 120초를 넘는다).
+                const int    iterations = req.value("simulationIterations", 6);
+                const double stepCm     = req.value("bodyDimensionStepCm", 1.0);
+
+                if (!manager.IsLoadedZls())
+                {
+                    ok = false; error = "씬이 로드되지 않았습니다";
+                }
+                else if (!measurements.is_object() || measurements.empty())
+                {
+                    ok = false; error = "measurements가 필요합니다";
+                }
+                else if (iterations < 0)
+                {
+                    ok = false; error = "simulationIterations는 0 이상이어야 합니다";
+                }
+                else if (!(stepCm > 0.0))
+                {
+                    // 원본에는 이 검사가 없다. 0 이면 `maxDest / stepCm` 이
+                    // inf 가 되고 그것을 int 로 캐스팅하는 것은 UB 다 —
+                    // 실제로는 거대한 루프가 되어 워커가 돌아오지 않는다.
+                    ok = false; error = "bodyDimensionStepCm는 0보다 커야 합니다";
+                }
+                else
+                {
+                    MeasureApplyReport report;
+                    const MeasureApplyError err = ApplyAvatarMeasurements(
+                        manager, measurements, iterations, (float)stepCm, report);
+
+                    if (err != MeasureApplyError::None)
+                    {
+                        ok = false;
+                        error = MeasureApplyErrorText(err);
+
+                        // 왜 하나도 안 먹었는지는 키 목록이 있어야 안다.
+                        // 에러 문자열밖에 못 싣는 규약이라 여기에 붙인다.
+                        if (err == MeasureApplyError::NoChange)
+                        {
+                            for (const std::string& k : report.unknown)  error += " / 모르는 치수: " + k;
+                            for (const std::string& k : report.rejected) error += " / 못 쓰는 값: " + k;
+                        }
+                    }
+                    else
+                    {
+                        // ★ 되읽어 싣는다. `avatar.measurements[*].real` 이
+                        //   엔진이 실제로 만들어 낸 치수다 — 요청값을
+                        //   메아리치면 몸이 안 변했을 때도 성공으로 보인다.
+                        result = json{
+                            { "applied",  report.applied  },
+                            { "unknown",  report.unknown  },
+                            { "rejected", report.rejected },
+                            // null 이라 건너뛴 개수. `applied` 가 비고 `skipped` 만
+                            // 크면 "바꿀 것 없음" 이 정상 통과한 것이다.
+                            { "skipped",  report.skipped  },
+                            { "steps",    report.steps    },
+                            { "simSteps", report.simSteps },
+                            { "frame",    curFrame.load() },
+                            // ★ 적용 뒤 **다시 잰** 치수. 이것이 되읽기의 정본이다 —
+                            //   아래 `avatar.measurements[*].real` 은 씬 데이터
+                            //   사본이라 이 op 으로는 안 움직인다(struct 주석 참고).
+                            { "measured", report.measured },
+                            { "avatar",   ReadAvatarBody(manager) },
+                        };
+                    }
+                }
+            }
+            else if (op == "loadDraping")
+            {
+                if (!manager.IsLoadedZls())
+                {
+                    ok = false; error = "씬이 로드되지 않았습니다";
+                }
+                else
+                {
+                    result = ApplyAutoDraping(manager);
+
+                    // LoadDrapingItem 이 안에서 ztSimulationManager::Reset() 을
+                    // 부른다. 프레임 카운터를 그대로 두면 화면이 "249프레임째"
+                    // 라고 말하는데 시뮬은 처음부터 다시 도는 상태가 된다 —
+                    // reset op 과 같은 자리를 되돌린다.
+                    if (result.value("applied", false))
+                    {
+                        maxFrame.store(-1);
+                        curFrame.store(-1);
+                        lastEmitted = -1;
                     }
                 }
             }
