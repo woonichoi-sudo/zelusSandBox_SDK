@@ -129,6 +129,37 @@ function segmentsObject(
   return line;
 }
 
+/**
+ * 켜고 끌 수 있는 갈래. **화면이 목록을 지어내지 않게** 여기에 둔다 —
+ * 종류가 늘면 이 표에만 더하면 되고, 체크박스는 이것을 읽어 그린다.
+ *
+ * ⚠️ `key` 는 `group.children` 의 `name` 접두사와 짝이다. 어긋나면 스위치가
+ *    조용히 아무 일도 안 하는데, 그 증상은 "체크박스가 안 먹는다" 로만 보여서
+ *    원인이 이름인지 배선인지 화면으로는 못 가른다.
+ */
+export const DESIGN_LAYERS = [
+  { key: 'links', label: '봉제 대응선', prefix: 'seam:links' },
+  { key: 'seams', label: '봉제선', prefix: 'seam:' },
+  { key: 'outer', label: '외곽선', prefix: 'curves:outer' },
+  { key: 'inner', label: '내부선', prefix: 'curves:inner' },
+  { key: 'vertices', label: '제어점', prefix: 'vertices:' },
+  { key: 'stitches', label: '스티치', prefix: 'stitch:' },
+] as const;
+
+export type DesignLayerKey = (typeof DESIGN_LAYERS)[number]['key'];
+
+/**
+ * 객체 이름 → 갈래. **`seam:links` 가 `seam:` 보다 먼저 걸려야 한다** —
+ * 대응선은 봉제선의 일부가 아니라 별도 스위치이고, 순서가 뒤집히면
+ * "봉제선 끄기" 가 대응선까지 같이 끈다.
+ */
+function layerOf(name: string): DesignLayerKey | null {
+  for (const l of DESIGN_LAYERS) {
+    if (name === l.prefix || name.startsWith(l.prefix)) return l.key;
+  }
+  return null;
+}
+
 export interface Design2DLayerView {
   curves: number;
   vertices: number;
@@ -276,6 +307,10 @@ export class Design2DLayer {
       this.group.add(links);
     }
 
+    // ★ 새로 세운 객체에 **꺼 뒀던 갈래를 다시 입힌다.** 없으면 씬을 다시
+    //   로드할 때 체크박스는 꺼져 있는데 선은 보이는 상태가 된다.
+    this.#applyLayers();
+
     this.#view = {
       curves: curveCount,
       vertices: anchors.length / 3 + handles.length / 3,
@@ -304,6 +339,44 @@ export class Design2DLayer {
 
   set visible(v: boolean) {
     this.group.visible = v;
+  }
+
+  // ── 갈래별 켜고 끄기 ──────────────────────────────────────
+  //
+  // ★ **상태를 여기가 들고 있다.** 체크박스가 아니라 이쪽이 정본인 이유는
+  //   `build()` 가 씬마다 객체를 새로 만들기 때문이다 — 화면에만 있으면
+  //   씬을 다시 로드할 때 꺼 뒀던 갈래가 슬그머니 켜지고, 사용자는 체크박스는
+  //   꺼져 있는데 선은 보이는 화면을 본다.
+
+  /** 꺼진 갈래. 비어 있으면 전부 켜진 상태다 */
+  readonly #off = new Set<DesignLayerKey>();
+
+  /** 지금 켜져 있는가 */
+  isLayerVisible(key: DesignLayerKey): boolean {
+    return !this.#off.has(key);
+  }
+
+  setLayerVisible(key: DesignLayerKey, on: boolean): void {
+    if (on) this.#off.delete(key);
+    else this.#off.add(key);
+    this.#applyLayers();
+  }
+
+  /** 화면이 체크박스를 그릴 때 읽는 표 */
+  get layers(): Array<{ key: DesignLayerKey; label: string; on: boolean }> {
+    return DESIGN_LAYERS.map((l) => ({
+      key: l.key,
+      label: l.label,
+      on: this.isLayerVisible(l.key),
+    }));
+  }
+
+  /** 지금 세워진 객체들에 꺼짐 상태를 입힌다. `build()` 끝에서도 부른다 */
+  #applyLayers(): void {
+    for (const child of this.group.children) {
+      const key = layerOf(child.name);
+      child.visible = key === null ? true : !this.#off.has(key);
+    }
   }
 }
 

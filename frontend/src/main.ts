@@ -58,7 +58,7 @@ import {
   uploadScene,
   type SceneSummary,
 } from './protocol/index.ts';
-import { AvatarPanel, ParamsPanel, SideTabs, SurfacePanel } from './ui/index.ts';
+import { AvatarPanel, Design2DOptions, ParamsPanel, SideTabs, SurfacePanel } from './ui/index.ts';
 import { Unfolder, UnfoldController, Viewer2D } from './viewer2d/index.ts';
 import {
   FrameStream,
@@ -84,6 +84,8 @@ const ui = {
   // 가운데 칸의 도면 캔버스 (L-2a). 왼쪽 칸과 별개의 렌더러다.
   canvas2d: el<HTMLCanvasElement>('view2d'),
   draft2dEmpty: el<HTMLElement>('draft2dEmpty'),
+  // 재단 도면의 표시 스위치가 그려질 자리 (D2-e)
+  draft2dOpts: el<HTMLElement>('draft2dOpts'),
   scene: el<HTMLSelectElement>('scene'),
   load: el<HTMLButtonElement>('load'),
   file: el<HTMLInputElement>('file'),
@@ -512,6 +514,20 @@ async function applySurfaceSize(uuid: string): Promise<void> {
   }
   surfacePanel.render();
 }
+
+// ── 재단 도면의 표시 스위치 (D2-e) ──────────────────────────
+//
+// 껍데기만이다. 갈래 목록도 켜짐/꺼짐도 `viewer2d/design.ts` 가 들고 있고,
+// 여기서는 위젯을 그 레이어에 물리기만 한다.
+//
+// ★ 참조를 남기지 않는다 — 클릭 → `setLayerVisible()` → 다시 그리기가 닫힌
+//   고리라 바깥에서 부를 일이 없다(`SideTabs` 와 같은 판단이다). 씬이 바뀌어도
+//   `build()` 끝에서 레이어가 스스로 꺼짐 상태를 다시 입힌다.
+new Design2DOptions({
+  root: ui.draft2dOpts,
+  layer: viewer2d.design,
+  onChange: (key, on) => log(`2D 도면 — ${key} ${on ? '표시' : '숨김'}`),
+});
 
 // ── 오른쪽 칸의 탭 (L-3c) ───────────────────────────────────
 //

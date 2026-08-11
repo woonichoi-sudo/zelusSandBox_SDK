@@ -341,6 +341,32 @@
             배치 없는 패턴이 있을 때만이고, L-3 이 `#paramsWrap` 을 오른쪽
             칸으로 옮기면 사라지는 문제다.)
       */
+      /*
+        ── 재단 도면의 표시 스위치 (D2-e) ────────────────────────
+        칸 **왼쪽 위**에 둔다. 아래는 `#unfoldWrap`(펼침 슬라이더)이 L-2b 에서
+        올 자리이고, 오른쪽 위는 도면이 넓게 쓰는 쪽이다.
+
+        ⚠️ `pointer-events` 를 상자에는 none, 라벨에만 auto 로 준다. 상자가
+           통째로 클릭을 먹으면 그 사각형 안에서는 **도면을 팬 할 수 없다** —
+           체크박스 여섯 개짜리 상자가 캔버스 조작을 가리는 셈이 된다.
+      */
+      #draft2dOpts {
+        position: absolute; left: 0.5rem; top: 0.5rem; z-index: 3;
+        display: flex; flex-wrap: wrap; gap: 0.1rem 0.6rem;
+        max-width: calc(100% - 1rem);
+        pointer-events: none;
+        font-size: 11px;
+      }
+      .dopt {
+        display: flex; align-items: center; gap: 0.25rem;
+        pointer-events: auto; cursor: pointer;
+        opacity: 0.55; user-select: none;
+      }
+      .dopt:hover { opacity: 0.9; }
+      /* 켜진 것을 진하게 — 꺼진 갈래가 한눈에 보여야 "왜 안 보이지" 를 막는다 */
+      .dopt:has(input:checked) { opacity: 0.95; }
+      .dopt input { margin: 0; cursor: pointer; }
+
       #unfoldWrap {
         position: absolute; left: 50%; transform: translateX(-50%);
         bottom: 0.6rem; z-index: 3;
@@ -499,6 +525,13 @@
         <b>2D 재단 도면</b>
         <span>씬을 로드하면 여기에 재단 도면이 섭니다</span>
       </div>
+      <!--
+        ── 표시 스위치 (D2-e) ──────────────────────────────────
+        체크박스는 `src/ui/design2dOptions.ts` 가 만든다(여기는 빈 자리다).
+        갈래 목록과 켜짐/꺼짐의 **정본은 `viewer2d/design.ts`** 다 — 화면에
+        두면 씬을 다시 로드할 때 선은 켜지고 체크박스는 꺼진 채로 갈라진다.
+      -->
+      <div id="draft2dOpts"></div>
     </div>
 
     <!--

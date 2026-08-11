@@ -33,3 +33,13 @@ export {
   SideTabs,
   type SideTabsOptions,
 } from './sideTabs.ts';
+
+/**
+ * 재단 도면의 표시 스위치 (D2-e). 켜짐/꺼짐의 정본은 `Design2DLayer` 이고
+ * 이 위젯은 읽어서 그리기만 한다 — 씬을 다시 로드해도 안 갈라지는 이유다.
+ */
+export {
+  Design2DOptions,
+  type Design2DOptionsOptions,
+  type Design2DOptionsView,
+} from './design2dOptions.ts';

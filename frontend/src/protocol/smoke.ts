@@ -99,8 +99,11 @@ import { SideTabs } from '../ui/index.ts';
 //   초록이다. 규약을 못박는 절(§8-12 ⑤)이 제품 함수를 부르게 두면 그 틈이 닫힌다.
 import {
   apply2d,
+  Design2DLayer,
+  DESIGN_LAYERS,
   Unfolder,
   UnfoldController,
+  type DesignLayerKey,
   type UnfoldStats,
 } from '../viewer2d/index.ts';
 import { ClothObject } from '../viewer3d/cloth.ts';
@@ -7895,6 +7898,226 @@ async function sectionParamRealWorker(): Promise<void> {
 // 화면에서는 **같은 탭을 다시 눌렀더니 보던 자리가 튀는** 증상으로만 드러난다.
 // ─────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────
+// §14. 재단 도면의 표시 스위치 (D2-e, viewer2d/design.ts)
+// ─────────────────────────────────────────────────────────────
+//
+// 좁게 겨냥한 절이다. `design.ts` 전체(폴리라인 변환·센티넬 걸러내기·z 순서·
+// 색 폴백)는 아직 무테스트이고 별도 단위로 뗐다 — 여기서 보는 것은 **깨지면
+// 조용한 두 가지**뿐이다:
+//
+//   ① 접두사 우선순위 — `seam:links` 가 `seam:` 보다 먼저 걸려야 한다.
+//      `DESIGN_LAYERS` 의 **순서를 바꾸는 것만으로** "봉제선 끄기" 가 대응선
+//      까지 끈다. 화면은 그럴듯해서 눈으로는 못 잡는다.
+//   ② `build()` 뒤 상태 유지 — 새 객체에 꺼짐을 다시 안 입히면, 씬을 다시
+//      로드할 때 **체크박스는 꺼져 있는데 선은 보이는** 화면이 된다. 두 번
+//      로드해야 드러나므로 사람이 발견하기 가장 나쁜 모양이다.
+//
+// DOM 을 안 쓰므로 워커도 GPU 도 필요 없다.
+
+/** 실제 응답과 같은 모양의 최소 씬. **이름이 진짜와 같아야** 접두사를 본다 */
+function fakeDesign2D(): Parameters<Design2DLayer['build']>[0] {
+  const line = (x: number) => ({
+    uuid: `c${x}`,
+    kind: 'outer' as const,
+    isLine: true,
+    cp: [x, 0, x, 1, x, 2, x, 3],
+    pts: [x, 0, x, 3],
+  });
+  return {
+    surfaces: [
+      {
+        uuid: 's1',
+        name: 'pattern 1',
+        curves: [line(0), { ...line(1), kind: 'inner' as const, isLine: false }],
+      },
+    ],
+    seams: [
+      {
+        uuid: 'seam-1',
+        sides: [[{ curve: 'c0', surface: 's1', t0: 0, t1: 1, pts: [0, 0, 0, 3] }], []],
+        links: [[0, 0, 1, 0], [0, 3, 1, 3]],
+        color: [1, 0, 0, 1],
+      },
+      {
+        uuid: 'seam-2',
+        sides: [[{ curve: 'c1', surface: 's1', t0: 1, t1: 0, pts: [1, 0, 1, 3] }], []],
+        links: [[1, 1, 2, 1]],
+        color: null,
+      },
+    ],
+    stitches: [
+      {
+        uuid: 'st-1',
+        surface: 's1',
+        color: [0.4, 0.4, 0.4, 1],
+        curves: [line(2)],
+      },
+    ],
+  };
+}
+
+/** 이름이 `prefix` 로 시작하는 객체들의 `visible` */
+function visibilityOf(layer: Design2DLayer, prefix: string): boolean[] {
+  return layer.group.children
+    .filter((c) => c.name === prefix || c.name.startsWith(prefix))
+    .map((c) => c.visible);
+}
+
+function sectionDesignLayers(): void {
+  section('§14. 재단 도면의 표시 스위치 — 갈래 (D2-e, viewer2d/design.ts)');
+
+  // ── ① 목록 자체 ────────────────────────────────────────────
+  {
+    const keys = DESIGN_LAYERS.map((l) => l.key).join(',');
+    check('갈래가 6개다', DESIGN_LAYERS.length === 6, keys);
+    check(
+      '키가 서로 다르다 (같으면 스위치 하나가 다른 것을 덮는다)',
+      new Set(DESIGN_LAYERS.map((l) => l.key)).size === DESIGN_LAYERS.length,
+      keys,
+    );
+    check(
+      '갈래마다 글자가 있다 (빈 체크박스가 서지 않는다)',
+      DESIGN_LAYERS.every((l) => l.label.trim().length > 0),
+      DESIGN_LAYERS.map((l) => l.label).join(' / '),
+    );
+
+    // ★★★ 이 절의 핵심. 순서가 뒤집히면 화면은 멀쩡한데 스위치가 거짓말한다
+    const iLinks = DESIGN_LAYERS.findIndex((l) => l.key === 'links');
+    const iSeams = DESIGN_LAYERS.findIndex((l) => l.key === 'seams');
+    check(
+      '★★★ `links` 가 `seams` 보다 **먼저** 온다 — `seam:links` 가 `seam:` 에 먼저 먹히면 안 된다',
+      iLinks >= 0 && iSeams >= 0 && iLinks < iSeams,
+      `links=${iLinks} seams=${iSeams}`,
+    );
+    check(
+      '대조군: 두 접두사가 실제로 포함 관계다 (그래서 순서가 문제가 된다)',
+      'seam:links'.startsWith(DESIGN_LAYERS[iSeams]!.prefix)
+      && DESIGN_LAYERS[iLinks]!.prefix === 'seam:links',
+      `${DESIGN_LAYERS[iSeams]!.prefix} ⊃ ${DESIGN_LAYERS[iLinks]!.prefix}`,
+    );
+  }
+
+  // ── ② 기본값과 갈래별 독립 ─────────────────────────────────
+  {
+    const layer = new Design2DLayer();
+    layer.build(fakeDesign2D());
+
+    check(
+      '처음엔 전부 켜져 있다',
+      layer.layers.every((l) => l.on) && layer.group.children.every((c) => c.visible),
+      layer.layers.map((l) => `${l.key}:${l.on ? 'on' : 'off'}`).join(' '),
+    );
+
+    // ★★★ 봉제선을 꺼도 대응선은 살아야 한다
+    layer.setLayerVisible('seams', false);
+    const seamCurves = layer.group.children
+      .filter((c) => c.name.startsWith('seam:') && c.name !== 'seam:links');
+    check(
+      '★★★ "봉제선" 을 꺼도 **대응선은 살아 있다** (접두사 우선순위가 실제로 먹는다)',
+      seamCurves.length > 0 && seamCurves.every((c) => !c.visible)
+      && visibilityOf(layer, 'seam:links').every((v) => v),
+      `봉제선 ${seamCurves.filter((c) => !c.visible).length}/${seamCurves.length} 숨김 · 대응선 ${visibilityOf(layer, 'seam:links').join(',')}`,
+    );
+
+    layer.setLayerVisible('seams', true);
+    layer.setLayerVisible('links', false);
+    check(
+      '★★ 거꾸로도 성립한다 — 대응선만 꺼지고 봉제선은 보인다',
+      visibilityOf(layer, 'seam:links').every((v) => !v)
+      && seamCurves.every((c) => c.visible),
+      `대응선 ${visibilityOf(layer, 'seam:links').join(',')} · 봉제선 보임 ${seamCurves.filter((c) => c.visible).length}`,
+    );
+    layer.setLayerVisible('links', true);
+
+    // 나머지 갈래가 서로를 안 건드리는지. 하나씩 끄고 **다른 것들이 다 켜져
+    // 있는지**를 본다 — "꺼졌다" 만 보면 전부 끄는 구현도 통과한다.
+    for (const target of DESIGN_LAYERS) {
+      layer.setLayerVisible(target.key, false);
+      const others = DESIGN_LAYERS.filter((l) => l.key !== target.key);
+      const bleed = others.filter((o) => visibilityOf(layer, o.prefix).some((v) => !v));
+      // ⚠️ `seams`(`seam:`)를 끌 때 `links`(`seam:links`)가 같이 걸리는 것은
+      //    위에서 이미 봤으므로 여기서는 접두사 포함 관계를 뺀다.
+      const real = bleed.filter((o) => !o.prefix.startsWith(target.prefix) && !target.prefix.startsWith(o.prefix));
+      check(
+        `${target.label} 만 꺼진다 (다른 갈래로 안 번진다)`,
+        real.length === 0,
+        real.length === 0 ? '번짐 없음' : `번짐: ${real.map((o) => o.key).join(',')}`,
+      );
+      layer.setLayerVisible(target.key, true);
+    }
+
+    check(
+      '전부 되돌리면 다시 다 보인다',
+      layer.group.children.every((c) => c.visible),
+      `${layer.group.children.filter((c) => c.visible).length}/${layer.group.children.length}`,
+    );
+  }
+
+  // ── ③ ★ `build()` 를 다시 해도 꺼짐이 유지된다 ──────────────
+  //
+  // 씬 재로드가 이 경로다. 안 지켜지면 체크박스와 화면이 갈라지는데, 두 번
+  // 로드해야 드러나므로 사람이 발견하기 가장 나쁜 모양이다.
+  {
+    const layer = new Design2DLayer();
+    layer.build(fakeDesign2D());
+    layer.setLayerVisible('links', false);
+    layer.setLayerVisible('vertices', false);
+
+    // 씬을 다시 로드한 셈
+    layer.build(fakeDesign2D());
+
+    check(
+      '★★★ 다시 build() 해도 꺼 뒀던 갈래가 그대로 꺼져 있다 (재로드 때 체크박스와 안 갈라진다)',
+      visibilityOf(layer, 'seam:links').every((v) => !v)
+      && visibilityOf(layer, 'vertices:').every((v) => !v),
+      `대응선 ${visibilityOf(layer, 'seam:links').join(',')} · 제어점 ${visibilityOf(layer, 'vertices:').join(',')}`,
+    );
+    check(
+      '★★ 상태 표도 그대로다 (화면이 읽는 값이 사실과 같다)',
+      !layer.isLayerVisible('links') && !layer.isLayerVisible('vertices')
+      && layer.isLayerVisible('outer'),
+      layer.layers.map((l) => `${l.key}:${l.on ? 'on' : 'off'}`).join(' '),
+    );
+    check(
+      '대조군: 안 껐던 갈래는 다시 세운 뒤에도 보인다 (전부 꺼 버리는 구현이 아니다)',
+      visibilityOf(layer, 'curves:outer').every((v) => v),
+      visibilityOf(layer, 'curves:outer').join(','),
+    );
+
+    // `clear()` 는 상태를 지우지 않는다 — 씬을 내렸다 다시 올려도 사용자가
+    // 꺼 둔 것은 그대로여야 한다.
+    layer.clear();
+    layer.build(fakeDesign2D());
+    check(
+      '★★ clear() → build() 를 지나도 꺼짐이 살아남는다 (씬 내림 → 재로드)',
+      visibilityOf(layer, 'seam:links').every((v) => !v),
+      visibilityOf(layer, 'seam:links').join(','),
+    );
+  }
+
+  // ── ④ 색 폴백 ──────────────────────────────────────────────
+  //
+  // 엔진 색이 정본이고 우리 팔레트는 폴백이다(D2-d). 뒤집히면 화면이
+  // 데스크톱과 다른 색을 내는데, 그 차이는 눈으로 못 가른다.
+  {
+    const layer = new Design2DLayer();
+    layer.build(fakeDesign2D());
+    const s1 = layer.group.children.find((c) => c.name === 'seam:seam-1') as { material?: { color?: { getHex(): number } } } | undefined;
+    const s2 = layer.group.children.find((c) => c.name === 'seam:seam-2') as { material?: { color?: { getHex(): number } } } | undefined;
+    check(
+      '★★ 엔진이 색을 주면 그 색을 쓴다 (빨강 [1,0,0])',
+      s1?.material?.color?.getHex() === 0xff0000,
+      `#${(s1?.material?.color?.getHex() ?? 0).toString(16).padStart(6, '0')}`,
+    );
+    check(
+      '★ 색이 null 이면 폴백 팔레트로 떨어진다 (빨강이 아니다)',
+      s2?.material?.color !== undefined && s2.material.color.getHex() !== 0xff0000,
+      `#${(s2?.material?.color?.getHex() ?? 0).toString(16).padStart(6, '0')}`,
+    );
+  }
+}
+
 function sectionSideTabs(): void {
   section('§13. 오른쪽 칸의 탭 — 판단 (L-3c, panels/sideTabs.ts)');
 
@@ -8583,6 +8806,9 @@ async function main(): Promise<void> {
   // 그리기(§13-2)뿐이라 즉시 끝난다.
   sectionSideTabs();
   sectionSideTabsDom();
+  // D2-e 재단 도면의 표시 스위치. DOM 도 워커도 안 쓴다 — 깨지면 조용한
+  // 두 가지(접두사 우선순위 · 재로드 후 상태 유지)만 좁게 본다.
+  sectionDesignLayers();
   await sectionZombies();
 
   clearInterval(keepAlive);

@@ -50,6 +50,8 @@ export { Viewer2D, type Viewer2DOptions } from './viewer2d.ts';
  */
 export {
   Design2DLayer,
+  DESIGN_LAYERS,
   seamColor,
   type Design2DLayerView,
+  type DesignLayerKey,
 } from './design.ts';
