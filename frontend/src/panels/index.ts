@@ -84,3 +84,14 @@ export {
   type SurfaceRow,
   type SurfaceSizeView,
 } from './surfaceSize.ts';
+
+export {
+  DEFAULT_SIDE_TAB,
+  isSideTabId,
+  SIDE_TABS,
+  SideTabsPanel,
+  type SideTabDef,
+  type SideTabId,
+  type SideTabItem,
+  type SideTabsView,
+} from './sideTabs.ts';

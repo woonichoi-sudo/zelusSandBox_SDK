@@ -28,3 +28,8 @@ export {
   SurfacePanel,
   type SurfacePanelOptions,
 } from './surfacePanel.ts';
+
+export {
+  SideTabs,
+  type SideTabsOptions,
+} from './sideTabs.ts';

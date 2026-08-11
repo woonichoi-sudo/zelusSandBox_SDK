@@ -41,6 +41,7 @@
 
 import {
   AvatarBodyPanel,
+  SideTabsPanel,
   SurfaceSizePanel,
   PlaybackController,
   shortcutFor,
@@ -57,7 +58,7 @@ import {
   uploadScene,
   type SceneSummary,
 } from './protocol/index.ts';
-import { AvatarPanel, ParamsPanel, SurfacePanel } from './ui/index.ts';
+import { AvatarPanel, ParamsPanel, SideTabs, SurfacePanel } from './ui/index.ts';
 import { Unfolder, UnfoldController, Viewer2D } from './viewer2d/index.ts';
 import {
   FrameStream,
@@ -108,8 +109,12 @@ const ui = {
   paramsBadge: el<HTMLElement>('paramsBadge'),
   // 아바타 체형 패널이 그려질 오른쪽 칸 (L-3a)
   avatarPanel: el<HTMLElement>('avatarPanel'),
-  // 옷 사이즈 패널 (L-3b). 같은 칸의 체형 아래에 이어 붙는다
+  // 옷 사이즈 패널 (L-3b). 같은 칸의 두 번째 탭이다
   surfacePanel: el<HTMLElement>('surfacePanel'),
+  // 오른쪽 칸의 탭 바 (L-3c). 버튼은 `ui/sideTabs.ts` 가 만든다
+  sideTabs: el<HTMLElement>('sideTabs'),
+  // 탭 전환 시 위치를 기억·복원할 스크롤 상자
+  sideScroll: el<HTMLElement>('sideScroll'),
   // 2D 펼침 (#15-b). 슬라이더 하나와 글자 두 자리 — 판단은 `viewer2d/` 다.
   unfold: el<HTMLInputElement>('unfold'),
   unfoldStat: el<HTMLElement>('unfoldStat'),
@@ -475,6 +480,23 @@ async function applySurfaceSize(uuid: string): Promise<void> {
   }
   surfacePanel.render();
 }
+
+// ── 오른쪽 칸의 탭 (L-3c) ───────────────────────────────────
+//
+// 껍데기만이다. 두 패널의 내용은 위 배선이 그대로 그리고, 이 아래는 **어느
+// 상자가 보이는지**만 정한다.
+//
+// ★ 갱신을 탭에 매달지 않는다. `refreshAvatarBody()`·`refreshSurfaces()` 는
+//   탭과 무관하게 씬마다 둘 다 돈다 — 숨은 탭을 안 그리면 "탭을 한 번 눌러야
+//   값이 맞는" 화면이 되고, 그건 화면이 잠깐 거짓말을 하는 상태다. 왕복이
+//   로드당 두 번뿐이라 아낄 값어치가 없다.
+// 탭 위젯은 스스로 굴러간다 — 클릭 → `SideTabsPanel.select()` → 가시성이
+// 닫힌 고리라 바깥에서 부를 일이 없다. 그래서 참조를 남기지 않는다.
+new SideTabs({
+  root: ui.sideTabs,
+  scroll: ui.sideScroll,
+  panel: new SideTabsPanel(),
+});
 
 // ── 재생 컨트롤 (#14) ───────────────────────────────────────
 //

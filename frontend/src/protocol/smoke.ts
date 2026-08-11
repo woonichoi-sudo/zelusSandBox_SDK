@@ -77,6 +77,10 @@ import {
   readParamValues,
   shortcutFor,
   SHORTCUT_HINT,
+  DEFAULT_SIDE_TAB,
+  isSideTabId,
+  SIDE_TABS,
+  SideTabsPanel,
   type ParamField,
   type ParamKey,
   type ParamValue,
@@ -84,7 +88,12 @@ import {
   type PlaybackHooks,
   type PlaybackPort,
   type ShortcutAction,
+  type SideTabsView,
 } from '../panels/index.ts';
+// L-3c 는 판단(`panels/sideTabs.ts`)과 그리기(`ui/sideTabs.ts`)가 갈려 있고,
+// **둘 다** 여기서 본다. 배럴로 가져오는 것은 의도적이다 — Builder 가 이번에
+// `ui/index.ts` 의 재export 를 건드렸으므로 그 줄도 같이 지난다.
+import { SideTabs } from '../ui/index.ts';
 // ★ #15-b 부터는 **제품의 `apply2d` 를 그대로 쓴다.** 15-a 때는 스모크가 자기
 //   사본을 들고 열벡터 규약을 못박았는데, 그러면 사본만 지켜지고 제품이 갈라져도
 //   초록이다. 규약을 못박는 절(§8-12 ⑤)이 제품 함수를 부르게 두면 그 틈이 닫힌다.
@@ -7874,6 +7883,614 @@ async function sectionParamRealWorker(): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────
+// §13. 오른쪽 칸의 탭 (L-3c) — 판단 (panels/sideTabs.ts, DOM 없이)
+//
+// L-3a·L-3b 가 오른쪽 칸에 체형 54행 + 옷 사이즈 24행을 **한 스크롤로 이어**
+// 놓았고, L-3c 가 그것을 탭 둘로 갈랐다. 여기서 못박는 것은 그 가름의 **판단**
+// 이다 — 탭이 몇 개인지 · 어느 상자와 짝인지 · 기본이 무엇인지 · 같은 탭을
+// 다시 눌렀을 때 "바뀌었다" 고 답하지 않는지.
+//
+// 마지막 항목이 이 절에서 제일 무겁다. `SideTabsPanel.select()` 의 반환값이
+// 곧 "스크롤을 저장·복원해도 되는가" 의 답이라, 여기가 참을 헤프게 돌려주면
+// 화면에서는 **같은 탭을 다시 눌렀더니 보던 자리가 튀는** 증상으로만 드러난다.
+// ─────────────────────────────────────────────────────────────
+
+function sectionSideTabs(): void {
+  section('§13. 오른쪽 칸의 탭 — 판단 (L-3c, panels/sideTabs.ts)');
+
+  // ── ① 목록과 짝 ────────────────────────────────────────────
+  {
+    const ids = SIDE_TABS.map((t) => t.id).join(',');
+    check(
+      '탭이 정확히 2개이고 순서가 아바타 → 옷 사이즈다',
+      ids === 'avatar,surface',
+      ids,
+    );
+    const byId = new Map(SIDE_TABS.map((t) => [t.id, t.paneId]));
+    check(
+      '★★ 탭 ↔ 상자의 짝이 못박혀 있다 (뒤바뀌면 아바타 탭에 옷 사이즈가 뜬다)',
+      byId.get('avatar') === 'avatarPanel' && byId.get('surface') === 'surfacePanel',
+      SIDE_TABS.map((t) => `${t.id}→${t.paneId}`).join(' '),
+    );
+    check(
+      '두 탭이 서로 다른 상자를 가리킨다 (같으면 한쪽 내용이 영영 안 보인다)',
+      new Set(SIDE_TABS.map((t) => t.paneId)).size === SIDE_TABS.length,
+      SIDE_TABS.map((t) => t.paneId).join(' / '),
+    );
+    check(
+      '탭마다 글자가 있다 (빈 버튼이 서지 않는다)',
+      SIDE_TABS.every((t) => t.label.trim().length > 0),
+      SIDE_TABS.map((t) => t.label).join(' / '),
+    );
+    check(
+      '★ 기본 탭이 아바타다 — 옷 사이즈는 몸이 정해진 다음의 조정이다',
+      DEFAULT_SIDE_TAB === 'avatar',
+      DEFAULT_SIDE_TAB,
+    );
+    check(
+      '기본 탭이 실제 목록 안에 있다 (없으면 첫 화면에 아무 상자도 안 뜬다)',
+      SIDE_TABS.some((t) => t.id === DEFAULT_SIDE_TAB),
+      DEFAULT_SIDE_TAB,
+    );
+  }
+
+  // ── ② id 판정 ──────────────────────────────────────────────
+  {
+    check(
+      'isSideTabId 가 진짜 id 둘을 받는다',
+      isSideTabId('avatar') && isSideTabId('surface'),
+    );
+    // `avatarPanel`·`surfacePanel` 이 여기 섞여 있는 것이 핵심이다 — 상자 id 와
+    // 탭 id 는 다른 이름 공간인데, 배선에서 헷갈리기 가장 쉬운 자리다.
+    const bogus = [
+      '', ' ', 'Avatar', 'AVATAR', 'avatars', 'surface ',
+      'avatarPanel', 'surfacePanel', 'constructor', '__proto__', 'toString', 'valueOf',
+    ];
+    const wrong = bogus.filter((b) => isSideTabId(b));
+    check(
+      '★★ 대소문자·공백·상자 id·프로토타입 이름은 전부 거짓이다',
+      wrong.length === 0,
+      wrong.length === 0 ? `${bogus.length}개 전부 거부` : `통과해버린 것: ${wrong.join(',')}`,
+    );
+  }
+
+  // ── ③ 마크업과의 대조 ──────────────────────────────────────
+  //
+  // 짝을 `panels/` 가 들고 있어 Node 에서 볼 수 있게 된 대신, **그 문자열이
+  // 실제 마크업과 갈라졌는지**는 여전히 아무도 안 본다. `ui/sideTabs.ts` 의
+  // 생성자가 던지긴 하지만 그건 브라우저를 띄워야 알고, 그 시점엔 오른쪽 칸이
+  // 통째로 안 뜬다. index.html 을 글자로 읽어 그 한 칸을 미리 막는다.
+  {
+    const html = readFileSync(path.join(FRONTEND, 'index.html'), 'utf8');
+    const missing = SIDE_TABS.filter((t) => !html.includes(`id="${t.paneId}"`));
+    check(
+      '★★ 탭이 가리키는 상자가 index.html 에 실재한다 (갈라지면 오른쪽 칸이 통째로 안 뜬다)',
+      missing.length === 0,
+      missing.length === 0
+        ? SIDE_TABS.map((t) => `#${t.paneId}`).join(' ')
+        : `없는 상자: ${missing.map((t) => t.paneId).join(',')}`,
+    );
+    check(
+      '★ main.ts 가 찾는 `#sideTabs`·`#sideScroll` 이 index.html 에 있다',
+      html.includes('id="sideTabs"') && html.includes('id="sideScroll"'),
+    );
+    // ⚠️ 탭 바가 **스크롤 상자 안**에 있으면 내용과 함께 굴러 올라가 버린다
+    //    (`SideTabsOptions.root` 의 "스크롤 상자 바깥이어야 한다"). 마크업
+    //    한 줄을 들여 쓰는 것만으로 그렇게 되는데, 위젯 쪽에서는 아무 티도
+    //    안 난다 — 두 상자가 형제인지를 글자로 본다.
+    {
+      const iTabs = html.indexOf('id="sideTabs"');
+      const iScroll = html.indexOf('id="sideScroll"');
+      check(
+        '★★ 탭 바가 스크롤 상자 **바깥**이다 (안에 있으면 바가 내용과 같이 굴러 올라간다)',
+        iTabs > 0 && iScroll > iTabs && html.slice(iTabs, iScroll).includes('</div>'),
+        iTabs > 0 && iScroll > iTabs ? '#sideTabs 가 #sideScroll 앞에서 닫힌다' : `iTabs=${iTabs} iScroll=${iScroll}`,
+      );
+    }
+    // ★ 배선은 Node 가 원리적으로 못 본다 — 하지만 **배선이 통째로 사라진 것**
+    //   만큼은 글자로 잡힌다. 이 다섯 줄이 없으면 위 단언 51개가 전부 초록인
+    //   채로 오른쪽 칸에 탭이 하나도 안 뜬다 (직전 단위에서 겪은 계열이다).
+    {
+      const main = readFileSync(path.join(FRONTEND, 'src/main.ts'), 'utf8');
+      check(
+        '★★ main.ts 가 두 상자를 실제로 집는다 (el(\'sideTabs\')·el(\'sideScroll\'))',
+        main.includes("'sideTabs'") && main.includes("'sideScroll'"),
+      );
+      check(
+        '★★★ main.ts 가 SideTabs 를 세우고 그 둘을 넘긴다 — 배선이 빠지면 스모크는 초록인데 탭이 안 뜬다',
+        /new SideTabs\(\{[\s\S]{0,400}?\}\)/.test(main)
+        && /new SideTabs\(\{[\s\S]{0,400}?root:\s*ui\.sideTabs/.test(main)
+        && /new SideTabs\(\{[\s\S]{0,400}?scroll:\s*ui\.sideScroll/.test(main)
+        && /new SideTabs\(\{[\s\S]{0,400}?panel:\s*new SideTabsPanel\(\)/.test(main),
+      );
+    }
+    // ⚠️ 문구가 아니라 **규칙**을 본다. 브라우저 기본 `[hidden]{display:none}`
+    //    은 작성자 규칙에 지므로, 이 한 줄이 없으면 두 상자에 나중에 `display:`
+    //    가 붙는 순간 탭이 조용히 안 갈린다 (L-2a 에서 실제로 겪었다).
+    check(
+      '★★ index.html 이 `.sidepane[hidden]` 을 display:none 으로 못박는다 (속성만 믿으면 L-2a 재발)',
+      /\.sidepane\[hidden\][^{]*\{[^}]*display\s*:\s*none/.test(html),
+    );
+    // 그 규칙이 걸릴 표식을 붙이는 것은 `ui/sideTabs.ts` 다 — 규칙과 표식이
+    // 서로 다른 파일에 있으므로 이름이 갈라지는지 한 번 본다.
+    check(
+      '★ 그 규칙이 쓰는 클래스 이름을 ui/sideTabs.ts 가 실제로 붙인다',
+      readFileSync(path.join(FRONTEND, 'src/ui/sideTabs.ts'), 'utf8').includes("'sidepane'"),
+    );
+  }
+
+  // ── ④ 상태 전이 ────────────────────────────────────────────
+  {
+    const p = new SideTabsPanel();
+    check('새 패널의 활성 탭이 기본값이다', p.active === DEFAULT_SIDE_TAB, p.active);
+    check(
+      '★★ 다른 탭을 고르면 참을 돌려주고 실제로 바뀐다 (부르는 쪽이 이 참으로 스크롤을 저장한다)',
+      p.select('surface') === true && p.active === 'surface',
+      p.active,
+    );
+    check(
+      '★★★ 같은 탭을 다시 고르면 거짓이다 — 보던 자리가 저장값으로 튀지 않는 근거가 이 한 줄이다',
+      p.select('surface') === false && p.active === 'surface',
+      p.active,
+    );
+    let threw = '';
+    let ret: boolean | null = null;
+    try {
+      ret = p.select('nope');
+    } catch (err: unknown) {
+      threw = messageOf(err);
+    }
+    check(
+      '★★ 모르는 id 는 던지지 않고 거짓이며 활성 탭도 그대로다 (클릭 핸들러가 죽으면 칸 전체가 멎는다)',
+      threw === '' && ret === false && p.active === 'surface',
+      threw ? `던졌다: ${threw}` : `ret=${ret} active=${p.active}`,
+    );
+    check(
+      '★ 프로토타입 이름도 탭이 되지 않는다',
+      ['constructor', '__proto__', 'toString', 'valueOf'].every((k) => p.select(k) === false)
+      && p.active === 'surface',
+      p.active,
+    );
+    p.reset();
+    check('reset() 이 기본 탭으로 되돌린다', p.active === DEFAULT_SIDE_TAB, p.active);
+  }
+
+  // ── ⑤ view ─────────────────────────────────────────────────
+  {
+    const on = (v: SideTabsView): string[] => v.tabs.filter((t) => t.active).map((t) => t.id);
+    const p = new SideTabsPanel();
+    const v = p.view;
+    check('view.active 가 active 와 같다', v.active === p.active, `${v.active} / ${p.active}`);
+    check(
+      'view.tabs 가 SIDE_TABS 와 같은 순서·같은 짝을 그대로 싣는다',
+      v.tabs.map((t) => `${t.id}:${t.paneId}:${t.label}`).join(',')
+      === SIDE_TABS.map((t) => `${t.id}:${t.paneId}:${t.label}`).join(','),
+      v.tabs.map((t) => `${t.id}:${t.paneId}`).join(','),
+    );
+    check(
+      '★★ 켜진 탭이 정확히 하나이고 그것이 active 다 (0 이면 칸이 비고, 2 면 상자가 겹친다)',
+      on(v).length === 1 && on(v)[0] === v.active,
+      `on=[${on(v).join(',')}] active=${v.active}`,
+    );
+    p.select('surface');
+    const v2 = p.view;
+    check(
+      '★★ 탭을 바꿔도 켜진 것은 하나뿐이고 그것이 바뀐 탭이다',
+      on(v2).length === 1 && on(v2)[0] === 'surface',
+      `on=[${on(v2).join(',')}]`,
+    );
+    check(
+      '대조군: 꺼진 탭도 하나 있다 (전부 참을 돌려주는 구현이 아니다)',
+      v2.tabs.filter((t) => !t.active).length === 1,
+      `off=${v2.tabs.filter((t) => !t.active).length}`,
+    );
+    // 뷰를 밖에서 주물러도 상태가 안 흔들린다. `SIDE_TABS` 를 그대로 내보내면
+    // 여기가 무너지고, 화면 한 곳의 실수가 다른 곳까지 옮는다.
+    v2.active = 'avatar';
+    const first = v2.tabs[0];
+    if (first) first.active = true;
+    check(
+      '★ view 를 바깥에서 고쳐도 패널의 상태는 그대로다 (뷰는 사본이다)',
+      p.active === 'surface' && on(p.view).join(',') === 'surface',
+      `active=${p.active} on=[${on(p.view).join(',')}]`,
+    );
+    check(
+      '★ SIDE_TABS 원본도 안 오염됐다',
+      SIDE_TABS.every((t) => !('active' in t)),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// §13-2. 오른쪽 칸의 탭 — 그리기 (ui/sideTabs.ts, 최소 DOM 스텁)
+//
+// ⚠️ **여기는 브라우저가 아니다.** 초록이라고 화면이 맞는다는 뜻은 아니다
+//    (직전 단위에서 결함 12건이 전부 스모크 초록 · 화면 빨강이었다). 반대는
+//    성립한다 — 여기가 빨간불이면 화면도 반드시 틀렸다.
+//
+// 그럼에도 스텁을 세우는 이유는 하나다: L-3c 의 설계 판단 중 **제일 미묘한
+// 것이 DOM 층에 산다**. "스크롤 위치를 탭마다 기억하고, 복원은 render() 뒤에
+// 한다" 는 규칙은 `panels/` 에서 잴 수 없는데, 이걸 안 재면 다음 사람이 두 줄
+// 순서를 바꿔도 아무 자국이 안 남는다.
+//
+// ★ 스텁이 **일부러 정확하게** 흉내내는 것은 `scrollTop` 의 잘림이다. 대입하는
+//   순간 `scrollHeight - clientHeight` 로 잘린다 — 상자가 짧다는 사실이 화면에
+//   드러나는 방식이 바로 이것이고, 이게 없으면 "복원을 render() 앞으로" 라는
+//   결함이 스텁 위에서 아무 자국도 안 남는다. 그래서 아래 ④에 **대조군**을 둬
+//   스텁이 진짜로 자르는지부터 확인한다.
+//
+// 새 의존성(jsdom 등)은 들이지 않는다. `ui/sideTabs.ts` 가 쓰는 DOM 표면은
+// 열 개 남짓이라 그만큼만 흉내낸다.
+// ─────────────────────────────────────────────────────────────
+
+class FakeClassList {
+  readonly #set = new Set<string>();
+  add(...names: string[]): void {
+    for (const n of names) this.#set.add(n);
+  }
+  remove(...names: string[]): void {
+    for (const n of names) this.#set.delete(n);
+  }
+  contains(n: string): boolean {
+    return this.#set.has(n);
+  }
+  toggle(n: string, force?: boolean): boolean {
+    const on = force ?? !this.#set.has(n);
+    if (on) this.#set.add(n);
+    else this.#set.delete(n);
+    return on;
+  }
+  get list(): string[] {
+    return [...this.#set];
+  }
+  reset(value: string): void {
+    this.#set.clear();
+    for (const n of value.split(/\s+/).filter(Boolean)) this.#set.add(n);
+  }
+}
+
+class FakeEl {
+  readonly tag: string;
+  id = '';
+  type = '';
+  textContent = '';
+  hidden = false;
+  tabIndex = 0;
+  /** 스텁 전용: 이 상자가 보일 때 차지하는 높이 */
+  contentHeight = 0;
+  /** 스텁 전용: 스크롤 상자의 보이는 높이 */
+  clientHeight = 0;
+  readonly children: FakeEl[] = [];
+  readonly attrs = new Map<string, string>();
+  readonly classList = new FakeClassList();
+  readonly #clicks: Array<() => void> = [];
+  #scrollTop = 0;
+
+  constructor(tag: string) {
+    this.tag = tag;
+  }
+
+  get className(): string {
+    return this.classList.list.join(' ');
+  }
+  set className(v: string) {
+    this.classList.reset(v);
+  }
+
+  /** 보이는 자식만 높이에 든다 — `hidden` 이 곧 레이아웃이다 */
+  get scrollHeight(): number {
+    return this.children.reduce((s, c) => s + (c.hidden ? 0 : c.contentHeight), 0);
+  }
+  get maxScroll(): number {
+    return Math.max(0, this.scrollHeight - this.clientHeight);
+  }
+  get scrollTop(): number {
+    return Math.min(this.#scrollTop, this.maxScroll);
+  }
+  /** ★ 브라우저와 같이 **대입하는 순간** 잘린다 */
+  set scrollTop(v: number) {
+    this.#scrollTop = Math.min(Math.max(0, v), this.maxScroll);
+  }
+
+  setAttribute(n: string, v: string): void {
+    this.attrs.set(n, String(v));
+  }
+  getAttribute(n: string): string | null {
+    return this.attrs.get(n) ?? null;
+  }
+  append(...kids: FakeEl[]): void {
+    this.children.push(...kids);
+  }
+  addEventListener(type: string, fn: () => void): void {
+    if (type === 'click') this.#clicks.push(fn);
+  }
+  click(): void {
+    for (const fn of [...this.#clicks]) fn();
+  }
+}
+
+interface FakeDom {
+  /** `#sideTabs` — 버튼이 붙을 자리 */
+  tabs: FakeEl;
+  /** `#sideScroll` — 위치를 기억·복원할 상자 */
+  scroll: FakeEl;
+  panes: Map<string, FakeEl>;
+  buttons(): FakeEl[];
+}
+
+/** `document` 를 잠깐 갈아끼운다. **반드시** 원복한다 */
+function withFakeDom<T>(paneIds: readonly string[], fn: (dom: FakeDom) => T): T {
+  const registry = new Map<string, FakeEl>();
+  const scroll = new FakeEl('div');
+  scroll.id = 'sideScroll';
+  const tabs = new FakeEl('div');
+  tabs.id = 'sideTabs';
+  const panes = new Map<string, FakeEl>();
+  for (const id of paneIds) {
+    const p = new FakeEl('div');
+    p.id = id;
+    registry.set(id, p);
+    panes.set(id, p);
+    scroll.append(p);
+  }
+  const g = globalThis as unknown as Record<string, unknown>;
+  const had = 'document' in g;
+  const prev = g['document'];
+  g['document'] = {
+    getElementById: (id: string): FakeEl | null => registry.get(id) ?? null,
+    createElement: (tag: string): FakeEl => new FakeEl(tag),
+  };
+  try {
+    return fn({ tabs, scroll, panes, buttons: () => tabs.children });
+  } finally {
+    if (had) g['document'] = prev;
+    else delete g['document'];
+  }
+}
+
+function makeSideTabs(dom: FakeDom, onChange?: (id: string) => void): SideTabs {
+  const opts = {
+    root: dom.tabs as unknown as HTMLElement,
+    scroll: dom.scroll as unknown as HTMLElement,
+    panel: new SideTabsPanel(),
+    ...(onChange ? { onChange } : {}),
+  };
+  return new SideTabs(opts);
+}
+
+function sectionSideTabsDom(): void {
+  section('§13-2. 오른쪽 칸의 탭 — 버튼·가시성·스크롤 (L-3c, ui/sideTabs.ts)');
+  const paneIds = SIDE_TABS.map((t) => t.paneId);
+
+  // ── ① 첫 그림 ──────────────────────────────────────────────
+  withFakeDom(paneIds, (dom) => {
+    const seen: string[] = [];
+    makeSideTabs(dom, (id) => seen.push(id));
+
+    const btns = dom.buttons();
+    check(
+      '탭 버튼이 탭 수만큼 생기고 글자가 목록 순서와 같다',
+      btns.length === SIDE_TABS.length
+      && btns.map((b) => b.textContent).join(',') === SIDE_TABS.map((t) => t.label).join(','),
+      btns.map((b) => b.textContent).join(' / '),
+    );
+    check(
+      '탭 바가 tablist 이고 버튼이 전부 tab 이다',
+      dom.tabs.getAttribute('role') === 'tablist'
+      && btns.every((b) => b.getAttribute('role') === 'tab'),
+    );
+    check(
+      '★ 버튼의 aria-controls 가 짝 상자를 가리키고, 상자는 그 버튼을 되가리킨다',
+      SIDE_TABS.every((t, i) => {
+        const b = btns[i];
+        const p = dom.panes.get(t.paneId);
+        return !!b && !!p
+          && b.getAttribute('aria-controls') === t.paneId
+          && p.getAttribute('role') === 'tabpanel'
+          && p.getAttribute('aria-labelledby') === b.id;
+      }),
+      btns.map((b) => `${b.id}→${b.getAttribute('aria-controls')}`).join(' '),
+    );
+    check(
+      '★ 두 상자에 `sidepane` 표식이 붙는다 (index.html 의 display:none 규칙이 걸릴 자리)',
+      [...dom.panes.values()].every((p) => p.classList.contains('sidepane')),
+    );
+
+    const shown = (): string[] => [...dom.panes.entries()].filter(([, p]) => !p.hidden).map(([id]) => id);
+    check(
+      '★★ 처음엔 아바타 상자만 보인다 (기본 탭이 곧 보이는 상자다)',
+      shown().join(',') === 'avatarPanel',
+      `보이는 것: [${shown().join(',')}]`,
+    );
+    check(
+      '★ 켜진 버튼이 정확히 하나이고 aria-selected 도 하나다',
+      btns.filter((b) => b.classList.contains('on')).length === 1
+      && btns.filter((b) => b.getAttribute('aria-selected') === 'true').length === 1
+      && btns[0]?.classList.contains('on') === true,
+      btns.map((b) => `${b.textContent}:${b.getAttribute('aria-selected')}`).join(' '),
+    );
+    check(
+      '★ 켜진 버튼만 tabIndex 0 이고 나머지는 -1 이다 (비활성으로 만들면 키보드로 못 넘어간다)',
+      btns.map((b) => b.tabIndex).join(',') === '0,-1',
+      btns.map((b) => b.tabIndex).join(','),
+    );
+    check(
+      '생성만으로는 onChange 가 울리지 않는다',
+      seen.length === 0,
+      `[${seen.join(',')}]`,
+    );
+
+    // ── ② 클릭 ───────────────────────────────────────────────
+    const surfaceBtn = btns[1];
+    surfaceBtn?.click();
+    check(
+      '★★★ 옷 사이즈 버튼을 누르면 **그 짝 상자만** 보인다 (짝이 뒤바뀌면 여기서 갈린다)',
+      shown().join(',') === 'surfacePanel',
+      `보이는 것: [${shown().join(',')}]`,
+    );
+    check(
+      '★★ 보이는 상자는 언제나 하나다 (둘 다 뜨면 겹치고, 하나도 없으면 칸이 빈다)',
+      shown().length === 1,
+      `${shown().length}개`,
+    );
+    check(
+      '버튼 표식도 같이 넘어간다 (.on · aria-selected · tabIndex)',
+      btns[1]?.classList.contains('on') === true && btns[0]?.classList.contains('on') === false
+      && btns[1]?.getAttribute('aria-selected') === 'true'
+      && btns[0]?.getAttribute('aria-selected') === 'false'
+      && btns.map((b) => b.tabIndex).join(',') === '-1,0',
+      btns.map((b) => `${b.textContent}:${b.tabIndex}`).join(' '),
+    );
+    check(
+      'onChange 가 바뀐 탭 id 로 한 번 울렸다',
+      seen.join(',') === 'surface',
+      `[${seen.join(',')}]`,
+    );
+    surfaceBtn?.click();
+    check(
+      '★★ 같은 버튼을 다시 눌러도 onChange 가 또 울리지 않는다 (안 바뀌었으므로)',
+      seen.join(',') === 'surface',
+      `[${seen.join(',')}]`,
+    );
+    btns[0]?.click();
+    check(
+      '아바타로 되돌아온다 (왕복이 된다)',
+      shown().join(',') === 'avatarPanel' && seen.join(',') === 'surface,avatar',
+      `보이는 것: [${shown().join(',')}] onChange=[${seen.join(',')}]`,
+    );
+  });
+
+  // ── ③ 마크업이 어긋나면 ────────────────────────────────────
+  withFakeDom(['avatarPanel'], (dom) => {
+    let msg = '';
+    try {
+      makeSideTabs(dom);
+    } catch (err: unknown) {
+      msg = messageOf(err);
+    }
+    check(
+      '★★ 상자가 없으면 생성자가 던진다 — 탭만 있고 내용이 없는 칸을 조용히 만들지 않는다',
+      msg !== '' && msg.includes('surfacePanel'),
+      msg || '(던지지 않았다)',
+    );
+  });
+
+  // ── ④ 스크롤 기억 ──────────────────────────────────────────
+  //
+  // 아바타는 슬라이더 29 + 치수 25 로 길고 옷 사이즈는 24행으로 짧다. 그
+  // **길이 차이**가 이 절이 존재하는 이유다 — 짧은 탭에서 긴 탭으로 돌아올 때
+  // 복원 순서가 틀리면 그때만 자국이 남는다.
+  withFakeDom(paneIds, (dom) => {
+    dom.scroll.clientHeight = 400;
+    const avatarPane = dom.panes.get('avatarPanel');
+    const surfacePane = dom.panes.get('surfacePanel');
+    if (avatarPane) avatarPane.contentHeight = 2_000; // 체형 54행
+    if (surfacePane) surfacePane.contentHeight = 600; // 옷 사이즈 24행
+    const w = makeSideTabs(dom);
+
+    // 대조군 ⓐ — 스텁이 정말로 브라우저처럼 자르는가. 이걸 먼저 확인하지
+    // 않으면 아래 ★★★ 이 "복원을 앞으로 옮겨도 초록" 인 이빨 없는 단언이 된다.
+    dom.scroll.scrollTop = 99_999;
+    check(
+      '대조군: 긴 탭(2000)에서는 1600 까지만 내려간다 — 스텁이 브라우저의 잘림을 흉내낸다',
+      dom.scroll.scrollTop === 1_600,
+      `${dom.scroll.scrollTop}`,
+    );
+
+    dom.scroll.scrollTop = 800;
+    check('전제: 아바타 탭에서 800 까지 내려가 있다', dom.scroll.scrollTop === 800, `${dom.scroll.scrollTop}`);
+
+    w.select('surface');
+    check(
+      '★★ 처음 여는 탭은 0 에서 시작한다 (직전 탭의 위치를 물려받지 않는다)',
+      dom.scroll.scrollTop === 0,
+      `${dom.scroll.scrollTop}`,
+    );
+
+    // 대조군 ⓑ — 짧은 탭에서는 200 이 천장이다. 즉 800 은 이 상태에서 대입하면
+    // 반드시 200 으로 잘린다 → 복원이 render() 앞이면 아래 ★★★ 이 빨간불이 된다.
+    dom.scroll.scrollTop = 99_999;
+    check(
+      '대조군: 짧은 탭(600)에서는 200 까지만 내려간다 (800 을 여기서 대입하면 잘린다)',
+      dom.scroll.scrollTop === 200,
+      `${dom.scroll.scrollTop}`,
+    );
+
+    dom.scroll.scrollTop = 150;
+    check('전제: 옷 사이즈 탭에서 150 까지 내려가 있다', dom.scroll.scrollTop === 150, `${dom.scroll.scrollTop}`);
+
+    w.select('avatar');
+    check(
+      '★★★ 돌아오면 떠날 때 보던 자리(800)가 그대로다 — 복원이 render() **뒤**라서 짧은 탭 높이에 안 잘린다',
+      dom.scroll.scrollTop === 800,
+      `${dom.scroll.scrollTop}`,
+    );
+
+    w.select('surface');
+    check(
+      '★★ 반대쪽도 각자 기억한다 (두 탭이 값 하나를 나눠 쓰지 않는다)',
+      dom.scroll.scrollTop === 150,
+      `${dom.scroll.scrollTop}`,
+    );
+
+    dom.scroll.scrollTop = 40;
+    w.select('surface');
+    check(
+      '★★★ 같은 탭을 다시 눌러도 보던 자리가 안 튄다 (저장·복원은 실제로 바뀔 때만)',
+      dom.scroll.scrollTop === 40,
+      `${dom.scroll.scrollTop}`,
+    );
+
+    w.select('avatar');
+    check(
+      '★★ 재클릭 뒤에도 기억이 안 망가졌다 (아바타는 여전히 800)',
+      dom.scroll.scrollTop === 800,
+      `${dom.scroll.scrollTop}`,
+    );
+    w.select('surface');
+    check(
+      '★★ 재클릭 직전에 보던 40 이 옷 사이즈의 새 기억이다 (150 이 아니다)',
+      dom.scroll.scrollTop === 40,
+      `${dom.scroll.scrollTop}`,
+    );
+  });
+
+  // ── ⑤ onChange 가 보는 상태 ────────────────────────────────
+  //
+  // ★ 돌연변이 검증에서 **아무 단언도 안 잡던 자리**라 뒤늦게 못박는다.
+  //   `onChange` 를 복원보다 **먼저** 울리게 바꿔도 54건이 전부 초록이었다.
+  //
+  // 지금은 `main.ts` 가 `onChange` 를 넘기지 않아 화면에 자국이 안 남지만,
+  // 바깥이 이 콜백 안에서 스크롤 위치를 읽거나 패널을 다시 그리기 시작하는
+  // 순간 순서가 곧 정확성이 된다 — 복원보다 먼저 울리면 핸들러가 **떠나기 전
+  // 탭의 자리**(그것도 짧은 탭 높이로 잘린 값)를 보고 판단한다. 두 줄의
+  // 순서라 다음 사람이 뒤집어도 아무 데서도 안 걸린다.
+  withFakeDom(paneIds, (dom) => {
+    dom.scroll.clientHeight = 400;
+    const avatarPane = dom.panes.get('avatarPanel');
+    const surfacePane = dom.panes.get('surfacePanel');
+    if (avatarPane) avatarPane.contentHeight = 2_000;
+    if (surfacePane) surfacePane.contentHeight = 600;
+    const seenAt: number[] = [];
+    const w = makeSideTabs(dom, () => seenAt.push(dom.scroll.scrollTop));
+
+    dom.scroll.scrollTop = 800;
+    w.select('surface'); // 처음 여는 탭 → 0
+    w.select('avatar'); // 돌아오면 800
+    check(
+      '★★ onChange 는 스크롤 복원이 **끝난 뒤** 울린다 (핸들러가 떠난 탭의 자리를 보지 않는다)',
+      seenAt.join(',') === '0,800',
+      `[${seenAt.join(',')}]`,
+    );
+  });
+
+  check(
+    '스텁 DOM 을 원복했다 (뒤 절이 가짜 document 를 물려받지 않는다)',
+    !('document' in (globalThis as unknown as Record<string, unknown>)),
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
 // §9. 좀비 프로세스
 // ─────────────────────────────────────────────────────────────
 
@@ -7962,6 +8579,10 @@ async function main(): Promise<void> {
   sectionParamDisabled();
   sectionParamPayload();
   await sectionParamRealWorker();
+  // L-3c 오른쪽 칸의 탭. 워커가 필요 없다 — 판단(§13)과 스텁 DOM 위의
+  // 그리기(§13-2)뿐이라 즉시 끝난다.
+  sectionSideTabs();
+  sectionSideTabsDom();
   await sectionZombies();
 
   clearInterval(keepAlive);

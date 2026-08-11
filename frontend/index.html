@@ -135,15 +135,54 @@
         이 상자의 `overflow-y: auto` 가 제대로 발동한다.
       */
       /*
-        오른쪽 칸의 스크롤 상자. **패널 둘이 이 안에서 이어진다** — 체형(L-3a)과
-        옷 사이즈(L-3b)를 각자 스크롤시키면 짧은 창에서 둘 다 두세 줄만 보인다.
-        하나로 굴리면 "몸을 키웠더니 옷이 안 맞는다" 를 한 흐름으로 훑는다.
+        ── 오른쪽 칸의 탭 (L-3c) ───────────────────────────────────
+        원래는 체형(L-3a)과 옷 사이즈(L-3b)가 **한 스크롤 안에 이어져** 있었다.
+        78행(슬라이더 29 + 치수 25 + 패턴 24)이 한 줄로 서면 아래쪽 옷 사이즈는
+        사실상 안 보인다 — 막대가 짧아져 "더 있다" 는 신호조차 흐려진다.
+        탭으로 가르면 두 목록이 각자 온전한 스크롤을 갖는다.
+
+        ★ **스크롤 주인이 바뀌었다.** `#sideScroll` 이 `position: absolute;
+          inset: 0` 로 칸을 통째로 덮고 있었는데, 그 상태로 탭 바를 안에 넣으면
+          바가 내용과 함께 굴러 올라가 버린다. 그래서 칸을 세로 flex 로 만들고
+          바는 `flex: 0 0 auto`(고정), 내용만 `flex: 1`(스크롤)로 나눈다.
+          `min-height: 0` 이 없으면 flex 아이템의 기본 최소 크기가 내용
+          높이가 되어 **스크롤이 아예 안 생긴다** — `.cell` 의 것과 같은 함정이
+          한 층 안쪽에서 되풀이된다.
       */
+      #sidePanel { display: flex; flex-direction: column; }
+
+      #sideTabs {
+        flex: 0 0 auto;
+        display: flex; gap: 0.25rem;
+        padding: 0.4rem 0.5rem 0;
+        border-bottom: 1px solid #2c333f;
+        background: #1a1e25;
+      }
+      /* 탭은 버튼이지만 상단 바의 버튼처럼 보이면 안 된다 — 누르는 것이 아니라
+         "지금 어디에 있는가" 를 말하는 물건이다 */
+      .stab {
+        font: inherit; font-size: 12px; color: inherit; cursor: pointer;
+        background: none; border: none; border-bottom: 2px solid transparent;
+        border-radius: 0; padding: 0.3rem 0.6rem; margin-bottom: -1px;
+        opacity: 0.5;
+      }
+      .stab:hover { background: #232833; opacity: 0.8; }
+      .stab.on { opacity: 1; border-bottom-color: #6d8cff; background: none; }
+
       #sideScroll {
-        position: absolute; inset: 0;
+        flex: 1 1 auto; min-height: 0;
         overflow-y: auto; padding: 0.5rem;
         font-size: 12px;
       }
+      /*
+        ⚠️ **이 한 줄이 없으면 탭이 갈리지 않을 수 있다.** `.todo[hidden]` 과
+           같은 이유다 — 브라우저 기본 `[hidden] { display: none }` 은 작성자
+           규칙에 지므로, 두 상자에 나중에 `display:` 가 붙는 순간 `hidden` 이
+           조용히 무력해진다(L-2a 에서 실제로 겪었다). 속성과 화면이 갈라지면
+           콘솔에는 아무 이상이 없어 보인다. `ui/sideTabs.ts` 가 이 표식을
+           두 상자에 붙인다.
+      */
+      #sideScroll > .sidepane[hidden] { display: none; }
       /* 두 패널이 위젯 규칙을 공유한다 */
       #sideScroll input[type="number"] {
         font: inherit; color: inherit; width: 5rem;
@@ -481,13 +520,30 @@
       ⚠️ 옷 사이즈는 아직 없다. 워커 op(`surfaces`/`setSurfaceSize`)이 다음
          단위이고, 경로는 확인해 뒀다(`ZestManager::UpdateSizeSurface`).
     -->
+    <!--
+      ── 오른쪽 칸의 탭 (L-3c) ────────────────────────────────────
+      두 패널의 **경계가 이미 상자와 맞아떨어진다** — `#avatarPanel` 이 아바타
+      탭, `#surfacePanel` 이 옷 사이즈 탭이다. 그래서 이 단위는 껍데기만
+      만들고 두 패널의 내용에는 손대지 않는다.
+
+      탭 버튼은 `src/ui/sideTabs.ts` 가 만든다(여기 있는 `#sideTabs` 는 빈
+      자리다). 어느 탭이 어느 상자와 짝인지 · 기본이 무엇인지는
+      `src/panels/sideTabs.ts` 가 정한다 — 짝을 마크업이나 배선에 두면
+      Node 에서 확인할 방법이 없어진다.
+    -->
     <div id="sidePanel" class="cell">
+      <!-- ★ 탭 바는 스크롤 상자 **바깥**이다. 안에 넣으면 위 CSS 의
+           `flex: 0 0 auto` 가 아무 일도 못 하고 바가 내용과 같이 굴러 올라간다. -->
+      <div id="sideTabs"></div>
       <div id="sideScroll">
         <div id="avatarPanel"></div>
         <!--
-          옷 사이즈 (L-3b). 아바타 체형 아래에 이어 붙는다 — 사용자가 요청한
-          두 가지가 같은 칸에 있어야 "몸을 키웠더니 옷이 안 맞는다" 를 한
-          화면에서 다룰 수 있다.
+          옷 사이즈 (L-3b). 같은 칸의 두 번째 탭이다 — 사용자가 요청한 두 가지가
+          같은 칸에 있어야 "몸을 키웠더니 옷이 안 맞는다" 를 한 자리에서 다룬다.
+          탭이 갈라도 스크롤 위치를 탭마다 기억하므로 오가는 비용이 작다.
+
+          ⚠️ 두 상자는 `#sideScroll` 의 **직계 자식**으로 남아야 한다 —
+             위 `#sideScroll > .sidepane[hidden]` 규칙이 그 관계에 걸려 있다.
         -->
         <div id="surfacePanel" class="pgroup"></div>
       </div>
