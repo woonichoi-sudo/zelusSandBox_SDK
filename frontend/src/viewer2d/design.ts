@@ -129,13 +129,6 @@ function segmentsObject(
   return line;
 }
 
-/** 폴리라인의 가운데쯤 되는 점. 대응선을 어디서 어디로 그을지 정한다 */
-function midpoint(pts: number[]): [number, number] | null {
-  if (pts.length < 2) return null;
-  const i = Math.floor(pts.length / 4) * 2;   // 점 개수의 절반, 짝수 인덱스
-  return [pts[i]!, pts[i + 1]!];
-}
-
 export interface Design2DLayerView {
   curves: number;
   vertices: number;
@@ -232,23 +225,22 @@ export class Design2DLayer {
     // 잇는다. 실측: 45개 중 42개가 **패턴을 가로지른다** — 그 42개가 참고
     // 이미지에서 길게 뻗은 점선이다.
     const linkVerts: number[] = [];
+    const linkColors: number[] = [];
     let seamCount = 0;
     let linkCount = 0;
 
     d.seams.forEach((seam: Design2DSeam, i: number) => {
-      const color = seamColor(i);
+      // ★ **엔진이 준 색이 정본이다.** 우리 팔레트는 폴백일 뿐이다 —
+      //   실측 22종이고 참고 이미지의 알록달록함이 바로 이 색이다.
+      const color = seam.color && seam.color.length >= 3
+        ? new THREE.Color(seam.color[0]!, seam.color[1]!, seam.color[2]!)
+        : seamColor(i);
       const verts: number[] = [];
-      const ends: Array<[number, number]> = [];
 
       for (const side of seam.sides) {
         for (const part of side) {
           verts.push(...polylineSegments(part.pts, Z.seam));
         }
-        // 측마다 **대표점 하나**를 뽑는다. 파트가 여럿이면 첫 파트를 쓴다 —
-        // 전부 이으면 점선이 그물이 되어 도면을 덮는다.
-        const head = side[0];
-        const m = head ? midpoint(head.pts) : null;
-        if (m) ends.push(m);
       }
 
       const line = segmentsObject(verts, color);
@@ -258,16 +250,27 @@ export class Design2DLayer {
         seamCount++;
       }
 
-      // 양측이 다 있어야 이을 수 있다. 실측에서 "한쪽이 빔" 은 0건이었지만
-      // 그것은 이 씬의 사실이지 계약이 아니다.
-      if (ends.length === 2) {
-        const [a, b] = ends as [[number, number], [number, number]];
-        linkVerts.push(a[0], a[1], Z.link, b[0], b[1], Z.link);
+      // ── 대응선: **개수도 위치도 엔진이 정한다** ───────────
+      //
+      // ⚠️ 여기를 두 번 틀렸다. 처음엔 측마다 중점 하나씩(45줄), 다음엔
+      //    길이 4cm 마다(199줄)로 **지어냈다.** 엔진이 주는 것은 108줄
+      //    (봉제선당 2~4)이고, 데스크톱 `RenderSewingLines` 가 쓰는 값이
+      //    바로 그것이다. 우리가 개수를 정하면 데스크톱과 다른 그림이
+      //    나오는데, 그 차이는 "점선이 좀 많은/적은 것 같다" 로만 보여서
+      //    화면으로는 무엇이 옳은지 못 가른다.
+      for (const L of seam.links ?? []) {
+        if (L.length < 4) continue;
+        linkVerts.push(L[0]!, L[1]!, Z.link, L[2]!, L[3]!, Z.link);
+        // 선분의 양 끝에 같은 색. 정점 색이라 선마다 다른 색이 된다
+        linkColors.push(color.r, color.g, color.b, color.r, color.g, color.b);
         linkCount++;
       }
     });
 
-    const links = segmentsObject(linkVerts, COLOR.link, { dashed: true, opacity: 0.55 });
+    // ⚠️ 봉제선마다 객체를 만들지 않고 **하나로 합친다.** 45개가 각자
+    //    LineSegments 면 드로콜이 그만큼 늘고, 점선 재질은 색만 다를 뿐
+    //    나머지가 같다. 정점 색으로 색을 싣는다.
+    const links = dashedLinks(linkVerts, linkColors);
     if (links) {
       links.name = 'seam:links';
       this.group.add(links);
@@ -322,6 +325,37 @@ function collectControlPoints(c: Design2DCurve, anchors: number[], handles: numb
     handles.push(cp[2]!, cp[3]!, Z.vertex);
     handles.push(cp[4]!, cp[5]!, Z.vertex);
   }
+}
+
+/**
+ * 봉제 대응선 전부를 담은 점선 객체 하나. **색은 정점에 실린다.**
+ *
+ * `LineDashedMaterial` 은 `vertexColors` 를 받으므로 봉제선마다 객체를 나눌
+ * 필요가 없다. 45개를 따로 만들면 드로콜만 늘고 얻는 것이 없다.
+ */
+function dashedLinks(verts: number[], colors: number[]): THREE.LineSegments | null {
+  if (verts.length === 0) return null;
+
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+  geom.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+  const line = new THREE.LineSegments(
+    geom,
+    new THREE.LineDashedMaterial({
+      vertexColors: true,
+      // 흰 종이 위에서 점선이 도면선을 덮지 않을 만큼만 진하다. 그물이라
+      // 불투명하면 패턴이 안 보인다.
+      transparent: true,
+      opacity: 0.75,
+      dashSize: 1.1,
+      gapSize: 1.0,
+    }),
+  );
+  // ⚠️ 이것을 안 부르면 **실선으로 나온다** — 셰이더가 쓰는 정점별 누적
+  //    거리가 여기서 만들어진다.
+  line.computeLineDistances();
+  return line;
 }
 
 /**

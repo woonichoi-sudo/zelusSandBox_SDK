@@ -546,6 +546,49 @@ json ReadDesign2D(ZestManager& manager)
         const ztDesignSeamData* data = qi->GetSeamData(entry.first);
         if (!data) continue;
 
+        // ── ★ 대응점과 색은 **엔진이 정본이다** ───────────────
+        //
+        // 처음엔 여기서 파트를 이어 붙여 길이로 균등 샘플링하고, 색은
+        // 황금각으로 만들어 냈다. 둘 다 발명이었다 — 데스크톱의
+        // `Seam2DRenderer::RenderSewingLines` 를 읽어 보니 엔진에 정본이 있다:
+        //
+        //     seam->GetPositionsForDraw(points0, points1, /*world=*/true);
+        //     for k in [0, min(size0, size1)) : DrawDashedLine(p0[k], p1[k])
+        //     ztColor seamColor = seam->GetColor();
+        //
+        // 우리가 지어낸 값으로 그리면 **데스크톱과 개수도 위치도 색도 다른
+        // 그림**이 나오는데, 그 차이는 "점선이 좀 많은/적은 것 같다" 로만
+        // 보여서 무엇이 옳은지 화면으로는 못 가른다. 실제로 그렇게 두 번
+        // 틀렸다(45줄 → 199줄 → 이것).
+        //
+        // ⚠️ `world=true` 를 넘긴다. 데스크톱과 같은 값이고, 커브를
+        //    `atWorld` 로 싣는 것과 좌표계가 일치해야 한다.
+        json links = json::array();
+        json seamColor;
+
+        // ⚠️ `GetSeamByUuid` 는 **private 이다.** 대신 지금 돌고 있는 이 맵이
+        //    객체를 직접 준다 — 한 번 더 찾을 이유도 없다.
+        if (const ztDesignSeam* seamObj = entry.second.get())
+        {
+            std::vector<ztSeamTessellatedPoint>* pts[2] = { nullptr, nullptr };
+            seamObj->GetPositionsForDraw(pts[0], pts[1], true);
+
+            if (pts[0] && pts[1])
+            {
+                const std::size_t n = (std::min)(pts[0]->size(), pts[1]->size());
+                for (std::size_t k = 0; k < n; ++k)
+                {
+                    const ztDesign2DPoint& a = (*pts[0])[k].point;
+                    const ztDesign2DPoint& b = (*pts[1])[k].point;
+                    if (a.x < -1e30f || a.x > 1e30f || b.x < -1e30f || b.x > 1e30f) continue;
+                    links.push_back(json::array({ a.x, a.y, b.x, b.y }));
+                }
+            }
+
+            const ztColor c = seamObj->GetColor();
+            seamColor = json::array({ c.r, c.g, c.b, c.a });
+        }
+
         json sides = json::array();
         for (const auto& side : data->seam)
         {
@@ -593,6 +636,12 @@ json ReadDesign2D(ZestManager& manager)
         seams.push_back(json{
             { "uuid",  entry.first.GetString() },
             { "sides", sides },
+            // 엔진이 준 대응점 쌍 `[[ax,ay,bx,by], ...]`. 화면은 이 개수만큼
+            // 점선을 긋는다 — 우리가 개수를 정하지 않는다
+            { "links", links },
+            // 엔진이 준 색 `[r,g,b,a]`. 없으면 null 이고, 그때만 화면이
+            // 자기 팔레트로 떨어진다
+            { "color", seamColor.is_null() ? json(nullptr) : seamColor },
         });
     }
 

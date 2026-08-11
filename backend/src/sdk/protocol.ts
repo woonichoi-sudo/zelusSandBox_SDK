@@ -397,6 +397,26 @@ export interface Design2DSeam {
   uuid: string;
   /** 길이 2. 각 측이 파트 여러 개일 수 있다 (실측: 최대 4파트) */
   sides: Design2DSeamPart[][];
+  /**
+   * ★ **대응점 쌍 `[[ax,ay,bx,by], ...]` — 화면은 이 개수만큼 점선을 긋는다.**
+   *
+   * 엔진의 `ztDesignSeam::GetPositionsForDraw(p0, p1, world=true)` 가 준 값이고,
+   * 데스크톱 `Seam2DRenderer::RenderSewingLines` 가 쓰는 바로 그것이다.
+   *
+   * ⚠️ **개수를 화면이 정하면 안 된다.** 실제로 두 번 틀렸다 — 봉제선당
+   *    중점 하나(45줄)는 너무 적고, 길이 4cm마다(199줄)는 너무 많다.
+   *    엔진이 주는 것은 **108줄**(봉제선당 2~4)이다.
+   */
+  links: number[][];
+  /**
+   * ★ 엔진이 준 색 `[r,g,b,a]` (`ztDesignSeam::GetColor`). 실측 **22종**이고
+   * 참고 이미지의 알록달록한 색이 이것이다.
+   *
+   * ⚠️ `.zls` 의 `seams` JSON 에는 색 필드가 없어서 처음에 "색은 데이터에
+   *    없다" 고 잘못 결론지었다 — 스티치만 보고 판단한 탓이다. 객체가 갖고
+   *    있다. null 이면 그때만 화면이 자기 팔레트로 떨어진다.
+   */
+  color: number[] | null;
 }
 
 /**

@@ -36,7 +36,14 @@ const SCENE = 'data/incoming/W_Bra top & Leggings.zls';
 interface Curve { uuid: string; kind: string; isLine: boolean; cp: number[]; pts: number[] }
 interface Surface { uuid: string; name: string; curves: Curve[] }
 interface SeamPart { curve: string; surface: string; t0: number; t1: number; pts: number[] }
-interface Seam { uuid: string; sides: SeamPart[][] }
+interface Seam {
+  uuid: string;
+  sides: SeamPart[][];
+  /** 엔진이 준 대응점 쌍 `[[ax,ay,bx,by], ...]` (`GetPositionsForDraw`) */
+  links: number[][];
+  /** 엔진이 준 색 `[r,g,b,a]` (`ztDesignSeam::GetColor`) */
+  color: number[] | null;
+}
 interface Stitch { uuid: string; surface: string; color: number[]; curves: Curve[] }
 interface Design2D { surfaces: Surface[]; seams: Seam[]; stitches: Stitch[] }
 
@@ -148,10 +155,41 @@ for (const s of d.seams.slice(0, 5)) {
     `  ↔  측1 ${s.sides[1]?.length ?? 0}파트 t[${p1?.t0.toFixed(2)},${p1?.t1.toFixed(2)}]`,
   );
 }
-// 방향 뒤집힘(t0 > t1)이 실제로 있는지. 있으면 화면이 대응선을 그을 때
-// 순서를 뒤집어야 한다 — 없으면 그 코드를 안 써도 된다.
+// 방향 뒤집힘(t0 > t1)이 실제로 있는지.
 const reversed = d.seams.flatMap((s) => s.sides.flat()).filter((p) => p.t0 > p.t1).length;
 console.log(`  방향 뒤집힌 파트(t0 > t1): ${reversed}개`);
+
+// ── ④-2 ★ 엔진이 준 대응점 — 우리가 개수를 정하지 않는다 ────
+//
+// 데스크톱의 Seam2DRenderer::RenderSewingLines 가 쓰는 값이다. 우리가
+// 샘플링을 발명했을 때 45줄(중점 하나) → 199줄(4cm마다)로 두 번 틀렸다.
+// 여기 나오는 수가 데스크톱 화면의 점선 수와 같아야 한다.
+const totalLinks = d.seams.reduce((n, s) => n + (s.links?.length ?? 0), 0);
+const perSeam = d.seams.map((s) => s.links?.length ?? 0);
+console.log(`\n=== ④-2 ★ 엔진이 준 대응점 (GetPositionsForDraw) ===`);
+console.log(`  점선 총 ${totalLinks}줄 · 봉제선당 ${Math.min(...perSeam)}~${Math.max(...perSeam)}줄`);
+console.log(`  (우리가 지어냈을 때: 중점만 45줄 / 4cm마다 199줄)`);
+const noLinks = perSeam.filter((n) => n === 0).length;
+if (noLinks > 0) console.log(`  ⚠️ 대응점이 0인 봉제선 ${noLinks}개 — 화면에서 그 짝은 안 보인다`);
+
+// ── ④-3 ★ 엔진이 준 색 ──────────────────────────────────────
+//
+// 내가 "색은 데이터에 없다" 고 결론 내렸던 것이 틀렸다. 스티치만 보고
+// 판단했는데 ztDesignSeam 이 자기 색을 갖고 있었다.
+const seamColors = new Map<string, number>();
+for (const s of d.seams) {
+  const k = s.color ? s.color.map((v) => v.toFixed(3)).join(',') : 'null';
+  seamColors.set(k, (seamColors.get(k) ?? 0) + 1);
+}
+console.log(`\n=== ④-3 ★ 엔진이 준 봉제선 색 — ${seamColors.size}종 ===`);
+for (const [k, n] of [...seamColors].sort((a, b) => b[1] - a[1]).slice(0, 10)) {
+  console.log(`    [${k}]  ${n}개`);
+}
+console.log(
+  seamColors.size <= 1
+    ? '  ⚠️ 한 종류뿐이다 — 참고 이미지의 여러 색은 여기서 안 나온다. 우리 팔레트가 필요하다'
+    : '  ✅ 여러 종류다 — 참고 이미지의 색이 이것이다. 우리 팔레트는 폴백으로만 쓴다',
+);
 
 // ── ⑤ 스티치 ─────────────────────────────────────────────────
 //
