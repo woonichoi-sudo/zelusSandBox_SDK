@@ -40,3 +40,16 @@ export {
  *    `unfold.ts`·`control.ts` 에 두고 여기에는 그리는 일만 남길 것.
  */
 export { Viewer2D, type Viewer2DOptions } from './viewer2d.ts';
+
+/**
+ * 도면 위의 디자인 정보 (D2-c). **DOM 을 안 쓴다** — `cloth.ts`·`unfold.ts` 와
+ * 같은 층위라 Node 에서 테스트가 붙는다.
+ *
+ * ⚠️ 여기 들어오는 좌표는 **이미 월드다**(워커가 `atWorld` 로 배치를 끝냈다).
+ *    옷 메시와 달리 `transform2d` 를 곱하면 두 번 적용된다.
+ */
+export {
+  Design2DLayer,
+  seamColor,
+  type Design2DLayerView,
+} from './design.ts';

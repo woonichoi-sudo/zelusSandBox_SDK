@@ -458,6 +458,38 @@ async function refreshSurfaces(): Promise<void> {
 }
 
 /**
+ * 재단 도면의 디자인 정보를 읽어 가운데 칸에 세운다 (D2-c).
+ *
+ * ★ **좌표를 다시 변환하지 않는다.** 워커가 `atWorld` 로 배치를 끝낸 값을
+ *   준다 — 같은 칸의 옷 메시는 `unfolder2d` 가 `transform2d` 를 곱해 세우지만
+ *   이쪽에 또 곱하면 두 번 적용된다. 그 증상은 "패턴이 좀 흩어져 보인다" 라서
+ *   원인을 못 찾는다.
+ *
+ * 화각(`fit`)은 **손대지 않는다.** 도면 범위는 이미 `unfolder2d` 가 옷 메시의
+ * 점에서 정했고, 커브는 그 안에 있다. 여기서 다시 맞추면 사용자가 맞춰 둔
+ * 확대가 로드마다 튄다.
+ */
+async function refreshDesign2d(): Promise<void> {
+  if (!currentScene || !client.connected) {
+    viewer2d.design.clear();
+    return;
+  }
+  try {
+    viewer2d.design.build(await client.design2d());
+    const v = viewer2d.design.view;
+    log(
+      `2D 디자인 — 커브 ${v.curves} · 제어점 ${v.vertices} · 봉제선 ${v.seams}`
+      + ` (대응선 ${v.links}) · 스티치 ${v.stitches}`,
+    );
+  } catch (err: unknown) {
+    // 옛 씬의 커브를 남기지 않는다. 남기면 새 패턴 위에 옛 봉제선이 겹쳐서,
+    // 화면만 보면 "도면이 이상하게 그려졌다" 로 보인다.
+    viewer2d.design.clear();
+    log(`2D 디자인 정보를 읽지 못했습니다: ${message(err)}`);
+  }
+}
+
+/**
  * 행 하나를 보낸다.
  *
  * ★ 응답이 **바꾼 뒤의 전체 목록**이라 그대로 부으면 된다. 엔진이 값을
@@ -568,6 +600,9 @@ function clearScene(): void {
   // 가리키지 않는다 (L-2a).
   viewer2d.cloth.clear();
   unfolder2d.clear();
+  // 커브·봉제선도 같이 내린다 (D2-c). 옷만 지우면 **선만 남아 떠 있어서**
+  // 씬이 아직 있는 것처럼 보인다 — 옷 메시와 그룹이 갈려 있는 대가다.
+  viewer2d.design.clear();
   paintDraft2d();
   currentScene = null;
   // 아바타도 씬에 딸려 있다. `currentScene = null` 뒤에 불러야
@@ -914,7 +949,14 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
     //   3D 정점과 무관하기 때문이다(`viewer2d.ts` 머리말).
     unfolder2d.build(viewer2d.cloth.patterns);
     unfolder2d.apply(viewer2d.cloth.patterns, 1);
+    // ★ 면을 흰 종이로 (D2-c). `showScene` 이 재질을 새로 만들므로 **로드마다**
+    //   불러야 한다. 도면에서는 색을 선이 지고 있어서 면까지 칠하면 선이 묻힌다.
+    viewer2d.paperize();
     paintDraft2d();
+    // 디자인 정보 (D2-c). 옷 메시와 달리 **왕복이 따로다** — 커브·봉제선은
+    // 메시가 아니라 디자인 계층에 있고, 실패해도 도면 자체는 서야 하므로
+    // 로드의 성패에 묶지 않는다.
+    void refreshDesign2d();
     // 오른쪽 칸 (L-3a). 아바타는 씬에 딸려 있으므로 씬이 바뀌면 반드시 다시
     // 읽는다 — 안 읽으면 옛 씬의 체형이 새 아바타의 값인 척한다.
     void refreshAvatarBody();
@@ -940,6 +982,7 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
     // 그대로 서 있어서, 화면만 보면 로드가 성공한 것처럼 보인다.
     viewer2d.cloth.clear();
     unfolder2d.clear();
+    viewer2d.design.clear();
     paintDraft2d();
     status(`로드 실패: ${message(err)}`, true);
   } finally {

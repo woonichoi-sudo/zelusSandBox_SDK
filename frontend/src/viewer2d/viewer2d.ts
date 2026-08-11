@@ -36,6 +36,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 
 import { ClothObject } from '../viewer3d/cloth.ts';
+import { Design2DLayer } from './design.ts';
 import type { DraftingBounds } from './unfold.ts';
 
 export interface Viewer2DOptions {
@@ -67,6 +68,12 @@ export class Viewer2D {
    * 정점 13,398 / 삼각형 24,090 짜리 씬에서 한 벌이 더 느는 비용은 작다.
    */
   readonly cloth = new ClothObject();
+
+  /**
+   * 디자인 정보(커브·제어점·봉제선·스티치). **옷 메시와 별개의 그룹이다** —
+   * 씬을 내렸다 올릴 때 둘의 수명이 갈리고, 도면선만 껐다 켜는 것도 열린다.
+   */
+  readonly design = new Design2DLayer();
 
   readonly #canvas: HTMLCanvasElement;
   readonly #renderer: THREE.WebGLRenderer;
@@ -128,6 +135,7 @@ export class Viewer2D {
     this.#scene.add(this.#grid);
 
     this.#scene.add(this.cloth.group);
+    this.#scene.add(this.design.group);
 
     this.#resizeObserver = new ResizeObserver(() => this.resize());
     this.#resizeObserver.observe(opts.canvas);
@@ -149,6 +157,32 @@ export class Viewer2D {
   /** 지금 맞춰 둔 도면 범위. 없으면 null */
   get bounds(): DraftingBounds | null {
     return this.#bounds;
+  }
+
+  /**
+   * 패턴 면을 **흰 종이**로 바꾼다 (D2-c).
+   *
+   * ★ 왼쪽 칸(3D)과 갈리는 지점이다. 실시간 뷰의 색은 "어느 삼각형이 어느
+   *   패턴인가" 를 구분하려는 것이고, 재단 도면의 색은 **선이 말한다** —
+   *   외곽선·봉제선·제어점이 정보를 지고 있으므로 면까지 색이면 선이 묻힌다.
+   *   데스크톱 2D 뷰가 흰 종이인 것도 같은 이유다.
+   *
+   * `showScene` 이 메시를 새로 세울 때마다 재질도 새로 만들어지므로 **로드
+   * 때마다 다시 불러야 한다.** 색만 바꾸는 이유는 조명·양면·polygonOffset
+   * 같은 설정이 도면에서도 그대로 필요해서다(패턴들이 겹치는 구간에서
+   * 얼룩지는 것은 여기서도 똑같이 일어난다).
+   */
+  paperize(): void {
+    for (const p of this.cloth.patterns) {
+      const m = p.mesh.material as THREE.MeshStandardMaterial | THREE.MeshStandardMaterial[];
+      const list = Array.isArray(m) ? m : [m];
+      for (const one of list) {
+        if (!(one as THREE.MeshStandardMaterial).color) continue;
+        // 순백이 아니라 아주 옅은 회색이다. 순백이면 흰 배경 요소(스티치의
+        // 흰색 4개)와 구분이 사라진다.
+        (one as THREE.MeshStandardMaterial).color.setHex(0xf2f4f7);
+      }
+    }
   }
 
   /**
