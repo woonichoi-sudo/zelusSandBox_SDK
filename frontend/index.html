@@ -207,6 +207,22 @@
       .amrow { display: flex; justify-content: space-between; gap: 0.5rem; opacity: 0.75; }
       .amrow b { font-weight: 600; font-variant-numeric: tabular-nums; }
 
+      /*
+        치수 편집 (W-2). 행은 `이름 ─── [숫자]` 한 줄 + 아래에 현재값/근사 차이.
+        `.srow`(옷 사이즈)와 같은 계열이되 [적용] 이 행마다가 아니라 하나뿐이라
+        입력이 제목 줄에 그대로 붙는다.
+      */
+      #avatarMeasure { margin-top: 0.9rem; border-top: 1px solid #2c333f; padding-top: 0.5rem; }
+      .mrow.dirty { border-left: 2px solid #6d8cff; padding-left: 0.35rem; }
+      .mrow .phead { justify-content: space-between; align-items: center; }
+      .mrow .phelp { font-variant-numeric: tabular-nums; }
+      /*
+        ⚠️ 사유·진행·결과가 나오는 한 줄이다. **툴팁이 아니라 화면 글자**라야
+           한다(#16). `hidden` 이 듣도록 `display` 를 여기에 두지 않는다.
+      */
+      .mstat { margin: 0.3rem 0; opacity: 0.8; line-height: 1.45; }
+      .mstat.err { color: #ff9a9a; opacity: 1; }
+
       .bar {
         /* 흐름 안으로 들어왔다. 화면 맨 위·전체 폭이라는 사실은 그대로다 */
         grid-column: 1 / -1; grid-row: 1; z-index: 2;
@@ -590,7 +606,22 @@
            `flex: 0 0 auto` 가 아무 일도 못 하고 바가 내용과 같이 굴러 올라간다. -->
       <div id="sideTabs"></div>
       <div id="sideScroll">
-        <div id="avatarPanel"></div>
+        <!--
+          아바타 탭 (L-3a + W-2). **상자 하나에 위젯이 둘**이다 —
+          위가 체형 슬라이더 29개(정규화 0~1), 아래가 치수 25개(cm).
+
+          ⚠️ **두 위젯을 `#sideScroll` 의 형제로 두면 안 된다.** 탭 가시성은
+             `#avatarPanel` 하나에만 걸리므로(`ui/sideTabs.ts` 가 `.sidepane`
+             을 그 상자에 붙인다) 형제로 빼면 치수 표가 **옷 사이즈 탭에서도
+             그대로 보인다.** 그래서 안쪽에 중첩한다.
+
+          갈라 놓은 이유는 왕복 시간이다: 치수 [적용] 한 번이 10초 넘게
+          걸리고 그동안 자기 상자만 1초마다 다시 그린다.
+        -->
+        <div id="avatarPanel">
+          <div id="avatarShape"></div>
+          <div id="avatarMeasure"></div>
+        </div>
         <!--
           옷 사이즈 (L-3b). 같은 칸의 두 번째 탭이다 — 사용자가 요청한 두 가지가
           같은 칸에 있어야 "몸을 키웠더니 옷이 안 맞는다" 를 한 자리에서 다룬다.

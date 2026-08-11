@@ -24,6 +24,12 @@ export {
   type AvatarPanelOptions,
 } from './avatarPanel.ts';
 
+/** 치수 25개를 cm 로 편집한다 (W-2). 같은 탭의 아래 칸이다 */
+export {
+  AvatarMeasurePanel,
+  type AvatarMeasurePanelOptions,
+} from './avatarMeasurePanel.ts';
+
 export {
   SurfacePanel,
   type SurfacePanelOptions,

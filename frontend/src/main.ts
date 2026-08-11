@@ -41,12 +41,14 @@
 
 import {
   AvatarBodyPanel,
+  AvatarMeasureController,
   DrapingPanel,
   SideTabsPanel,
   SurfaceSizePanel,
   PlaybackController,
   shortcutFor,
   SHORTCUT_HINT,
+  type AvatarMeasureView,
   type DrapingView,
   type PlaybackView,
   type ShortcutAction,
@@ -60,7 +62,14 @@ import {
   uploadScene,
   type SceneSummary,
 } from './protocol/index.ts';
-import { AvatarPanel, Design2DOptions, ParamsPanel, SideTabs, SurfacePanel } from './ui/index.ts';
+import {
+  AvatarMeasurePanel,
+  AvatarPanel,
+  Design2DOptions,
+  ParamsPanel,
+  SideTabs,
+  SurfacePanel,
+} from './ui/index.ts';
 import { Unfolder, UnfoldController, Viewer2D } from './viewer2d/index.ts';
 import {
   FrameStream,
@@ -114,8 +123,11 @@ const ui = {
   paramsWrap: el<HTMLDetailsElement>('paramsWrap'),
   params: el<HTMLElement>('params'),
   paramsBadge: el<HTMLElement>('paramsBadge'),
-  // 아바타 체형 패널이 그려질 오른쪽 칸 (L-3a)
-  avatarPanel: el<HTMLElement>('avatarPanel'),
+  // 아바타 탭 안의 두 자리. 위가 체형 슬라이더 29개 (L-3a), 아래가 치수
+  // 25개 (W-2). **둘 다 `#avatarPanel` 안쪽이어야 한다** — 탭 가시성이 그
+  // 상자에만 걸린다(index.html 의 주석 참고).
+  avatarShape: el<HTMLElement>('avatarShape'),
+  avatarMeasure: el<HTMLElement>('avatarMeasure'),
   // 옷 사이즈 패널 (L-3b). 같은 칸의 두 번째 탭이다
   surfacePanel: el<HTMLElement>('surfacePanel'),
   // 오른쪽 칸의 탭 바 (L-3c). 버튼은 `ui/sideTabs.ts` 가 만든다
@@ -213,6 +225,9 @@ client.on('open', ({ reconnected, attempt }) => {
   playback.sessionStarted();
   // 지난 세션의 드레이프 결과는 이 워커의 것이 아니다 (W-1).
   draping.reset();
+  // 치수도 같다 (W-2). 특히 **"이 아바타는 치수 변형을 지원하지 않는다" 는
+  // 기억을 지워야 한다** — 새 워커에는 아직 씬조차 없다.
+  avatarMeasure.reset();
   // 새 워커는 씬도 파라미터도 초기값이다. 화면에 남은 값은 이미 죽은 세션의 것이다.
   refreshParams();
   if (!reconnected) return;
@@ -372,7 +387,7 @@ ui.paramsWrap.addEventListener('toggle', () => {
 const avatarBody = new AvatarBodyPanel();
 
 const avatarPanel = new AvatarPanel({
-  root: ui.avatarPanel,
+  root: ui.avatarShape,
   panel: avatarBody,
   onEdit: (key, value) => {
     avatarBody.edit(key, value);
@@ -385,22 +400,36 @@ const avatarPanel = new AvatarPanel({
   },
 });
 
-/** 워커의 체형을 다시 읽어 화면에 붓는다. 씬이 없으면 비운다 */
+/**
+ * 워커의 체형·치수를 다시 읽어 화면에 붓는다. 씬이 없으면 비운다.
+ *
+ * ★ **왕복 하나로 두 패널을 채운다** (W-2). `avatarBody` 응답이 체형 29개와
+ *   치수 25개를 같이 주므로 두 모듈에 같은 응답을 먹인다 — 치수를 따로
+ *   읽는 op 을 만들면 로드마다 왕복이 하나 더 늘고, 두 표가 서로 다른
+ *   시점의 몸을 가리키는 순간이 생긴다.
+ */
 async function refreshAvatarBody(): Promise<void> {
   if (!currentScene || !client.connected) {
     avatarBody.clear();
+    avatarMeasure.clear();
     avatarPanel.render();
+    measurePanel.render();
     return;
   }
   try {
-    avatarBody.setFromWorker(await client.avatarBody());
+    const res = await client.avatarBody();
+    avatarBody.setFromWorker(res);
+    // ⚠️ 여기서 낡음이 풀린다 — 방금 읽은 스냅샷이 곧 지금 몸이다.
+    avatarMeasure.setFromWorker(res);
   } catch (err: unknown) {
     // 못 읽었으면 **옛 값을 남기지 않는다.** 남기면 화면이 지금 아바타와
     // 무관한 숫자를 "현재 체형" 이라고 말한다.
     avatarBody.clear();
+    avatarMeasure.clear();
     log(`아바타 체형을 읽지 못했습니다: ${message(err)}`);
   }
   avatarPanel.render();
+  measurePanel.render();
 }
 
 /**
@@ -416,6 +445,11 @@ async function applyAvatarBody(): Promise<void> {
   try {
     const res = await client.setAvatarBody(payload);
     avatarBody.applied(res.avatar);
+    // ★ **이 경로에는 치수 되읽기가 없다** — 셰이퍼가 몸을 바꿨는데
+    //   `measurements[*].real` 은 씬 데이터 사본이라 안 움직인다. 그 사실을
+    //   치수 패널에 알려 화면이 "이 숫자는 그 전에 잰 값" 이라고 말하게
+    //   한다. 이 한 줄이 없으면 화면이 조용히 거짓말을 한다.
+    avatarMeasure.noteBodyParamsApplied();
     log(
       `아바타 체형 — 적용 ${res.applied.length}개`
       + (res.unknown.length > 0 ? ` · ⚠ 모르는 키 ${res.unknown.join(', ')}` : ''),
@@ -427,6 +461,71 @@ async function applyAvatarBody(): Promise<void> {
     status(`아바타 체형 적용 실패: ${message(err)}`, true);
   }
   avatarPanel.render();
+  measurePanel.render();
+}
+
+// ── 아바타 치수 (W-2) ───────────────────────────────────────
+//
+// 같은 탭의 아래 칸이고 같은 3층이되, 판단 쪽이 **왕복까지 스스로 한다**
+// (`panels/avatarMeasure.ts`) — `draping.ts` 와 같은 계열이다. 이유는 시간이다:
+// [적용] 한 번이 10초 넘게 걸리고 그 사이의 "적용 중" 도 상태이므로, 그것을
+// main.ts 의 불리언으로 두면 자동 테스트가 원리적으로 못 붙는다(ISSUE-009).
+//
+// ★ **`frame:-1` 뒤처리를 새로 만들지 않는다.** 이 op 도 엔진 안에서
+//   시뮬을 되돌리므로 W-1 의 드레이프와 사정이 정확히 같다 — `refreshPose()`
+//   + `playback.syncFromWorker()` 를 그대로 재사용한다.
+const avatarMeasure: AvatarMeasureController = new AvatarMeasureController({
+  port: client,
+  hooks: {
+    log,
+    onChange: paintMeasure,
+    afterApplied: async (res) => {
+      // ★ 체형 슬라이더도 같이 갱신한다. `res.avatar` 는 **워커가 다시 읽은**
+      //   체형이라, 치수로 몸을 만들면 29개 값이 실제로 어떻게 움직였는지가
+      //   그대로 화면에 드러난다(요청값의 메아리가 아니다).
+      avatarBody.setFromWorker(res.avatar);
+      avatarPanel.render();
+      // 아래 둘은 리셋이 하는 것과 똑같다 — 새로 만들지 않는다.
+      await refreshPose('치수');
+      await playback.syncFromWorker();
+    },
+  },
+});
+
+const measurePanel = new AvatarMeasurePanel({
+  root: ui.avatarMeasure,
+  panel: avatarMeasure,
+  onEdit: (key, value) => {
+    avatarMeasure.edit(key, value);
+    // `edit` 이 이미 onChange 를 낸다. 여기서 또 그리면 타이핑 중인 칸을
+    // 두 번 훑는다 — 배선은 알리기만 한다.
+  },
+  onApply: () => void applyAvatarMeasurements(),
+  onRevert: () => avatarMeasure.revert(),
+});
+
+/**
+ * 치수를 적용한다. **바뀐 것만 나간다** (판단은 컨트롤러가 한다).
+ *
+ * ⚠️ 여기서 하는 유일한 판단은 **화면 전체를 잠그는 것**이다. 이 op 이 도는
+ *    동안 워커는 stdin 을 순차 처리하느라 다른 요청에 답하지 못한다 — 재생·
+ *    리셋·로드 버튼이 살아 있으면 누른 뒤 15초를 아무 반응 없이 기다리게
+ *    된다. `setBusy` 는 로드가 이미 쓰는 장치라 새로 만들 것이 없다.
+ */
+async function applyAvatarMeasurements(): Promise<void> {
+  if (busy) return;
+  setBusy(true);
+  try {
+    await avatarMeasure.apply();
+  } finally {
+    setBusy(false);
+  }
+  measurePanel.render();
+}
+
+/** 표 하나와 글자 한 줄. **상태는 만들지 않는다 — 받은 것만 그린다** */
+function paintMeasure(view: AvatarMeasureView = avatarMeasure.view): void {
+  measurePanel.render(view);
 }
 
 // ── 옷 사이즈 (L-3b) ────────────────────────────────────────
@@ -698,6 +797,11 @@ function paintPlayback(view: PlaybackView = playback.view): void {
   //   currentScene 을 믿으면 버튼이 켜져 있는데 워커는 "씬이 없다" 로 답한다.
   draping.setScene(view.scene !== null);
   paintDraping();
+  // ★ 치수 패널도 같은 사실을 쓴다 (W-2). `currentScene`(우리가 보고 싶은 것)
+  //   이 아니라 `view.scene`(워커에 로드돼 있다고 아는 것)이라야 한다 —
+  //   재연결 직후처럼 둘이 갈라지면 [적용] 이 켜져 있는데 워커는 "씬이 없다"
+  //   로 답하고, 그 왕복은 15초짜리로 오해받는다.
+  avatarMeasure.setScene(view.scene !== null);
   // ★ 재생 중에는 파라미터 [적용] 을 잠근다. **위젯은 열어 둔다** — 값을 미리
   //   맞춰 두고 정지한 뒤 한 번에 보낼 수 있다. 잠그는 이유는 시뮬이 도는
   //   도중의 변경이 어떻게 반영되는지 **측정한 적이 없어서**다. 한 런의
@@ -1255,6 +1359,20 @@ declare global {
      * 자동 드레이프가 없어서** 아무 일도 안 일어난 것이다(실패가 아니다).
      */
     draping: DrapingPanel;
+    /**
+     * W-2 의 진단 표면 — 치수(cm). `avatarMeasure.view.text` 가 화면이 말하고
+     * 있어야 하는 글자다.
+     *
+     * ★ `view.rows[*].current` 가 **되읽기의 정본**이다 — 마지막
+     *   `setAvatarMeasurements` 응답의 `measured` 로 덮인 값이고,
+     *   `avatarBody.view` 쪽 숫자와는 다른 것이다(씬 데이터 사본은 이 op 으로
+     *   안 움직인다). `view.stale` 이 참이면 아직 그 정본이 없다는 뜻이다.
+     *
+     * `stats.notSupported` 가 0 이 아니면 이 씬의 아바타가 `ztDesignZeta` 가
+     * 아니어서(예: `sample.zls`) 치수 변형이 원리적으로 안 되는 것이다 —
+     * UI 를 의심할 자리가 아니다.
+     */
+    avatarMeasure: AvatarMeasureController;
     viewer2d: Viewer2D;
     unfolder2d: Unfolder;
     stream: FrameStream;
@@ -1291,6 +1409,7 @@ globalThis.cobalt = {
   avatarBody,
   surfaceSize,
   draping,
+  avatarMeasure,
   viewer2d,
   unfolder2d,
   stream,

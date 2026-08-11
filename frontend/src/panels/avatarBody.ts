@@ -23,16 +23,21 @@
  * **전부 0.5** 였다. cm 단위의 몸은 `measurements` 쪽에 따로 온다(키 175.739,
  * 허리 61.647). 둘을 같은 자리에 섞어 보여주면 사용자가 0.5 를 센티미터로 읽는다.
  *
- * ── ⚠️ 치수(`measurements.real`)는 **갱신되지 않는다** ──────
+ * ── ⚠️ 치수는 **이 모듈이 더 이상 들고 있지 않다** (W-2) ────
  *
- * **[실측]** 워커가 수정본을 만들 때 그 필드를 복사해 넘기고 엔진이 되써주지
- * 않는다. 즉 체형을 만진 뒤의 치수는 **로드 시점 값**이다. 그래서 이 모듈은
- * 치수를 "지금 몸" 이 아니라 **"로드했을 때의 몸"** 으로 표시하도록
- * `measurementsStale` 을 돌려준다 — 화면이 그 사실을 글자로 말해야 한다.
- * 회색으로만 만들면 #16 이 없애려던 그 거짓말이 된다.
+ * L-3a 에서는 치수 25개를 여기서 읽기 전용으로 보여줬고, 체형을 보낸 뒤
+ * **갱신할 방법이 없어서** `measurementsStale` 로 "낡았다" 고 말만 했다.
+ * W-2 가 `setAvatarMeasurements` 를 열면서 되읽기의 정본(`measured`)이
+ * 생겼고, 그 경로는 **왕복이 10초 넘게 걸리는 상태 기계**라 값 그릇인 이
+ * 모듈과 성격이 다르다. 그래서 치수는 통째로 `panels/avatarMeasure.ts` 로
+ * 옮겼다 — 낡음 플래그도 그쪽이 소유한다(그쪽만이 풀 수 있다).
+ *
+ * ★ **여기서 남은 책임은 하나다**: 체형을 보낸 쪽이 치수를 낡게 만들었다는
+ *   사실을 알리는 것. `applied()` 가 참을 돌려주고, 배선이
+ *   `AvatarMeasureController.noteBodyParamsApplied()` 로 넘긴다.
  */
 
-import type { AvatarBodyResult, AvatarMeasurement } from '../protocol/index.ts';
+import type { AvatarBodyResult } from '../protocol/index.ts';
 
 /**
  * 엔진 키 → 한국어 이름. **목록이 아니라 사전이다** (머리말 참고).
@@ -114,16 +119,6 @@ export interface AvatarGroup {
   fields: AvatarField[];
 }
 
-/** 치수 한 줄. **cm 다** */
-export interface AvatarMeasureRow {
-  key: string;
-  /** 엔진 이름 그대로. 여기에는 한국어 사전을 두지 않는다 — 아래 주석 참고 */
-  label: string;
-  real: number;
-  expected?: number;
-  locked: boolean;
-}
-
 export type AvatarPhase = 'noScene' | 'noAvatar' | 'ready';
 
 export interface AvatarBodyView {
@@ -131,16 +126,8 @@ export interface AvatarBodyView {
   /** 왜 못 쓰는지. `phase !== 'ready'` 일 때만 있다. **화면 글자가 된다** */
   reason?: string;
   groups: AvatarGroup[];
-  measurements: AvatarMeasureRow[];
   /** 아직 안 보낸 편집 수 */
   dirty: number;
-  /**
-   * 치수가 낡았는가 — **체형을 한 번이라도 보낸 뒤로 참이다.**
-   *
-   * 워커가 갱신해 주지 않으므로(머리말) 이 값이 참이면 화면은 치수를
-   * "로드 시점 값" 이라고 말해야 한다.
-   */
-  measurementsStale: boolean;
 }
 
 /**
@@ -151,10 +138,8 @@ export interface AvatarBodyView {
  */
 export class AvatarBodyPanel {
   #worker: Record<string, number> = {};
-  #measures: Record<string, AvatarMeasurement> = {};
   #pending = new Map<string, number>();
   #phase: AvatarPhase = 'noScene';
-  #stale = false;
 
   /** 워커가 말한 사실로 덮어쓴다. 편집 중이던 값은 **버린다** */
   setFromWorker(res: AvatarBodyResult | null): void {
@@ -162,24 +147,20 @@ export class AvatarBodyPanel {
     if (!res) {
       this.#phase = 'noScene';
       this.#worker = {};
-      this.#measures = {};
       return;
     }
     if (!res.hasAvatar) {
       this.#phase = 'noAvatar';
       this.#worker = {};
-      this.#measures = {};
       return;
     }
     this.#phase = 'ready';
     this.#worker = { ...(res.bodyParams ?? {}) };
-    this.#measures = { ...(res.measurements ?? {}) };
   }
 
   /** 씬을 내렸다 */
   clear(): void {
     this.setFromWorker(null);
-    this.#stale = false;
   }
 
   /**
@@ -209,11 +190,16 @@ export class AvatarBodyPanel {
     return Object.fromEntries(this.#pending);
   }
 
-  /** 보낸 뒤. 워커가 되읽어 준 값으로 덮는다 */
+  /**
+   * 보낸 뒤. 워커가 되읽어 준 값으로 덮는다.
+   *
+   * ★ **치수를 낡게 만든다** (머리말). 이 모듈은 치수를 안 들고 있으므로
+   *   그 사실을 배선이 `AvatarMeasureController.noteBodyParamsApplied()` 로
+   *   넘겨야 한다 — 여기서 참을 돌려주는 이유가 그것이고, 잊으면 화면이
+   *   **바뀐 몸의 옛 치수를 "지금 치수" 로** 말한다.
+   */
   applied(res: AvatarBodyResult): void {
     this.setFromWorker(res);
-    // 체형이 바뀌었으므로 치수는 이제 낡았다(머리말).
-    this.#stale = true;
   }
 
   get view(): AvatarBodyView {
@@ -240,24 +226,11 @@ export class AvatarBodyPanel {
       groups.push({ key: 'other', label: '기타', fields: rest.map((k) => this.#field(k)) });
     }
 
-    const measurements: AvatarMeasureRow[] = Object.entries(this.#measures).map(([k, m]) => ({
-      key: k,
-      // ⚠️ 치수에는 한국어 사전을 두지 않는다. 체형과 달리 **cm 단위의 실제
-      //    치수**라 이름이 틀리면 사용자가 잘못된 부위를 읽는다 — 엔진 이름을
-      //    그대로 두는 편이 안전하고, 필요하면 사전을 나중에 실측과 함께 붙인다.
-      label: k,
-      real: m.real,
-      ...(m.expected === undefined ? {} : { expected: m.expected }),
-      locked: m.locked,
-    }));
-
     return {
       phase: this.#phase,
       ...(reason === undefined ? {} : { reason }),
       groups,
-      measurements,
       dirty: this.#pending.size,
-      measurementsStale: this.#stale,
     };
   }
 

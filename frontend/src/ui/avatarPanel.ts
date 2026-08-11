@@ -9,11 +9,16 @@
  *
  * ① **못 쓰는 상태에는 이유가 글자로 남는다.** 툴팁이 아니라 화면 글자다 —
  *    마우스를 올려야 보이는 것은 보이는 게 아니다.
- * ② **치수가 낡았으면 그 사실을 말한다.** 체형을 보낸 뒤의 `real` 은 로드 시점
- *    값이다(워커가 갱신해 주지 않는다). 숫자만 그대로 두면 화면이 거짓말을
- *    한다 — 이 패널에서 가장 조용히 틀릴 수 있는 자리다.
- * ③ **슬라이더와 숫자를 같이 둔다.** 0~1 정규화라 슬라이더만으로는 지금 값이
+ * ② **슬라이더와 숫자를 같이 둔다.** 0~1 정규화라 슬라이더만으로는 지금 값이
  *    얼마인지 못 읽고, 숫자만으로는 범위 감각이 없다.
+ *
+ * ── 치수 25개는 **여기 없다** (W-2) ─────────────────────────
+ *
+ * L-3a 에서는 이 패널이 치수도 읽기 전용으로 그렸다. W-2 가 그것을 편집
+ * 가능하게 만들면서 `ui/avatarMeasurePanel.ts` 로 옮겼다 — 같은 탭의 바로
+ * 아래 칸이라 사용자가 보는 자리는 그대로다. 갈라 놓은 이유는 **왕복 시간**
+ * 이다: 치수 쪽은 [적용] 한 번이 10초 넘게 걸려서 그동안 자기 상자만 다시
+ * 그려야 하는데, 한 위젯이면 슬라이더 29개까지 같이 흔들린다.
  */
 
 import type { AvatarBodyPanel, AvatarBodyView } from '../panels/index.ts';
@@ -44,6 +49,7 @@ export class AvatarPanel {
   /** 매번 다시 만들지 않고 값만 갈아 끼우려고 잡아 둔다 */
   readonly #inputs = new Map<string, { range: HTMLInputElement; num: HTMLElement; row: HTMLElement }>();
 
+  #title: HTMLElement;
   #bar: HTMLElement;
   #apply: HTMLButtonElement;
   #revert: HTMLButtonElement;
@@ -56,6 +62,11 @@ export class AvatarPanel {
     this.#root = opts.root;
     this.#panel = opts.panel;
     this.#opts = opts;
+
+    // 같은 탭에 [적용] 버튼이 둘(체형·치수)이 됐다. 어느 것이 무엇을 보내는지
+    // 제목이 없으면 알 수 없다 — 하나는 정규화 0~1, 하나는 cm 다.
+    this.#title = document.createElement('h4');
+    this.#title.textContent = '체형 (정규화 0~1)';
 
     this.#bar = document.createElement('div');
     this.#bar.className = 'pbar';
@@ -78,7 +89,7 @@ export class AvatarPanel {
 
     this.#body = document.createElement('div');
 
-    this.#root.append(this.#bar, this.#banner, this.#body);
+    this.#root.append(this.#title, this.#bar, this.#banner, this.#body);
     this.render();
   }
 
@@ -118,11 +129,10 @@ export class AvatarPanel {
     this.#apply.disabled = view.dirty === 0;
     this.#revert.disabled = view.dirty === 0;
 
-    // ② 치수가 낡았으면 그 사실을 말한다.
-    this.#banner.hidden = !view.measurementsStale;
-    this.#banner.textContent = view.measurementsStale
-      ? '아래 치수는 로드했을 때의 값입니다 — 체형을 바꿔도 갱신되지 않습니다. 정확한 치수를 보려면 씬을 다시 로드하세요.'
-      : '';
+    // 낡음 알림은 **치수 패널이 낸다** (W-2). 낡는 것도 풀리는 것도 그쪽
+    // 숫자이고, 두 상자가 같은 말을 하면 어느 것이 정본인지 흐려진다.
+    this.#banner.hidden = true;
+    this.#banner.textContent = '';
   }
 
   #build(view: AvatarBodyView): void {
@@ -166,28 +176,6 @@ export class AvatarPanel {
         this.#inputs.set(f.key, { range, num, row });
       }
 
-      this.#body.append(group);
-    }
-
-    // 치수 — 읽기 전용이다. 쓰기는 `SetMeasurementParam` 경로이고 우리 op 에
-    // 아직 없다(체형 쪽만 열었다).
-    if (view.measurements.length > 0) {
-      const group = document.createElement('div');
-      group.className = 'pgroup';
-      const h = document.createElement('h4');
-      h.textContent = `치수 (cm) — 읽기 전용 ${view.measurements.length}개`;
-      group.append(h);
-
-      for (const m of view.measurements) {
-        const row = document.createElement('div');
-        row.className = 'prow amrow';
-        const k = document.createElement('span');
-        k.textContent = m.label;
-        const v = document.createElement('b');
-        v.textContent = m.real.toFixed(1);
-        row.append(k, v);
-        group.append(row);
-      }
       this.#body.append(group);
     }
   }

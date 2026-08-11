@@ -73,9 +73,32 @@ export {
   type AvatarBodyView,
   type AvatarField,
   type AvatarGroup,
-  type AvatarMeasureRow,
   type AvatarPhase,
 } from './avatarBody.ts';
+
+/**
+ * 치수(cm)로 몸을 만든다 (W-2). **`avatarBody.ts` 와 짝이되 성격이 다르다** —
+ * 이쪽은 왕복이 10초 넘게 걸리는 상태 기계이고, **치수 되읽기의 정본**
+ * (`measured`)을 가진 유일한 자리다(원본 머리말의 표 참고).
+ */
+export {
+  AvatarMeasureController,
+  estimateSeconds,
+  stepsFor,
+  validateMeasure,
+  DEFAULT_SIM_ITERATIONS,
+  DEFAULT_STEP_CM,
+  REQUEST_TIMEOUT_MS,
+  WORKER_TIMEOUT_MS,
+  type AvatarMeasureHooks,
+  type AvatarMeasureOptions,
+  type AvatarMeasureOutcome,
+  type AvatarMeasurePhase,
+  type AvatarMeasurePort,
+  type AvatarMeasureRow,
+  type AvatarMeasureStats,
+  type AvatarMeasureView,
+} from './avatarMeasure.ts';
 
 /**
  * 저장된 드레이프 적용 (W-1). **`reset` 과 같은 자리의 op 이다** — 성공하면
