@@ -256,12 +256,57 @@
         "title": "C. 디자인 기반 2D — 새 op (2026-08-09 사용자 결정으로 deferred에서 승격)",
         "cost": "높음. 메시가 아니라 디자인 엔티티라 프로토콜을 새로 설계해야 한다. 15번이 uvs로 그리는 패턴 외곽선 위에 얹힌다",
         "why": "제품 앱의 2D 뷰 스크린샷을 기준으로 삼기로 했다. 15번만으로는 흰 실루엣과 크기까지만 나오고 봉제선·커브 제어점·노치·시접이 없다",
+        "status": "대부분 완료 (2026-08-11). D2-a(6c85592) · D2-b(db6e2d1) · D2-c(50c397a) · D2-d(b8211ec) · D2-e(a73c070). 남은 것은 화살표 노치와 봉제선 끝점 원, 그리고 design.ts 전면 테스트다",
+        "origin": "사용자가 데스크톱 2D 뷰 스크린샷을 다시 주며 '전개도 정보가 다 반영이 안 됐다. 이미지처럼 나와야 한다' 고 지목한 데서 착수했다 (2026-08-11)",
         "items": [
-          { "what": "봉제선(seam) — 어느 점과 어느 점이 꿰매지는가", "note": "제품 앱 2D 뷰의 점선. 관계 정보라 메시에 없다. 조사에서 zls의 surface마다 seams 3개가 확인됐다" },
-          { "what": "커브 제어점", "note": "2D 뷰의 점들. 디자인 엔티티" },
-          { "what": "노치 / 시접(seam allowance)", "note": "zwViewOptionManager의 showNotch·showSeamAllowance가 동결돼 있다 — PROJECT_ANALYSIS §8" }
+          {
+            "what": "D2-a — 워커가 커브·봉제선·스티치를 낸다",
+            "status": "done",
+            "commit": "6c85592",
+            "note": "새 op design2d(읽기 전용). ★ 새 의존성이 없다 — ztSceneQueryInterface 가 GetCurvesInSurface / GetSeams / GetStitches / CreateGeomCubicBezierCurve 를 다 갖고 있고 워커가 이미 그 헤더를 쓴다. L-3a 에서 걸렸던 '메서드는 있는데 객체를 얻는 공개 경로가 없다' 가 여기선 없다. ── ★ atWorld 가 #15 의 전치 함정을 통째로 없앤다: .zls 실측으로 제어점 909개의 범위가 66.6×103.5cm 인데 도면 전체는 144.2×175.4cm 라 커브가 패턴 로컬임을 먼저 확인했고, CreateGeomCubicBezierCurve(uuid, atWorld=true) 가 배치까지 끝낸 값을 주므로 우리가 행렬을 안 만진다. 프로브 실측 144.24×175.45cm 로 L-2a 와 소수점까지 일치, 서피스 상자 겹침 2.5%(#15 가 '배치가 맞으면 2.5%' 라고 잰 값). ── ⚠️ 실측이 전제 둘을 깼다: (1) 커브가 outer 168 + inner 112 뿐이고 sewline·grain·hole·seamAllowance 가 전부 0개다. notches 도 null 이다 — 즉 시접과 노치는 그릴 데이터가 없다. (2) 스티치 색이 회색 50 · 흰색 4 로 2종뿐이다. ── 폴리라인으로 내린다(제어점만 보내고 화면에서 베지어를 풀면 세분 규칙이 두 곳에 생겨 '곡선이 좀 각져 보인다' 로만 드러난다). 직선은 양 끝점만. ⚠️ .zls 에 FLT_MAX 센티넬 제어점이 2개 있어 걷어낸다. 페이로드 287.5KB, 로드당 1회라 프레임 경로에 없다. 손으로 돌려 보는 것은 backend/tools/probe-design2d.ts"
+          },
+          {
+            "what": "D2-b — SDK → 게이트웨이 → 프론트 프로토콜",
+            "status": "done",
+            "commit": "db6e2d1",
+            "note": "★ 이 단위에서 가장 조용히 깨질 자리를 타입 주석에 못박았다 — 재단 도면의 메시(uvs)는 패턴 로컬이라 화면이 transform2d 를 곱해 세우는데(#15) 커브는 워커가 atWorld 로 이미 끝냈다. 같은 칸에서 한쪽에만 곱해야 하고, 둘 다 곱하면 '패턴이 좀 흩어져 보인다' 로만 보인다. ⚠️ kind 유니온에 7종을 적었지만 실측은 outer·inner 둘뿐이다(타입에서 빼지 않은 이유는 다른 씬에 있을 수 있어서). ⚠️ Design2DSeamPart.t0 > t1 이 실측 73개 있다 — 워커가 정규화하지 않는다. 게이트웨이는 build 가 없는 인자 없는 읽기 op 이다. OPS 테이블에 한 줄 더하니 서버 스모크의 개수 단언이 정확히 1건 실패했다(21→22, 표 22→23) — 그게 그 단언의 역할이다"
+          },
+          {
+            "what": "D2-c — 가운데 칸 렌더링 (흰 종이 + 커브 + 제어점 + 봉제선 + 스티치)",
+            "status": "done",
+            "commit": "50c397a",
+            "note": "패턴 면을 흰 종이(#f2f4f7)로 바꿨다 — 실시간 뷰의 색은 '어느 삼각형이 어느 패턴인가' 를 구분하려는 것이고 재단 도면에서는 정보를 선이 진다. 순백이 아닌 이유는 스티치의 흰색 4개와 구분이 사라지지 않게 하기 위해서다. showScene 이 재질을 새로 만들므로 로드마다 다시 칠한다. ⚠️ LineBasicMaterial.linewidth 는 대부분의 플랫폼에서 무시되고 1px 로 고정된다 — 굵기로 종류를 구분하면 전부 같은 선이 되므로 색과 z 순서로만 가른다(z 는 값이 아니라 순서가 의미다: 외곽 0.5 → 내부 0.6 → 스티치 0.7 → 봉제 0.8 → 대응선 0.9 → 점 1.0). ⚠️ 점선은 computeLineDistances() 를 안 부르면 실선으로 나온다. 직선의 핸들은 안 그린다(엔진이 값을 채워 둬도 곡률을 안 만들어 떠 있는 점이 된다) — 그래서 제어점이 909 가 아니라 878(앵커 560 + 핸들 318)이다. design.ts 는 DOM 을 안 써서 cloth.ts·unfold.ts 와 같은 층위다. 옷 메시와 별개 그룹이라 씬 내림·로드 실패 경로에서 따로 비워야 한다"
+          },
+          {
+            "what": "D2-d — 봉제 대응선을 엔진 값으로 (내가 두 번 지어냈다)",
+            "status": "done",
+            "commit": "b8211ec",
+            "note": "★★★ 이 단위의 교훈이 가장 크다. D2-c 의 점선이 틀렸고, 참고 이미지를 눈으로 흉내내며 값을 지어내다 두 번 연속 빗나갔다 — 1차 봉제선당 중점 하나(45줄·회색 1종), 2차 길이 4cm 마다(199줄·황금각 45종), 정답은 엔진이 준 108줄·22종. ── 답은 회사 저장소 zelusSandBox/Seam2DRenderer.cpp 에 있었다: seam->GetPositionsForDraw(p0, p1, world=true) 로 대응점을 받고 seam->GetColor() 로 색을 받는다. 개수도 위치도 색도 우리가 정할 것이 하나도 없었다. ── ★ '색은 데이터에 없다' 는 D2-c 의 결론이 틀렸다. .zls 의 seams JSON 에 색 필드가 없고 스티치가 2종뿐인 것만 보고 판단했는데, ztDesignSeam 객체가 색을 갖고 있었다(실측 22종). 우리 팔레트(seamColor)는 색이 null 일 때만 쓰는 폴백으로 내렸다. ── ★★ 교훈: 참고 이미지를 명세로 삼을 때 그림을 흉내내지 말고 그리는 코드를 읽어라. 회사 저장소는 읽기 전용이지 읽지 말라는 뜻이 아니다. 두 번의 헛수고가 한 파일로 끝났다. ── ⚠️ GetSeamByUuid 는 private 이다. 이미 돌고 있는 GetSeams() 맵이 객체를 준다. ⚠️ GetPositionsForDraw 는 const 인데 mutable 캐시를 건드린다 — 이 프로젝트에 정확히 그 함정의 전례가 있어(IsUpdateRenderMesh) backend 스모크 73건을 돌렸고 통과했다. 시뮬은 안 건드린다. ⚠️ 헤드리스에서 그 값이 완전한지는 미결이다 — ISSUE-022"
+          },
+          {
+            "what": "D2-e — 표시 스위치 체크박스 6개 + 테스트 21건",
+            "status": "done",
+            "commit": "a73c070",
+            "note": "사용자 요청이다(점선을 껐다 켰다 하고 싶다). 갈래 6개 — 봉제 대응선·봉제선·외곽선·내부선·제어점·스티치. ★ 상태를 체크박스가 아니라 Design2DLayer 가 든다: build() 가 객체를 새로 만들므로 화면에 두면 씬 재로드 때 선은 켜지고 체크박스는 꺼진 채로 갈라지고, 콘솔에는 아무 이상이 없다. clear() 는 상태를 안 지운다. ⚠️ 접두사 우선순위가 유일한 함정이다 — seam:links 와 seam: 이 포함 관계라 DESIGN_LAYERS 에서 links 가 먼저 와야 하고, 순서를 바꾸는 것만으로 '봉제선 끄기' 가 대응선까지 끈다. ⚠️ 상자에 pointer-events: none, 라벨에만 auto — 상자가 클릭을 먹으면 그 사각형 안에서 도면을 팬 할 수 없다. ── 테스트는 깨지면 조용한 두 가지만 좁게 겨냥했다(접두사 우선순위 · 재로드 후 상태 유지). 돌연변이로 이빨을 확인했다: 목록 순서 뒤집기 → 5건 빨간불, build() 끝의 #applyLayers() 제거 → 2건 빨간불. 심은 것은 그 자리에서 되돌리고 git hash-object 로 확인했다"
+          },
+          {
+            "what": "화살표 노치 (RenderArrowNotch) — 참고 이미지의 빗금",
+            "status": "todo",
+            "note": "★ 이미지의 빗금은 ztDesignNotch 가 아니다. notches 는 null 인데 이미지에 빗금이 있어서 한동안 수수께끼였는데, Seam2DRenderer::RenderArrowNotch / RenderArrowNotchForSeamPartGroup 이 그리는 봉제 방향 화살표였다. 구현이 회사 저장소에 있으므로 읽어서 옮기면 된다 — D2-d 의 교훈대로 그림을 흉내내지 말 것"
+          },
+          {
+            "what": "봉제선 끝점 원 — 참고 이미지의 흰 테두리 원",
+            "status": "todo",
+            "note": "Seam2DRenderer::RenderEndPointForGroup 이다: DrawPoint(끝점, 봉제선 색, radius) + DrawFixedSizeCircle(끝점, radius/2, 흰색, lineWidth). 끝점은 GetSeamPartGroupEndpoints — 그룹의 front.t[0] 과 back.t[1] 두 점이다. 지금 우리가 찍는 것은 커브 제어점이라 다른 물건이다"
+          },
+          {
+            "what": "design.ts 전면 테스트",
+            "status": "todo",
+            "note": "D2-e 에서 의식적으로 뗀 것이다. 지금 §14 21건은 표시 스위치만 덮고, 폴리라인 변환·FLT_MAX 센티넬 걸러내기·z 순서·직선의 핸들 제외·색 폴백 같은 400줄이 무테스트다. cloth.ts·unfold.ts 와 같은 DOM-free 층인데 그것들은 테스트가 있다"
+          },
+          { "what": "노치 / 시접(seam allowance)", "status": "blocked", "note": "⛔ 그릴 데이터가 없다 — 사용자 씬에서 notches 는 null 이고 seamAllowance 커브는 0개다(D2-a 실측). zwViewOptionManager 의 showNotch·showSeamAllowance 가 동결된 것과는 다른 이유다. 다른 씬에 데이터가 있는지 먼저 재고 착수할 것" }
         ],
-        "note": "착수 전에 DESIGN.md §7.3을 다시 볼 것. 어느 수준까지 그릴지(외곽선만 / 봉제선까지 / 시접까지)가 op 개수를 가른다"
+        "note": "★ 이 그룹에서 배운 것: 참고 이미지를 명세로 삼을 때 그림을 흉내내지 말고 데스크톱의 그리는 코드를 읽어라(zelusSandBox/Seam2DRenderer.cpp · Renderer2D.cpp). 두 번 지어내고 두 번 틀렸다 — D2-d 참고"
       },
       {
         "key": "misc",

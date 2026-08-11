@@ -194,9 +194,12 @@ cd frontend && npm run dev      # Vite :5173
 | 명령 | 위치 | 건수 | GPU |
 |---|---|---|---|
 | `npm run smoke` | `backend` | 73 | ❌ |
-| `npm run smoke:server` | `backend` | 373 | ❌ |
-| `npm run smoke` | `frontend` | 702 | ❌ |
-| `npm run verify:ui` | `frontend` | 200 | ✅ **필요** |
+| `npm run smoke:server` | `backend` | 376 | ❌ |
+| `npm run smoke` | `frontend` | **778** | ❌ |
+| `npm run verify:ui` | `frontend` | 200 | ✅ **필요** — ⛔ GPU 이슈 + [ISSUE-019]로 보류 중 |
+| `tools/probe-avatar.ts` | `backend` | 측정 도구 — 체형 29 · 치수 25 | ❌ |
+| `tools/probe-surface.ts` | `backend` | 측정 도구 — 서피스 24개 크기 | ❌ |
+| `tools/probe-design2d.ts` | `backend` | 측정 도구 — 커브 280 · 봉제선 45 · 스티치 54 · 좌표계 | ❌ |
 | `npm run sweep:params` | `backend` | 측정 도구 (~6분) | ❌ |
 
 `verify:ui`는 게이트웨이(3000)와 Vite(5173)가 **떠 있어야** 한다 — 하네스가 서버를 안 띄운다.
