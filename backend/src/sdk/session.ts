@@ -14,7 +14,10 @@ import {
   type MeshInfoResult,
   type PatternData,
   type AvatarBodyResult,
+  type AvatarMeasurementTargets,
+  type LoadDrapingResult,
   type SetAvatarBodyResult,
+  type SetAvatarMeasurementsResult,
   type SurfacesResult,
   type Design2DResult,
   type SetParamsResult,
@@ -238,6 +241,42 @@ export class Session extends EventEmitter {
    */
   setAvatarBody(bodyParams: Record<string, number>): Promise<SetAvatarBodyResult> {
     return this.#call('setAvatarBody', { bodyParams });
+  }
+
+  /**
+   * 치수(cm)로 몸을 만든다 (W-1). 키는 `avatarBody()` 의 `measurements` 이름이고
+   * **`null` 은 "지정 안 함"** 이다 — 안 바꿀 치수를 지우지 않고 그대로 실어도 된다.
+   *
+   * ⚠️ **오래 걸리고, 그동안 이 세션은 다른 op 에 응답하지 못한다.** 실측
+   *    Release Δ15cm = 15.4초(Step 96번). 기본값(`6`, `1.0`)은 엔진팀 문서 값이며
+   *    회사 struct 의 초기값(`1`, `100`)과 다르다 — 그쪽을 쓰면 단계가 통째로
+   *    사라져 옷이 몸을 뚫는다(`protocol.cpp` 주석 참고).
+   *
+   * ★ 되읽기의 정본은 `measured` 다. `avatar.measurements[*].real` 은 이 op 으로
+   *   움직이지 않는다.
+   */
+  setAvatarMeasurements(
+    measurements: AvatarMeasurementTargets,
+    opts: { simulationIterations?: number; bodyDimensionStepCm?: number } = {},
+  ): Promise<SetAvatarMeasurementsResult> {
+    return this.#call('setAvatarMeasurements', {
+      measurements,
+      ...(opts.simulationIterations === undefined
+        ? {} : { simulationIterations: opts.simulationIterations }),
+      ...(opts.bodyDimensionStepCm === undefined
+        ? {} : { bodyDimensionStepCm: opts.bodyDimensionStepCm }),
+    });
+  }
+
+  /**
+   * `.zls` 에 저장된 자동 드레이프를 적용한다 (W-1). 펼쳐진 옷이 입혀진다.
+   *
+   * ⚠️ **`applied:false` 는 실패가 아니다** — 그 씬에 자동 드레이프가 없을 뿐이다.
+   * ★ **`applied:true` 면 프레임 카운터가 -1 로 되돌아간다** (엔진이 안에서
+   *   `Reset()` 한다). 부르는 쪽은 `reset()` 과 같은 뒤처리를 해야 한다.
+   */
+  loadDraping(): Promise<LoadDrapingResult> {
+    return this.#call('loadDraping');
   }
 
   /** 서피스(패턴) 목록과 크기를 읽는다. **cm 다** (L-3b) */

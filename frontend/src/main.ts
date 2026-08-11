@@ -41,11 +41,13 @@
 
 import {
   AvatarBodyPanel,
+  DrapingPanel,
   SideTabsPanel,
   SurfaceSizePanel,
   PlaybackController,
   shortcutFor,
   SHORTCUT_HINT,
+  type DrapingView,
   type PlaybackView,
   type ShortcutAction,
 } from './panels/index.ts';
@@ -95,6 +97,9 @@ const ui = {
   //    (`index.html` 의 주석에 실측이 있다).
   reset: el<HTMLButtonElement>('reset'),
   clear: el<HTMLButtonElement>('clear'),
+  // 저장된 드레이프 적용 (W-1). 사유·결과는 툴팁이 아니라 `#drapestat` 글자다
+  drape: el<HTMLButtonElement>('drape'),
+  drapestat: el<HTMLElement>('drapestat'),
   snap: el<HTMLButtonElement>('snap'),
   mode: el<HTMLButtonElement>('mode'),
   snapstat: el<HTMLElement>('snapstat'),
@@ -206,6 +211,8 @@ let busy = false;
 client.on('open', ({ reconnected, attempt }) => {
   // 새 워커다. 시뮬도 구독도 씬도 초기값이므로 우리 쪽 믿음을 먼저 지운다.
   playback.sessionStarted();
+  // 지난 세션의 드레이프 결과는 이 워커의 것이 아니다 (W-1).
+  draping.reset();
   // 새 워커는 씬도 파라미터도 초기값이다. 화면에 남은 값은 이미 죽은 세션의 것이다.
   refreshParams();
   if (!reconnected) return;
@@ -568,6 +575,46 @@ const playback = new PlaybackController({
   },
 });
 
+// ── 저장된 드레이프 (W-1) ───────────────────────────────────
+//
+// 판단은 `panels/draping.ts`(DOM 없음), 배선만 여기다 — 재생 컨트롤과 같은 3층이다.
+//
+// ★ **`reset` 과 같은 자리의 op 이다.** 워커의 `LoadDrapingItem` 이 안에서
+//   `ztSimulationManager::Reset()` 을 부르므로 성공하면 프레임 카운터가 -1 로
+//   되돌아간다. 그래서 뒤처리를 **새로 만들지 않고 리셋의 것을 그대로 쓴다** —
+//   `refreshPose()`(화면의 포즈)와 `playback.syncFromWorker()`(재생 상태·프레임
+//   번호) 둘이고, 이는 `PlaybackHooks.afterReset` + `#run` 이 하는 일과 같다.
+// 타입을 손으로 적는다. `paintDraping` 의 기본 인자가 이 상수를 다시 보므로
+// (hooks.onChange → paintDraping → draping.view) 추론이 자기 자신을 물어 TS7022 가 된다.
+const draping: DrapingPanel = new DrapingPanel({
+  port: client,
+  hooks: {
+    log,
+    onChange: paintDraping,
+    afterApplied: async () => {
+      // 옷의 포즈가 바뀌었다. 시뮬이 멈춰 있으면 frame 이벤트가 한 건도 안
+      // 오므로(워커는 maxFrame 이 바뀔 때만 낸다) 여기서 안 받으면 **화면은
+      // 펼쳐진 옷 그대로**다 — 리셋과 정확히 같은 계열의 거짓말이다.
+      await refreshPose('드레이프');
+      // 프레임 카운터가 -1 이 됐고 시뮬 모드도 달라졌을 수 있다. 믿음이 아니라
+      // 워커의 사실로 덮어쓴다.
+      await playback.syncFromWorker();
+    },
+  },
+});
+
+/** 버튼 하나와 글자 한 줄. **상태는 만들지 않는다 — 받은 것만 그린다** */
+function paintDraping(view: DrapingView = draping.view): void {
+  ui.drape.disabled = busy || !view.canApply;
+  ui.drapestat.textContent = view.text;
+  ui.drapestat.classList.toggle('err', view.isError);
+}
+
+ui.drape.addEventListener('click', () => void draping.apply());
+
+// 연결 전에도 이유가 보여야 한다 — 빈 자리에는 "왜 못 누르는지" 가 없다.
+paintDraping();
+
 /**
  * 리셋 뒤에 **포즈를 다시 받아 온다.**
  *
@@ -578,22 +625,26 @@ const playback = new PlaybackController({
  *
  * 토폴로지는 리셋으로 바뀌지 않으므로 `meshData(false)`(위치만)면 충분하다 —
  * 103MB 재로드가 아니라 프레임 한 장 값이다.
+ *
+ * ★ 드레이프 적용(W-1)도 **같은 이유로 같은 것을 부른다.** 엔진이 안에서
+ *   `Reset()` 하므로 사정이 정확히 같다 — 그래서 로그 문구만 갈라 두고 구현은
+ *   하나로 둔다(두 벌이 되면 한쪽만 고쳐지는 날이 온다).
  */
-async function refreshPose(): Promise<void> {
+async function refreshPose(cause = '리셋'): Promise<void> {
   if (!currentScene || !client.connected) return;
   // 칸에 남아 있는 옛 런의 프레임을 먼저 버린다. 안 그러면 방금 받은 리셋
   // 포즈를 다음 rAF 가 드레이프된 프레임으로 덮어쓴다.
   stream.resume();
   const patterns = decodePatterns(await client.meshData(false));
   if (!viewer.cloth.updatePositions(patterns)) {
-    log('리셋 후 포즈가 화면의 토폴로지와 다릅니다 — 씬을 다시 로드하세요');
+    log(`${cause} 후 포즈가 화면의 토폴로지와 다릅니다 — 씬을 다시 로드하세요`);
     return;
   }
   // 정점 버퍼가 방금 3D 로 덮였다. 펼침의 원본도 같이 갱신해야 한다 —
   // 안 하면 t>0 인 채로 리셋했을 때 화면이 리셋 전 포즈에 멎는다
   // (`sync` 가 다시 쓰라고 표시까지 해 준다).
   unfolder.sync(viewer.cloth.patterns);
-  log(`리셋 — 포즈를 다시 받아 화면에 반영했습니다 (패턴 ${patterns.length})`);
+  log(`${cause} — 포즈를 다시 받아 화면에 반영했습니다 (패턴 ${patterns.length})`);
 }
 
 /**
@@ -641,6 +692,12 @@ function paintPlayback(view: PlaybackView = playback.view): void {
   ui.reset.disabled = busy || !view.canReset;
   ui.clear.disabled = busy || !view.canClear;
   ui.sim.textContent = view.text;
+  // ★ 드레이프 버튼의 활성 조건도 **여기서 나오는 사실**을 쓴다 (W-1).
+  //   `currentScene`(우리가 보고 싶은 것)이 아니라 `view.scene`(워커에 로드돼
+  //   있다고 아는 것)이라야 한다 — 재연결 직후처럼 둘이 갈라지는 순간에
+  //   currentScene 을 믿으면 버튼이 켜져 있는데 워커는 "씬이 없다" 로 답한다.
+  draping.setScene(view.scene !== null);
+  paintDraping();
   // ★ 재생 중에는 파라미터 [적용] 을 잠근다. **위젯은 열어 둔다** — 값을 미리
   //   맞춰 두고 정지한 뒤 한 번에 보낼 수 있다. 잠그는 이유는 시뮬이 도는
   //   도중의 변경이 어떻게 반영되는지 **측정한 적이 없어서**다. 한 런의
@@ -1192,6 +1249,12 @@ declare global {
      *  화면이 무엇을 말하고 있어야 하는지의 정본이다 */
     avatarBody: AvatarBodyPanel;
     surfaceSize: SurfaceSizePanel;
+    /**
+     * W-1 의 진단 표면 — 저장된 드레이프. `draping.view.text` 가 화면이 말하고
+     * 있어야 하는 글자이고, `draping.stats.noAutoItem` 이 0 이 아니면 **씬에
+     * 자동 드레이프가 없어서** 아무 일도 안 일어난 것이다(실패가 아니다).
+     */
+    draping: DrapingPanel;
     viewer2d: Viewer2D;
     unfolder2d: Unfolder;
     stream: FrameStream;
@@ -1227,6 +1290,7 @@ globalThis.cobalt = {
   viewer,
   avatarBody,
   surfaceSize,
+  draping,
   viewer2d,
   unfolder2d,
   stream,

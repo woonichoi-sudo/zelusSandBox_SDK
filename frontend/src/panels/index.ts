@@ -77,6 +77,21 @@ export {
   type AvatarPhase,
 } from './avatarBody.ts';
 
+/**
+ * 저장된 드레이프 적용 (W-1). **`reset` 과 같은 자리의 op 이다** — 성공하면
+ * 워커가 프레임 카운터를 -1 로 되돌린다(원본 머리말 참고).
+ */
+export {
+  DrapingPanel,
+  type DrapingHooks,
+  type DrapingOptions,
+  type DrapingOutcome,
+  type DrapingPhase,
+  type DrapingPort,
+  type DrapingStats,
+  type DrapingView,
+} from './draping.ts';
+
 export {
   SurfaceSizePanel,
   validateSize,

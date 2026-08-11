@@ -66,6 +66,11 @@ export type {
   AvatarBodyResult,
   AvatarMeasurement,
   SetAvatarBodyResult,
+  // 치수로 몸 만들기 · 드레이프 (W-1)
+  AvatarMeasurementTargets,
+  SetAvatarMeasurementsResult,
+  DrapingItem,
+  LoadDrapingResult,
   // 옷 사이즈 (L-3b)
   SurfaceInfo,
   SurfacesResult,

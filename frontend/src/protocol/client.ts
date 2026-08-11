@@ -43,7 +43,10 @@ import {
   type ServerEvent,
   type ServerMessage,
   type AvatarBodyResult,
+  type AvatarMeasurementTargets,
+  type LoadDrapingResult,
   type SetAvatarBodyResult,
+  type SetAvatarMeasurementsResult,
   type SurfacesResult,
   type Design2DResult,
   type SetParamsResult,
@@ -519,6 +522,59 @@ export class GatewayClient {
    */
   setAvatarBody(bodyParams: Record<string, number>): Promise<SetAvatarBodyResult> {
     return this.request<SetAvatarBodyResult>('setAvatarBody', { bodyParams });
+  }
+
+  /**
+   * 치수(cm)로 몸을 만든다 (W-1). 키는 `avatarBody()` 의 `measurements` 이름이다.
+   *
+   * ★ **`null` 은 "지정 안 함" 이다.** 키 25개를 전부 실어 보내고 안 바꿀 것을
+   *   null 로 두는 것이 엔진팀이 정한 사용법이며, 게이트웨이도 워커도 그렇게
+   *   받는다(전부 null 이어도 성공이고 `skipped` 로만 센다).
+   *
+   * ★ **되읽기의 정본은 `measured` 다.** 응답의
+   *   `avatar.measurements[*].real` 은 **이 op 으로 움직이지 않는다** — 씬
+   *   데이터의 사본이라 쓰기가 닿지 않는다(실측: Δ15cm 를 걸어도 61.647 그대로).
+   *   화면이 그 값을 "지금 치수" 로 보여주면 거짓말이 된다.
+   *
+   * ⚠️ **오래 걸린다.** 실측 Release 허리둘레 Δ15cm = **15.4초**이고, 그동안
+   *    이 세션의 워커는 다른 요청에 응답하지 못한다(stdin 순차 처리). 기본
+   *    제한 시간은 60초라 더 큰 변경은 `timeoutMs` 를 올려야 할 수 있다 —
+   *    다만 워커 쪽 상한이 120초이므로 그 위로 올려 봐야 소용이 없다.
+   */
+  setAvatarMeasurements(
+    measurements: AvatarMeasurementTargets,
+    opts: {
+      simulationIterations?: number;
+      bodyDimensionStepCm?: number;
+      timeoutMs?: number;
+    } = {},
+  ): Promise<SetAvatarMeasurementsResult> {
+    return this.request<SetAvatarMeasurementsResult>(
+      'setAvatarMeasurements',
+      {
+        measurements,
+        ...(opts.simulationIterations === undefined
+          ? {} : { simulationIterations: opts.simulationIterations }),
+        ...(opts.bodyDimensionStepCm === undefined
+          ? {} : { bodyDimensionStepCm: opts.bodyDimensionStepCm }),
+      },
+      opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs },
+    );
+  }
+
+  /**
+   * `.zls` 에 저장된 자동 드레이프를 적용한다 (W-1) — 펼쳐진 옷이 입혀진다.
+   *
+   * ⚠️ **`applied:false` 는 실패가 아니다.** 그 씬에 자동 드레이프가 저장돼
+   *    있지 않을 뿐이고(`reason:'noAutoItem'`), 게이트웨이도 성공으로 중계한다.
+   *    씬이 로드되지 않았을 때만 `GatewayError` 로 던진다.
+   *
+   * ★ **`applied:true` 면 워커가 프레임 카운터를 -1 로 되돌린다** (엔진이 안에서
+   *   `Reset()` 한다). 즉 화면에는 `reset` 과 **같은 무게**의 op 이다 — 재생
+   *   상태·프레임 표시·화면의 포즈를 리셋과 똑같이 갱신해야 한다.
+   */
+  loadDraping(): Promise<LoadDrapingResult> {
+    return this.request<LoadDrapingResult>('loadDraping');
   }
 
   /** 서피스(패턴) 목록과 크기. **cm 다** (L-3b) */

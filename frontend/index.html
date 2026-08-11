@@ -232,6 +232,13 @@
       #status.err { color: #ff9a9a; opacity: 1; }
       .stat { opacity: 0.5; }
       .stat b { font-weight: 600; opacity: 0.95; }
+      /*
+        드레이프의 사유·결과 (W-1). 다른 `.stat` 보다 진하다 — 이건 계측값이
+        아니라 **사용자에게 하는 말**이라, 흐리게 두면 "안 보이는 글자" 가 된다.
+        "자동 드레이프가 없다" 는 오류가 아니므로 빨갛게 칠하지 않는다(.err 만).
+      */
+      #drapestat { opacity: 0.85; }
+      #drapestat.err { color: #ff9a9a; opacity: 1; }
 
       /*
         3D 조작 힌트. 화면 기준(fixed) → **3D 칸 기준**(absolute)으로 바뀐다.
@@ -433,6 +440,18 @@
       <button id="reset" disabled title="시뮬레이션을 처음으로 되돌립니다. 씬은 그대로입니다 (R)">↺ 리셋</button>
       <button id="clear" disabled title="씬을 워커에서 내립니다. 다시 보려면 로드해야 합니다 (C)">✕ 씬 내림</button>
       <!--
+        드레이프 적용 (W-1). `.zls` 에 저장된 "입혀진 상태" 를 씌운다 — 로드
+        직후의 옷은 펼쳐진 채이고, 이 버튼이 그것을 입힌다.
+
+        ⚠️ **리셋과 같은 무게의 버튼이다.** 성공하면 워커가 프레임 카운터를
+           -1 로 되돌린다(엔진이 안에서 Reset 한다). 그래서 옆의 재생 컨트롤과
+           같은 줄에 둔다 — 오른쪽 칸(체형·사이즈)의 물건이 아니다.
+        ⚠️ `#drapestat` 은 **툴팁이 아니라 화면 글자다.** 비활성 사유도,
+           "이 씬에는 자동 드레이프가 없다" 도 여기 뜬다 — 아무 일도 안 일어난
+           화면은 고장으로 보인다(#16 에서 확립한 규칙).
+      -->
+      <button id="drape" disabled>👗 드레이프</button>
+      <!--
         스냅샷 = 익스포트한 glTF(아바타 + 진짜 머티리얼)를 화면에 세운다.
         **버튼이다. 자동이 아니다** — 사용자 씬 기준 36.5MB / 4.3초라 씬을 열
         때마다 자동으로 돌리면 첫 화면이 그만큼 늦어진다.
@@ -442,6 +461,8 @@
       <button id="snap" disabled title="지금 포즈를 glTF 로 내보내 아바타와 함께 세웁니다">🧍 스냅샷</button>
       <button id="mode" disabled hidden>↩ 실시간</button>
       <span class="spacer"></span>
+      <!-- 드레이프의 사유·결과 (W-1). 위 버튼 주석 참고 -->
+      <span id="drapestat" class="stat"></span>
       <span id="snapstat" class="stat"></span>
       <!--
         `#sim` 은 **워커가 말하는 상태**(재생/정지 · 프레임)이고 `#frames` 는

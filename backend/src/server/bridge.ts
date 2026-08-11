@@ -288,6 +288,69 @@ const buildSetAvatarBody: Build = (msg) => {
 };
 
 /**
+ * setAvatarMeasurements: 치수는 **숫자 아니면 `null`** 이다 (W-1).
+ *
+ * `buildSetAvatarBody` 와 갈리는 지점이 정확히 그 `null` 이다. 엔진팀 문서가
+ * "키 25개를 전부 보내고 안 바꿀 것은 null" 이라고 정했고, 워커도 null 을
+ * `rejected` 가 아니라 `skipped` 로 센다. 여기서 null 을 거절하면 **정상 요청이
+ * 통째로 막힌다** — 실제 파일을 그대로 보내면 23개가 null 이다.
+ *
+ * 범위(cm)는 검사하지 않는다. `setParams`·`setAvatarBody` 와 같은 판단이다 —
+ * 어떤 치수가 가능한 몸인지는 엔진이 알고, 게이트웨이가 흉내 내면 두 곳이
+ * 어긋난 채로 굳는다. 모르는 이름도 막지 않는다(워커가 `unknown` 으로 답한다).
+ *
+ * ⚠️ **빈 객체는 거절한다.** 워커가 "measurements가 필요합니다" 로 거절하므로
+ *    통과시켜도 결과는 같지만, 왕복 하나를 아끼면서 문구도 같은 자리에서 나온다.
+ *
+ * 두 옵션은 **넘어온 것만 싣는다.** 기본값(6 / 1.0)을 여기 적으면 워커의
+ * 기본값과 두 곳이 되고, 그 둘이 갈라지는 날 아무도 모른다.
+ */
+const buildSetAvatarMeasurements: Build = (msg) => {
+  const measurements = msg['measurements'];
+  if (!isRecord(measurements) || Array.isArray(measurements)) {
+    reject('measurements 필드가 필요합니다 (객체)');
+  }
+
+  const out: Record<string, number | null> = {};
+  for (const [k, v] of Object.entries(measurements)) {
+    // ★ null 은 "지정 안 함" 이다. 잘못된 값이 아니다.
+    if (v === null) {
+      out[k] = null;
+      continue;
+    }
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      reject(`measurements.${k}는 숫자나 null 이어야 합니다 (받은 값: ${describe(v)})`);
+    }
+    out[k] = v;
+  }
+  if (Object.keys(out).length === 0) {
+    reject('measurements 가 비어 있습니다 (치수 이름 → cm 또는 null)');
+  }
+
+  const payload: Record<string, unknown> = { measurements: out };
+
+  const iterations = msg['simulationIterations'];
+  if (iterations !== undefined) {
+    if (typeof iterations !== 'number' || !Number.isInteger(iterations) || iterations < 0) {
+      reject(`simulationIterations는 0 이상의 정수여야 합니다 (받은 값: ${describe(iterations)})`);
+    }
+    payload['simulationIterations'] = iterations;
+  }
+
+  const stepCm = msg['bodyDimensionStepCm'];
+  if (stepCm !== undefined) {
+    // 워커가 0 을 막지만(0 이면 단계 수가 무한이 되어 돌아오지 않는다) 여기서도
+    // 거른다 — 워커를 굳게 만들 수 있는 값은 게이트웨이를 지나지 않는 편이 낫다.
+    if (typeof stepCm !== 'number' || !Number.isFinite(stepCm) || stepCm <= 0) {
+      reject(`bodyDimensionStepCm는 0보다 큰 숫자여야 합니다 (받은 값: ${describe(stepCm)})`);
+    }
+    payload['bodyDimensionStepCm'] = stepCm;
+  }
+
+  return { payload };
+};
+
+/**
  * setSurfaceSize: uuid 는 필수, 크기는 **둘 중 하나만 있어도 된다** (L-3b).
  *
  * 둘 다 요구하지 않는 이유는 워커 쪽과 같다 — 화면이 항상 두 값을 들고 있어야
@@ -474,6 +537,34 @@ const OPS: Record<Op, OpRule> = {
   // 실제로 어떻게 처리하는지가 우리 코드에 가려진다. 모르는 키는 워커가
   // unknown 으로 되돌려 준다(ISSUE-014 를 되풀이하지 않는 자리다).
   setAvatarBody: { allow: true, build: buildSetAvatarBody },
+
+  // ── 치수로 몸 만들기 (W-1) ────────────────────────────────
+  //
+  // 쓰기다. `setAvatarBody` 와 같은 판단이되 **null 을 통과시킨다** — 그것이
+  // "지정 안 함" 의 표현이라서다(buildSetAvatarMeasurements 주석).
+  //
+  // ⚠️ **이 테이블에서 유일하게 세션을 오래 붙잡는 op 이다.** 실측 Release
+  //    Δ15cm = 15.4초이고 그동안 워커가 다른 요청에 답하지 못한다(stdin 순차
+  //    처리). 그래도 게이트웨이에 특별 취급을 두지 않았다:
+  //      - 요청 타임아웃 120초(worker.ts) 안이고, 소켓 하트비트는 게이트웨이의
+  //        이벤트 루프가 내므로 워커가 바빠도 연결이 끊기지 않는다
+  //      - 상한을 여기 두면 "얼마가 너무 긴가" 를 게이트웨이가 정하게 되는데,
+  //        그 답은 씬과 Δ에 달렸다 — 엔진만 안다
+  //    진행률·취소는 계획 밖이다(있다면 워커 프로토콜 쪽 일이다).
+  setAvatarMeasurements: { allow: true, build: buildSetAvatarMeasurements },
+
+  // ── 드레이프 (W-1) ────────────────────────────────────────
+  //
+  // 인자가 없다. 씬 존재 확인은 **워커가 한다** — `setSurfaceSize` 의 uuid 와
+  // 같은 판단이다(게이트웨이가 씬 상태를 따라다니면 세션이 하는 일을 두 번
+  // 하게 되고, 갈라지면 더 나쁘다).
+  //
+  // ★ **성공해도 `applied:false` 일 수 있다.** 씬에 자동 드레이프가 저장돼
+  //   있지 않은 경우이고 **에러가 아니다** — mapResult 로 실패로 바꾸지 않는다.
+  //   화면이 그 사실을 글자로 말하면 된다.
+  // ★ `applied:true` 면 워커가 프레임 카운터를 -1 로 되돌린다(엔진이 안에서
+  //   Reset 한다). 즉 클라이언트에게는 `reset` 과 같은 무게의 op 이다.
+  loadDraping: { allow: true },
 
   // ── 옷 사이즈 (L-3b) ──────────────────────────────────────
   //

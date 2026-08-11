@@ -24,6 +24,19 @@ export type Request =
   | { id: number; op: 'setParams'; params: Partial<SimulationParams> }
   | { id: number; op: 'avatarBody' }
   | { id: number; op: 'setAvatarBody'; bodyParams: Record<string, number> }
+  /**
+   * 치수(cm)로 몸을 만든다 (W-1). ⚠️ **오래 걸린다** — 아래
+   * `SetAvatarMeasurementsResult` 주석의 실측 참고.
+   */
+  | {
+      id: number;
+      op: 'setAvatarMeasurements';
+      measurements: AvatarMeasurementTargets;
+      simulationIterations?: number;
+      bodyDimensionStepCm?: number;
+    }
+  /** `.zls` 에 저장된 자동 드레이프를 적용한다 (W-1) */
+  | { id: number; op: 'loadDraping' }
   | { id: number; op: 'surfaces' }
   | { id: number; op: 'setSurfaceSize'; uuid: string; width?: number; height?: number }
   | { id: number; op: 'design2d' }
@@ -321,6 +334,107 @@ export interface AvatarBodyResult {
   bodyParams?: Record<string, number>;
   /** 치수 25개. 키는 `ztAvatarMeasureUtils::GetMeasurePartName` */
   measurements?: Record<string, AvatarMeasurement>;
+}
+
+// ── 치수로 몸 만들기 (W-1) ──────────────────────────────────
+//
+// `setAvatarBody` 는 정규화 0~1 의 체형 슬라이더이고, 이쪽은 **cm 단위의 치수**
+// 를 목표로 걸어 엔진이 그 몸을 만들게 한다. 둘은 같은 아바타를 다른 어휘로
+// 만지는 것이라 응답이 서로의 결과를 되읽어 준다.
+
+/**
+ * 치수 목표. 키는 `AvatarBodyResult.measurements` 와 **같은 이름**이고
+ * (`ztAvatarMeasureUtils::GetMeasurePartIdx` 가 정본), 값은 cm 다.
+ *
+ * ★ **`null` 은 "지정 안 함" 이다. 잘못된 값이 아니다.** 엔진팀 문서가 키 25개를
+ *   전부 보내고 안 바꿀 것을 null 로 두라고 한다. 워커는 null 을 `rejected` 가
+ *   아니라 `skipped` 로 세고, 전부 null 이어도 성공으로 답한다
+ *   (`protocol.cpp` 의 `ApplyAvatarMeasurements`).
+ */
+export type AvatarMeasurementTargets = Record<string, number | null>;
+
+/**
+ * ⚠️ **오래 걸리는 유일한 op 이다.** 목표까지 `bodyDimensionStepCm` 씩 쪼개
+ * 밀면서 단계마다 `simulationIterations` 번 시뮬을 돌린다 — 그동안 워커는
+ * **다른 요청에 응답하지 못한다**(stdin 을 순차 처리한다).
+ *
+ * **[실측 2026-08-11]** Release, 허리둘레 Δ15cm = 16단계 × 6회 = Step 96번,
+ * **15.4초**. (같은 조건 Debug 는 142초로 워커 기본 타임아웃 120초를 넘겼다.)
+ *
+ * `applied` 가 비고 `skipped` 만 크면 "바꿀 것이 없었다" 가 정상 통과한 것이다.
+ */
+export interface SetAvatarMeasurementsResult {
+  /** 실제로 목표를 건 치수 이름 */
+  applied: string[];
+  /** 엔진에 그런 치수 이름이 없다. `setParams` 와 같은 규약이다 */
+  unknown: string[];
+  /** 이름은 맞지만 값을 쓸 수 없다 (숫자도 null 도 아닌 값) */
+  rejected: string[];
+  /** null 이라 건너뛴 수. **오류가 아니다** */
+  skipped: number;
+  /** 중간 단계 수 (마지막 목표값 단계 포함) */
+  steps: number;
+  /** 실제로 부른 Step 횟수 = 대략 `steps × simulationIterations` */
+  simSteps: number;
+  /** 적용 직후의 프레임 카운터. 엔진이 안에서 리셋하므로 보통 -1 이다 */
+  frame: number;
+  /**
+   * ★ **되읽기의 정본이다.** 적용 뒤 `ztDesignZeta` 에서 **다시 잰** 치수
+   * (이름 → cm)이고, 요청한 것만이 아니라 **25개 전부**가 실린다.
+   *
+   * ⚠️ **단, 실제로 적용된 것이 하나도 없으면 비어 있다** (실측 2026-08-11:
+   *    키 25개를 전부 null 로 보내면 `skipped:25, steps:0` 에 `measured` 는
+   *    `{}`). 워커가 다시 재는 것은 몸을 바꾼 뒤이기 때문이다 — 지금 치수를
+   *    그냥 읽고 싶으면 이 op 이 아니라 `avatarBody` 다.
+   *
+   * ⚠️ 아래 `avatar.measurements[*].real` 은 **이 op 으로 움직이지 않는다** —
+   *    그쪽은 씬 데이터의 사본이라 쓰기가 닿지 않는다(실측: Δ15cm 를 걸고
+   *    Step 을 96번 돌려도 61.647 그대로였는데 glTF 해시는 바뀌었다).
+   *    화면이 "지금 치수" 로 보여줄 값은 반드시 이쪽이다.
+   */
+  measured: Record<string, number>;
+  /** 적용 뒤 다시 읽은 체형. 위 경고대로 `measurements` 쪽은 낡은 값이다 */
+  avatar: AvatarBodyResult;
+}
+
+// ── 드레이프 (W-1) ──────────────────────────────────────────
+//
+// `.zls` 는 "입혀진 상태" 를 드레이핑 아이템으로 저장해 둔다. 그냥 로드하면
+// 옷이 펼쳐진 채로 나오고, 이 op 이 그 저장된 상태를 씌운다.
+
+/** 씬에 저장된 드레이프 아이템 하나 */
+export interface DrapingItem {
+  uuid: string;
+  name: string;
+  /**
+   * 자동 드레이프(`ztDrapingItem::AUTO_ITEM_UUID`)인가.
+   * **`loadDraping` 이 적용하는 것은 이것 하나다** — 나머지는 목록에만 나온다.
+   */
+  isAuto: boolean;
+}
+
+/**
+ * ⚠️ **`applied: false` 는 에러가 아니다.** 씬에 자동 드레이프가 저장돼 있지
+ * 않을 뿐이고(`reason: 'noAutoItem'`), 그 경우에도 op 자체는 성공으로 답한다.
+ * 씬이 로드되지 않았을 때만 `ok:false` 가 된다.
+ *
+ * ★ **`applied: true` 면 워커가 프레임 카운터를 -1 로 되돌린다** —
+ *   `LoadDrapingItem` 이 안에서 `ztSimulationManager::Reset()` 을 부르기
+ *   때문이다. 즉 **`reset` op 과 같은 자리**이고, 화면의 재생 상태·프레임
+ *   표시도 리셋과 똑같이 갱신돼야 한다.
+ */
+export interface LoadDrapingResult {
+  applied: boolean;
+  /** 왜 못 했는가. `applied: true` 면 없다 */
+  reason?: 'noAutoItem' | 'loadFailed';
+  items: DrapingItem[];
+  count: number;
+  /**
+   * 엔진이 말하는 활성 아이템. **이것이 적용 여부의 증거다** — 요청을 메아리친
+   * 값이 아니다. 쿼리 인터페이스가 없으면 없을 수 있다.
+   */
+  activeUuid?: string;
+  activeName?: string;
 }
 
 // ── 옷 사이즈 (L-3b) ────────────────────────────────────────

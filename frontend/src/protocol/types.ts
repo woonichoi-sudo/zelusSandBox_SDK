@@ -32,6 +32,15 @@ export type {
   AvatarBodyResult,
   AvatarMeasurement,
   SetAvatarBodyResult,
+  // 치수로 몸 만들기 (W-1). ⚠️ 되읽기의 정본은 `SetAvatarMeasurementsResult.
+  // measured` 다 — `avatar.measurements[*].real` 은 이 op 으로 **안 움직인다**
+  // (씬 데이터의 사본이라 쓰기가 닿지 않는다. 원본 주석에 실측이 있다).
+  AvatarMeasurementTargets,
+  SetAvatarMeasurementsResult,
+  // 드레이프 (W-1). ⚠️ `applied:false` 는 에러가 아니라 "그 씬에 자동 드레이프가
+  // 없다" 이고, `applied:true` 는 프레임 카운터를 -1 로 되돌린다(= reset 과 같은 자리)
+  DrapingItem,
+  LoadDrapingResult,
   // 옷 사이즈 (L-3b). 크기는 cm 다
   SurfaceInfo,
   SurfacesResult,
