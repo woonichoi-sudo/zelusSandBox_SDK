@@ -4,7 +4,9 @@
 
 #include <zsTransform.h>   // 패턴 → 월드 변환 (MeshData)
 
+#include <ztAvatarCommon.h>        // ztAvatarBodyParam·ztAvatarMeasurePart + 이름 함수
 #include <ztDesign2DTransform.h>   // 서피스 2D 배치 (MeshData의 transform2d)
+#include <ztDesignAvatar.h>        // ztDesignAvatarData·ztDesignZetaData (체형)
 #include <ztDesignClothPattern.h>
 #include <ztDesignMaterial.h>      // 패턴 색 (MeshData의 material)
 #include <ztDesignSurface.h>       // GetTransform() — 전방선언만으론 부족하다
@@ -161,6 +163,117 @@ ztSceneQueryInterface* QueryInterface(ZestManager& manager)
 {
     ztScene* scene = manager.GetSceneManager()->GetCurrentScene();
     return scene ? scene->GetQueryInterface() : nullptr;
+}
+
+// ── 아바타 체형 (L-3a) ──────────────────────────────────────
+//
+// 데스크톱 앱에는 이 UI가 없다. 엔진에는 완비돼 있고 노출만 안 돼 있었다.
+//
+// ── 경로를 여기로 정한 이유 ─────────────────────────────────
+// `ztAvatarManager` 에 SetBodyParam/SetMeasurementParam/UpdateBodyParams 가
+// 전부 있지만 **그 객체를 얻는 공개 경로가 SDK 헤더에 없다** — `ztDesignAvatar`
+// 는 메시·본·측정커브만 노출하고 매니저를 안 준다. 대신
+// `ztSceneQueryInterface` 가 데이터 왕복을 열어 둔다:
+//
+//     GetCurrentAvatar() → GetAvatarData(uuid) → 복사·수정 → UpdateAvatar(uuid, 수정본)
+//
+// 체형은 `ztDesignAvatarData::zetaData` 안에 있다(`ztDesignZetaData`):
+//   bodyParams               float 29개 — ztAvatarBodyParam 순서
+//   measurementExpectedValues 목표 치수 25개 (value + isLock)
+//   measurementRealValues     실측 치수 25개
+//
+// ⚠️ **`UpdateAvatar` 가 체형을 실제로 반영하는지는 헤더로 알 수 없다.**
+//    내부에서 `UpdateBodyParams()` 를 부르는지 여부가 이 단위의 유일한
+//    미지수이고, 돌려 봐야 답이 나온다. 그래서 아래 `setAvatarBody` 는
+//    **쓰고 나서 다시 읽어** 응답에 실어 준다 — 값이 안 붙었으면 그 사실이
+//    응답에 그대로 드러난다(요청한 값을 메아리치면 거짓말이 된다).
+
+/** 키는 엔진이 정한 이름을 그대로 쓴다 — 우리가 발명하면 두 이름이 갈라진다 */
+json ReadAvatarBody(ZestManager& manager)
+{
+    ztSceneQueryInterface* qi = QueryInterface(manager);
+    if (!qi) return json{ { "hasAvatar", false } };
+
+    const ztUuid uuid = qi->GetCurrentAvatar();
+    const ztDesignAvatarData* data = qi->GetAvatarData(uuid);
+    if (!data) return json{ { "hasAvatar", false } };
+
+    const ztDesignZetaData& z = data->zetaData;
+
+    json params = json::object();
+    for (int i = 0; i < (int)ztAvatarBodyParam::Count; ++i)
+    {
+        params[ztAvatarBodyParamUtils::GetParamName((ztAvatarBodyParam)i)] = z.bodyParams[i];
+    }
+
+    json measures = json::object();
+    for (int i = 0; i < (int)ztAvatarMeasurePart::Count; ++i)
+    {
+        const auto& want = z.measurementExpectedValues[i];
+        json m = json{
+            { "real",   z.measurementRealValues[i] },
+            { "locked", want.isLock },
+        };
+        // FLT_MIN 이 "목표 없음" 의 표시다(MeasurementInfo 의 기본값). 그대로
+        // 실으면 받는 쪽이 1.17e-38 을 치수로 읽는다.
+        if (want.value != FLT_MIN) m["expected"] = want.value;
+        // ⚠️ 이름 함수가 **두 구조체로 갈려 있다** — 체형은 ztAvatarBodyParamUtils,
+        //    치수는 ztAvatarMeasureUtils 다. 한쪽에 다 있을 것으로 짐작하면 컴파일에서 걸린다.
+        measures[ztAvatarMeasureUtils::GetMeasurePartName((ztAvatarMeasurePart)i)] = m;
+    }
+
+    return json{
+        { "hasAvatar",    true },
+        { "uuid",         uuid.GetString() },
+        { "bodyParams",   params },
+        { "measurements", measures },
+    };
+}
+
+/**
+ * 체형 값을 쓴다. `applied` / `unknown` 은 `setParams` 와 같은 규약이다.
+ *
+ * ⚠️ **모르는 키를 조용히 넘기지 않는다.** ISSUE-014 가 정확히 그 반대 상황이었다
+ *    — 워커가 안 먹는 필드에도 "적용됨" 이라고 답해서, 화면은 값을 바꿨다고
+ *    믿는데 시뮬은 그대로였다.
+ */
+bool WriteAvatarBody(ZestManager& manager, const json& body,
+                     std::vector<std::string>& applied,
+                     std::vector<std::string>& unknown)
+{
+    ztSceneQueryInterface* qi = QueryInterface(manager);
+    if (!qi) return false;
+
+    const ztUuid uuid = qi->GetCurrentAvatar();
+    const ztDesignAvatarData* cur = qi->GetAvatarData(uuid);
+    if (!cur) return false;
+
+    // 값 복사본을 만들어 고친다. 원본은 const 이고, 부분 수정본을 넘기면
+    // 나머지 필드(포즈·텍스처·액세서리)가 기본값으로 덮인다.
+    ztDesignAvatarData next = *cur;
+
+    for (auto it = body.begin(); it != body.end(); ++it)
+    {
+        if (!it.value().is_number()) { unknown.push_back(it.key()); continue; }
+
+        int index = -1;
+        for (int i = 0; i < (int)ztAvatarBodyParam::Count; ++i)
+        {
+            if (it.key() == ztAvatarBodyParamUtils::GetParamName((ztAvatarBodyParam)i))
+            {
+                index = i;
+                break;
+            }
+        }
+
+        if (index < 0) { unknown.push_back(it.key()); continue; }
+
+        next.zetaData.bodyParams[index] = it.value().get<float>();
+        applied.push_back(it.key());
+    }
+
+    if (!applied.empty()) qi->UpdateAvatar(uuid, next);
+    return true;
 }
 
 // base64 — 정점 버퍼를 JSON에 실어 보내기 위한 임시 수단이다.
@@ -819,6 +932,37 @@ int RunProtocolLoop(ZestManager& manager)
                     manager.UpdateLiveEditing(ztLiveEditType::UpdateClothPhysicsParameters);
 
                     result = json{ { "applied", applied }, { "unknown", unknown } };
+                }
+            }
+            else if (op == "avatarBody")
+            {
+                result = ReadAvatarBody(manager);
+            }
+            else if (op == "setAvatarBody")
+            {
+                if (!manager.IsLoadedZls())
+                {
+                    ok = false; error = "씬이 로드되지 않았습니다";
+                }
+                else
+                {
+                    std::vector<std::string> applied, unknown;
+                    if (!WriteAvatarBody(manager, req.value("bodyParams", json::object()),
+                                         applied, unknown))
+                    {
+                        ok = false; error = "씬에 아바타가 없습니다";
+                    }
+                    else
+                    {
+                        // ★ 쓰고 나서 **다시 읽어** 실어 준다. 요청한 값을 메아리치면
+                        //   UpdateAvatar 가 아무 일도 안 했을 때조차 성공으로 보인다 —
+                        //   그 미지수가 이 단위의 전부다(위 주석 참고).
+                        result = json{
+                            { "applied", applied },
+                            { "unknown", unknown },
+                            { "avatar",  ReadAvatarBody(manager) },
+                        };
+                    }
                 }
             }
             else if (op == "meshInfo")
