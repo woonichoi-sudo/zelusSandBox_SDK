@@ -94,7 +94,12 @@
         따라온다. `setSize(w, h, false)` 의 `false` 가 three 로 하여금 style 을
         건드리지 않게 하므로, 크기의 정본은 끝까지 이 CSS 다.
       */
-      #view { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+      /*
+        두 캔버스가 **같은 규칙**을 쓴다. 가운데 칸의 `#view2d`(L-2a)도 자기
+        칸을 꽉 채우고, 크기의 정본은 똑같이 CSS 다 — `Viewer2D` 의 `resize()`
+        가 `clientWidth/Height` 를 읽고 `setSize(w, h, false)` 로 넘긴다.
+      */
+      #view, #view2d { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 
       /*
         빈 자리 표시. **툴팁이 아니라 화면에 보이는 글자여야 한다** — 어느
@@ -108,6 +113,15 @@
       }
       .todo b { font-weight: 600; font-size: 14px; }
       .todo span { font-size: 12px; }
+      /*
+        ⚠️ **이 한 줄이 없으면 `hidden` 이 듣지 않는다.** 브라우저 기본 스타일의
+           `[hidden] { display: none }` 은 작성자 규칙에 진다 — 위의
+           `display: flex` 가 이겨서, `main.ts` 가 `hidden = true` 로 놔도 글자가
+           도면 위에 그대로 뜬다(L-2a 에서 실제로 그렇게 나왔다). 속성과 화면이
+           갈라지면 콘솔로는 "숨겼다" 고 나오는데 눈에는 보이므로, 원인을
+           찾기 전까지 렌더링 쪽을 의심하게 된다.
+      */
+      .todo[hidden] { display: none; }
 
       .bar {
         /* 흐름 안으로 들어왔다. 화면 맨 위·전체 폭이라는 사실은 그대로다 */
@@ -375,11 +389,31 @@
       한다 — 그게 L-2 의 일이다. 그때까지 이 칸은 비어 있고, 비어 있다는 사실이
       화면에 글자로 남는다.
     -->
+    <!--
+      ── 가운데 칸: 2D 재단 도면 (L-2a) ──────────────────────────
+      `src/viewer2d/viewer2d.ts` 의 `Viewer2D` 가 이 캔버스를 쥔다. 왼쪽 칸과
+      **별개의 렌더러이자 별개의 옷 한 벌**이다 — `Unfolder.apply()` 가 정점
+      버퍼를 덮어쓰기 때문에, 3D 와 도면을 동시에 보여주려면 버퍼가 둘이어야
+      한다.
+
+      ★ **이 칸은 프레임을 받지 않는다.** 도면 좌표는 `uvs`·`transform2d` 로만
+        계산되고 둘 다 topology 와 함께 한 번만 오므로, 재단 도면은 옷이 어떻게
+        드레이프되든 같다. 씬 하나당 한 번 세우면 끝이다.
+
+      ⚠️ 왼쪽 칸의 [펼침] 슬라이더는 **아직 왼쪽 칸을 모핑한다.** 슬라이더의
+         소속을 가운데로 옮기는 것은 L-2b 다. 그때까지는 슬라이더를 밀면 왼쪽
+         칸도 도면이 되어 같은 그림이 둘로 보인다 — 고장이 아니다.
+    -->
     <div id="viewport2d" class="cell">
-      <div class="todo">
+      <canvas id="view2d"></canvas>
+      <!--
+        도면이 없는 상태(씬 미로드 / 배치를 못 받음)를 화면에 글자로 남긴다.
+        빈 격자만 보이면 "아직 안 만든 것" 과 "고장난 것" 을 구분할 수 없다.
+        `main.ts` 가 `hidden` 을 토글한다.
+      -->
+      <div id="draft2dEmpty" class="todo">
         <b>2D 재단 도면</b>
-        <span>L-2 에서 채웁니다</span>
-        <span>지금은 왼쪽 아래 [펼침] 슬라이더로 3D 칸 안에서 봅니다</span>
+        <span>씬을 로드하면 여기에 재단 도면이 섭니다</span>
       </div>
     </div>
 

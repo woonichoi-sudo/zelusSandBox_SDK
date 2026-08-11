@@ -30,3 +30,13 @@ export {
   type DraftingBounds,
   type UnfoldStats,
 } from './unfold.ts';
+
+/**
+ * 가운데 칸의 도면 뷰포트 (L-2a). **위의 모핑과 배타가 아니다** — 왼쪽 칸은
+ * 여전히 `viewer.setUnfold` 로 3D↔도면을 잇고, 이쪽은 도면만 상시로 보여준다.
+ *
+ * ⚠️ 이 파일만 DOM(`WebGLRenderer`·`ResizeObserver`)을 만진다. Node 에서
+ *    import 되지 않으므로 자동 테스트가 못 붙는다 — 판단은 위쪽
+ *    `unfold.ts`·`control.ts` 에 두고 여기에는 그리는 일만 남길 것.
+ */
+export { Viewer2D, type Viewer2DOptions } from './viewer2d.ts';

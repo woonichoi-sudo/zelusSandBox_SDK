@@ -56,7 +56,7 @@ import {
   type SceneSummary,
 } from './protocol/index.ts';
 import { ParamsPanel } from './ui/index.ts';
-import { Unfolder, UnfoldController } from './viewer2d/index.ts';
+import { Unfolder, UnfoldController, Viewer2D } from './viewer2d/index.ts';
 import {
   FrameStream,
   showScene,
@@ -78,6 +78,9 @@ function el<T extends HTMLElement>(id: string): T {
 
 const ui = {
   canvas: el<HTMLCanvasElement>('view'),
+  // 가운데 칸의 도면 캔버스 (L-2a). 왼쪽 칸과 별개의 렌더러다.
+  canvas2d: el<HTMLCanvasElement>('view2d'),
+  draft2dEmpty: el<HTMLElement>('draft2dEmpty'),
   scene: el<HTMLSelectElement>('scene'),
   load: el<HTMLButtonElement>('load'),
   file: el<HTMLInputElement>('file'),
@@ -132,6 +135,39 @@ function message(err: unknown): string {
 
 const viewer = new Viewer3D({ canvas: ui.canvas });
 viewer.start();
+
+/**
+ * 가운데 칸의 재단 도면 (L-2a).
+ *
+ * ★ **프레임 경로에 붙지 않는다.** 도면 좌표는 `uvs`·`transform2d` 로만
+ *   계산되고 둘 다 topology 와 함께 한 번만 오므로, 옷이 어떻게 드레이프
+ *   되든 재단 도면은 같다. 그래서 아래 rAF 드레인(`#applyFrame`)에도,
+ *   `refreshPose()` 에도 이 뷰어가 나오지 않는다 — 세우는 것은 로드당 한 번,
+ *   `paintDraft2d()` 뿐이다.
+ */
+const viewer2d = new Viewer2D({ canvas: ui.canvas2d });
+viewer2d.start();
+
+/**
+ * 가운데 칸에 도면을 세운다. **`unfolder` 와 같은 계산을 다시 하지 않는다** —
+ * 왼쪽 칸의 모핑이 쓰는 것과 같은 `Unfolder` 를 한 벌 더 두고 `t = 1` 에
+ * 고정한다.
+ *
+ * 왜 별도의 `Unfolder` 인가: `build()` 가 만드는 목표 정점은 **메시 로컬**
+ * 좌표라(`unfold.ts` 머리말) 어느 메시에 걸린 3D 변환을 되돌린 것인지에
+ * 의존한다. 왼쪽 옷과 가운데 옷은 서로 다른 `Mesh` 객체이므로 목표도 따로
+ * 계산해야 한다. `build()` 는 로드당 한 번이라 비용이 두 배가 되어도 로드
+ * 경로에만 있다.
+ */
+const unfolder2d = new Unfolder();
+
+function paintDraft2d(): void {
+  const b = unfolder2d.stats.bounds;
+  viewer2d.fit(b);
+  // 도면이 없으면 격자만 남는다. 그 상태가 무엇인지 글자로 말한다 —
+  // 빈 격자만으로는 "아직 안 만든 것" 과 "고장난 것" 이 구분되지 않는다.
+  ui.draft2dEmpty.hidden = b !== null;
+}
 
 // ── 클라이언트 ──────────────────────────────────────────────
 //
@@ -371,6 +407,11 @@ function clearScene(): void {
   unfoldControl.setScene(false);
   unfoldControl.setStats(null);
   paintUnfold();
+  // 가운데 칸도 같이 내린다 — 씬이 워커에서 내려갔으므로 도면 역시 아무것도
+  // 가리키지 않는다 (L-2a).
+  viewer2d.cloth.clear();
+  unfolder2d.clear();
+  paintDraft2d();
   currentScene = null;
   ui.stat.textContent = '-';
   ui.frames.textContent = '-';
@@ -693,6 +734,9 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
     const shown = await showScene(client, viewer, sceneId, {
       // 재연결 후 다시 로드할 때는 사용자가 맞춰 둔 시점을 빼앗지 않는다.
       frameCamera: opts.refit !== false,
+      // 가운데 칸의 옷도 같은 디코딩 결과에서 세운다 (L-2a). 따로 받으면
+      // 두 칸이 서로 다른 순간의 토폴로지를 들 수 있다.
+      mirror: viewer2d.cloth,
     });
     currentScene = sceneId;
     playback.sceneLoaded(sceneId);
@@ -704,6 +748,12 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
     unfolder.build(viewer.cloth.patterns);
     unfoldControl.setScene(true);
     unfoldControl.setStats(unfolder.stats);
+    // ★ 가운데 칸 (L-2a). 도면에 **고정**한다 — `t = 1` 을 한 번 쓰고 끝이다.
+    //   왼쪽 칸처럼 프레임마다 `sync`/`apply` 를 부르지 않는 이유는 목표 정점이
+    //   3D 정점과 무관하기 때문이다(`viewer2d.ts` 머리말).
+    unfolder2d.build(viewer2d.cloth.patterns);
+    unfolder2d.apply(viewer2d.cloth.patterns, 1);
+    paintDraft2d();
     const u = unfolder.stats;
     log(
       `2D 도면 — 패턴 ${u.placed}/${u.patterns} 배치됨`
@@ -720,6 +770,11 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
     // "펼칠 수 있다" 고 말하면서 옛 씬의 배치로 보간한다.
     unfolder.clear();
     unfoldControl.setStats(null);
+    // 가운데 칸도 같이 비운다. 남겨 두면 실패한 로드 뒤에 **옛 씬의 도면**이
+    // 그대로 서 있어서, 화면만 보면 로드가 성공한 것처럼 보인다.
+    viewer2d.cloth.clear();
+    unfolder2d.clear();
+    paintDraft2d();
     status(`로드 실패: ${message(err)}`, true);
   } finally {
     setBusy(false);
@@ -897,6 +952,19 @@ declare global {
   var cobalt: {
     client: GatewayClient;
     viewer: Viewer3D;
+    /**
+     * L-2a 의 진단 표면 — 가운데 칸(재단 도면).
+     *
+     * `viewer2d.bounds` 가 null 이면 도면이 없는 상태이고(칸에 안내 글자가
+     * 떠 있어야 한다), `viewer2d.renders` 가 안 오르면 **왼쪽 칸이 아니라
+     * 이쪽 렌더 루프가 멎은 것**이다. 두 칸이 렌더러를 따로 쓰므로 한쪽만
+     * 멎을 수 있고, 그 구분이 여기서만 난다.
+     *
+     * `unfolder2d` 는 왼쪽 칸의 `unfolder` 와 **다른 객체다** — 목표 정점이
+     * 메시 로컬 좌표라 어느 옷의 것인지에 의존한다.
+     */
+    viewer2d: Viewer2D;
+    unfolder2d: Unfolder;
     stream: FrameStream;
     snapshots: SnapshotLoader<ParsedSnapshot>;
     playback: PlaybackController;
@@ -928,6 +996,8 @@ declare global {
 globalThis.cobalt = {
   client,
   viewer,
+  viewer2d,
+  unfolder2d,
   stream,
   snapshots,
   playback,
