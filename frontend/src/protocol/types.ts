@@ -35,6 +35,14 @@ export type {
   // 옷 사이즈 (L-3b). 크기는 cm 다
   SurfaceInfo,
   SurfacesResult,
+  // 디자인 기반 2D (D2-a). ★ 좌표가 **월드 2D 다** — 화면이 transform2d 를
+  // 다시 곱하면 두 번 적용된다. 원본 주석 참고
+  Design2DCurve,
+  Design2DResult,
+  Design2DSeam,
+  Design2DSeamPart,
+  Design2DStitch,
+  Design2DSurface,
   ErrResponse,
   MeshDataResult,
   MeshInfoResult,

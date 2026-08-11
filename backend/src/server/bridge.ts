@@ -485,6 +485,15 @@ const OPS: Record<Op, OpRule> = {
   // 그건 세션이 이미 하는 일을 두 번 하는 것이고 갈라지면 더 나쁘다.
   setSurfaceSize: { allow: true, build: buildSetSurfaceSize },
 
+  // ── 디자인 기반 2D (D2-a) ─────────────────────────────────
+  //
+  // 읽기 전용이고 씬을 안 바꾼다. 1건 ~288KB 로 `meshData`(~48KB)보다 크지만
+  // **로드당 한 번이면 되는 물건이다** — 커브·봉제선은 드레이프와 무관하게
+  // 고정이라 프레임 경로에 없다. 연타를 따로 막지 않는 근거는 `meshData` 와
+  // 같다: 워커가 stdin 을 순차 처리하고, 무한정 쌓이는 것은 연결당 동시 요청
+  // 상한(maxInflight)이 이미 막는다.
+  design2d: { allow: true },
+
   meshInfo: { allow: true },
 
   // 1건 ~48KB. 연타를 따로 막지 않는 이유: 실측에서 20건 동시 요청이 27ms에

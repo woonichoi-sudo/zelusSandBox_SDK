@@ -16,6 +16,7 @@ import {
   type AvatarBodyResult,
   type SetAvatarBodyResult,
   type SurfacesResult,
+  type Design2DResult,
   type SetParamsResult,
   type SimulationParams,
   type StatusResult,
@@ -253,6 +254,19 @@ export class Session extends EventEmitter {
    */
   setSurfaceSize(uuid: string, size: { width?: number; height?: number }): Promise<SurfacesResult> {
     return this.#call('setSurfaceSize', { uuid, ...size });
+  }
+
+  /**
+   * 재단 도면의 **디자인 정보**를 읽는다 — 커브·봉제선·스티치 (D2-a).
+   *
+   * ★ 좌표가 **월드 2D 다.** 워커가 `atWorld` 로 배치까지 끝낸 값을 주므로
+   *   화면이 `transform2d` 를 곱하면 안 된다 — 두 번 적용된다.
+   *
+   * 로드당 한 번이면 된다. 커브·봉제선은 드레이프와 무관하게 고정이라
+   * 프레임 경로에 없다(L-2a 가 재단 도면에 대해 확인한 성질과 같다).
+   */
+  design2d(): Promise<Design2DResult> {
+    return this.#call('design2d');
   }
 
   meshInfo(): Promise<MeshInfoResult> {

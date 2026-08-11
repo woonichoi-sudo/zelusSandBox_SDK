@@ -2645,6 +2645,8 @@ async function main(): Promise<void> {
         ['avatarBody', true], ['setAvatarBody', true],
         // 옷 사이즈 (L-3b). uuid 검증은 워커가 한다 — 게이트웨이는 타입만 본다.
         ['surfaces', true], ['setSurfaceSize', true],
+        // 디자인 2D (D2-a). 읽기 전용이라 build 가 없다 — 인자가 없는 op 이다.
+        ['design2d', true],
         ['meshInfo', true], ['meshData', true], ['subscribe', true], ['unsubscribe', true],
         ['export', true], ['quit', false],
       ];
@@ -2672,9 +2674,9 @@ async function main(): Promise<void> {
         );
       }
 
-      check('표가 프로토콜 op 22개를 전부 덮는다', TABLE.length === 22, `${TABLE.length}개`);
+      check('표가 프로토콜 op 23개를 전부 덮는다', TABLE.length === 23, `${TABLE.length}개`);
       check(
-        'allowedOps()가 허용 21개와 정확히 일치 (거부 문구에 실리는 목록)',
+        'allowedOps()가 허용 22개와 정확히 일치 (거부 문구에 실리는 목록)',
         allowedOps().slice().sort().join(',')
           === TABLE.filter(([, a]) => a).map(([o]) => o).sort().join(','),
         allowedOps().join(','),

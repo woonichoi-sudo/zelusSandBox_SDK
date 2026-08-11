@@ -26,6 +26,7 @@ export type Request =
   | { id: number; op: 'setAvatarBody'; bodyParams: Record<string, number> }
   | { id: number; op: 'surfaces' }
   | { id: number; op: 'setSurfaceSize'; uuid: string; width?: number; height?: number }
+  | { id: number; op: 'design2d' }
   | { id: number; op: 'meshInfo' }
   | { id: number; op: 'meshData'; topology?: boolean }
   | { id: number; op: 'export'; path: string; format?: 'gltf' | 'zbin' }
@@ -338,6 +339,82 @@ export interface SurfaceInfo {
 
 export interface SurfacesResult {
   surfaces: SurfaceInfo[];
+}
+
+// ── 디자인 기반 2D (D2-a) ───────────────────────────────────
+//
+// 재단 도면에 삼각형 메시 말고 **디자인 정보**를 얹기 위한 것이다 — 외곽선,
+// 제어점, 봉제선, 스티치.
+//
+// ★ **좌표가 전부 월드 2D 다.** 워커가 `CreateGeomCubicBezierCurve(uuid,
+//   atWorld=true)` 로 배치까지 끝낸 값을 준다. 화면이 `transform2d` 를 다시
+//   곱하면 **두 번 적용된다** — 그러면 도면이 그럴듯하게 어긋난 채 나오고,
+//   그 증상은 "패턴이 좀 흩어져 보인다" 로만 보여서 원인을 못 찾는다.
+//   실측으로 확인했다: 전체 범위 144.24 × 175.45cm 로 L-2a 의 도면 크기와
+//   소수점까지 같고, 서피스 상자 겹침이 2.5% 다(#15 가 "배치가 맞으면 2.5%"
+//   라고 잰 값).
+
+/** 커브 하나. 폴리라인은 **엔진이 푼 결과**다 — 우리가 베지어를 다시 풀지 않는다 */
+export interface Design2DCurve {
+  uuid: string;
+  /**
+   * 커브 종류. ⚠️ **실측에서 나온 것은 `outer`·`inner` 둘뿐이다** —
+   * `hole`·`sewline`·`grain`·`seamAllowance` 는 워커가 요청은 하지만 이 씬에
+   * 0개다. 즉 **시접은 그릴 데이터가 없다.**
+   */
+  kind: 'outer' | 'inner' | 'hole' | 'sewline' | 'grain' | 'seamAllowance' | 'stitch';
+  /** 직선이면 폴리라인이 양 끝점 2개뿐이다 (세분이 무의미하다) */
+  isLine: boolean;
+  /** 제어점 4개 = `[x,y, x,y, x,y, x,y]`. 참고 이미지의 원들이 이것이다 */
+  cp: number[];
+  /** 폴리라인 `[x,y, x,y, ...]`. 최소 2점(4수)이 보장된다 */
+  pts: number[];
+}
+
+export interface Design2DSurface {
+  uuid: string;
+  /** 유일하지 않다 — `SurfaceInfo.name` 과 같은 주의 */
+  name: string;
+  curves: Design2DCurve[];
+}
+
+/** 봉제선의 한 조각. **한 커브의 `t0`~`t1` 구간**이다 */
+export interface Design2DSeamPart {
+  curve: string;
+  surface: string;
+  /**
+   * ⚠️ **`t0 > t1` 일 수 있다** — 실측 73개. 방향이 뒤집힌 파트라는 뜻이고,
+   * 워커가 정규화하지 않고 그대로 싣는다. 대응선을 그을 때 필요하다.
+   */
+  t0: number;
+  t1: number;
+  /** 그 구간만 잘라낸 폴리라인 (월드) */
+  pts: number[];
+}
+
+/** 봉제선 하나. `sides[0]` 과 `sides[1]` 이 서로 꿰매진다 */
+export interface Design2DSeam {
+  uuid: string;
+  /** 길이 2. 각 측이 파트 여러 개일 수 있다 (실측: 최대 4파트) */
+  sides: Design2DSeamPart[][];
+}
+
+/**
+ * 스티치. ⚠️ **색이 회색·흰색 2종뿐이다** (실측: 0.408 회색 50개, 흰색 4개).
+ * 참고 이미지의 알록달록한 색은 여기서 나오지 않는다.
+ */
+export interface Design2DStitch {
+  uuid: string;
+  surface: string;
+  /** `[r,g,b,a]` 0~1 */
+  color: number[];
+  curves: Design2DCurve[];
+}
+
+export interface Design2DResult {
+  surfaces: Design2DSurface[];
+  seams: Design2DSeam[];
+  stitches: Design2DStitch[];
 }
 
 export interface SetAvatarBodyResult {

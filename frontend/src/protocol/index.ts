@@ -69,6 +69,13 @@ export type {
   // 옷 사이즈 (L-3b)
   SurfaceInfo,
   SurfacesResult,
+  // 디자인 기반 2D (D2-a)
+  Design2DCurve,
+  Design2DResult,
+  Design2DSeam,
+  Design2DSeamPart,
+  Design2DStitch,
+  Design2DSurface,
   SetParamsResult,
   SimulationParams,
   StatusResult,

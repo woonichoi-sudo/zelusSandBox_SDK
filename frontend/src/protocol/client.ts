@@ -45,6 +45,7 @@ import {
   type AvatarBodyResult,
   type SetAvatarBodyResult,
   type SurfacesResult,
+  type Design2DResult,
   type SetParamsResult,
   type SimulationParams,
   type StatusResult,
@@ -533,6 +534,19 @@ export class GatewayClient {
    */
   setSurfaceSize(uuid: string, size: { width?: number; height?: number }): Promise<SurfacesResult> {
     return this.request<SurfacesResult>('setSurfaceSize', { uuid, ...size });
+  }
+
+  /**
+   * 재단 도면의 디자인 정보 — 커브·봉제선·스티치 (D2-a).
+   *
+   * ★ **좌표가 월드 2D 다.** 워커가 배치까지 끝낸 값을 준다 —
+   *   `PatternTransform2D` 를 다시 곱하면 **두 번 적용된다.**
+   *
+   * 로드당 한 번이면 된다(~288KB). 커브·봉제선은 드레이프와 무관하므로
+   * 프레임마다 받을 물건이 아니다.
+   */
+  design2d(): Promise<Design2DResult> {
+    return this.request<Design2DResult>('design2d');
   }
 
   meshInfo(): Promise<MeshInfoResult> {
