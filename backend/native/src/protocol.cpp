@@ -14,7 +14,11 @@
 #include <ztDesignSurface.h>       // ztDesignSurfaceData::name (옷 사이즈)
 #include <ztDesign2DTransform.h>   // 서피스 2D 배치 (MeshData의 transform2d)
 #include <ztDesignAvatar.h>        // ztDesignAvatarData·ztDesignZetaData (체형)
+#include <ztDesignBoundaryCurve.h> // ztBoundaryType (디자인 2D 커브 종류)
 #include <ztDesignClothPattern.h>
+#include <ztDesignSeam.h>          // ztDesignSeamData (봉제선)
+#include <ztDesignStitch.h>        // ztDesignStitchData (스티치)
+#include <ztGeomCubicBezierCurve.h> // 커브 세분·구간 잘라내기
 #include <ztDesignMaterial.h>      // 패턴 색 (MeshData의 material)
 #include <ztDesignSurface.h>       // GetTransform() — 전방선언만으론 부족하다
 #include <ztDesignTriMesh.h>
@@ -397,6 +401,232 @@ std::string Base64(const void* data, std::size_t bytes)
     }
 
     return out;
+}
+
+// ── 디자인 기반 2D (D2-a) ───────────────────────────────────
+//
+// 지금 가운데 칸의 재단 도면은 **삼각형 메시뿐**이다(`uvs` + `transform2d`).
+// 데스크톱 2D 뷰는 그 위에 외곽 커브·제어점·봉제선·스티치를 얹는다 — 즉
+// 우리에게 없는 것은 렌더링이 아니라 **데이터**다.
+//
+// ── ★ 좌표계: `atWorld` 가 전치 함정을 통째로 없앤다 ─────────
+//
+// `.zls` 실측: 제어점 909개의 범위가 66.6×103.5cm 인데 도면 전체는
+// 144.2×175.4cm 다(L-2a). **안 맞는다 = 각자 원점 근처에 겹쳐 있다** —
+// `uvs` 가 그랬던 #15 와 같은 상황이다. 그때는 워커가 `transform2d` 를
+// 직접 실어 보내 화면에서 곱했고, 그 과정에서 **가장 위험했던 것이 전치**
+// 였다(`zsMatrix33` 은 저장이 열 우선인데 `GetElement(i,j)` 가 `e[j][i]`
+// 라 (행,열) 접근이다. 전치해 읽어도 그럴듯한 도면이 나온다).
+//
+// 여기서는 그 위험을 **애초에 만들지 않는다.** `CreateGeomCubicBezierCurve`
+// 가 `atWorld` 플래그를 받아 엔진이 직접 배치까지 끝낸 커브를 준다. 우리는
+// 행렬을 만지지 않으므로 전치가 성립할 자리가 없다.
+// ⚠️ 다만 **그 플래그가 정말 배치를 적용하는지는 헤더로 알 수 없다.**
+//    프로브가 좌표 범위를 재서 가른다 — 로컬이면 66×103, 월드면 144×175
+//    부근이어야 한다. 이 단위의 유일한 미지수다.
+//
+// ── 왜 폴리라인으로 내리는가 ────────────────────────────────
+//
+// 제어점 4개를 그대로 보내고 화면에서 베지어를 풀 수도 있다. 그러면
+// **세분 규칙이 두 곳에 생긴다** — 엔진의 `Tessellate` 와 우리 것. 길이가
+// 어긋나면 도면과 3D 가 미세하게 다른 모양이 되고, 그 차이는 "곡선이 좀
+// 각져 보인다" 로만 보여서 원인을 못 찾는다. 엔진이 푼 결과를 그대로 쓴다.
+// 제어점(`cp`)은 **그리기용으로 따로** 싣는다 — 이미지의 원들이 그것이다.
+//
+// ⚠️ `.zls` 에 `FLT_MAX` 센티넬 제어점이 2개 있었다. 그대로 그리면 도면이
+//    무한대로 늘어나 화면이 비어 보인다. 걷어낸다.
+
+/** 커브 하나를 월드 폴리라인 + 제어점으로 편다. 비었으면 실리지 않는다 */
+json TessellateCurve(ztSceneQueryInterface* qi, const ztUuid& curveUuid,
+                     const char* kind)
+{
+    // atWorld = true — 위 머리말 참고. 배치를 엔진이 끝내 준다
+    ztGeomCubicBezierCurve geom = qi->CreateGeomCubicBezierCurve(curveUuid, true);
+
+    const auto finite = [](const ztDesign2DPoint& p) {
+        return p.x > -1e30f && p.x < 1e30f && p.y > -1e30f && p.y < 1e30f;
+    };
+
+    json cp = json::array();
+    for (const ztDesign2DPoint& p : geom.CP())
+    {
+        if (!finite(p)) return json();   // 센티넬이 낀 커브는 통째로 버린다
+        cp.push_back(p.x);
+        cp.push_back(p.y);
+    }
+
+    // 직선은 세분이 무의미하다 — 양 끝점이면 충분하고, 280개 커브에서
+    // 이 구분이 페이로드를 눈에 띄게 줄인다.
+    std::vector<ztDesign2DPoint> tess;
+    if (geom.IsLine())
+    {
+        tess.push_back(geom.CP()[0]);
+        tess.push_back(geom.CP()[3]);
+    }
+    else
+    {
+        // 최소 정점으로 편평도를 맞춘다 — 균등 분할보다 점이 적고 더 매끈하다
+        geom.SmartTessellation(tess);
+    }
+
+    json pts = json::array();
+    for (const ztDesign2DPoint& p : tess)
+    {
+        if (!finite(p)) return json();
+        pts.push_back(p.x);
+        pts.push_back(p.y);
+    }
+    if (pts.size() < 4) return json();   // 점 하나짜리는 그릴 것이 없다
+
+    return json{
+        { "uuid",   curveUuid.GetString() },
+        { "kind",   kind },
+        { "isLine", geom.IsLine() },
+        { "cp",     cp },
+        { "pts",    pts },
+    };
+}
+
+json ReadDesign2D(ZestManager& manager)
+{
+    json surfaces = json::array();
+    json seams    = json::array();
+    json stitches = json::array();
+
+    ztSceneQueryInterface* qi = QueryInterface(manager);
+    if (!qi) return json{ { "surfaces", surfaces }, { "seams", seams },
+                          { "stitches", stitches } };
+
+    // 어느 종류를 어떤 이름으로 내릴지의 정본. 화면이 색을 여기에 건다.
+    // `Grain`(식서 방향)·`SeamAllowance`(시접)도 열려 있지만 이 씬에 있는지
+    // 안 쟀다 — 목록에 넣어 두면 프로브가 개수로 답한다.
+    struct Kind { ztBoundaryType type; const char* name; };
+    static const Kind kinds[] = {
+        { ztBoundaryType::Outer,         "outer"         },
+        { ztBoundaryType::Inner,         "inner"         },
+        { ztBoundaryType::Hole,          "hole"          },
+        { ztBoundaryType::Sewline,       "sewline"       },
+        { ztBoundaryType::Grain,         "grain"         },
+        { ztBoundaryType::SeamAllowance, "seamAllowance" },
+    };
+
+    for (const auto& entry : manager.GetSurfaceInfos())
+    {
+        const ztDesignSurface* surface = entry.second.get();
+        if (!surface) continue;
+
+        json curves = json::array();
+        for (const Kind& k : kinds)
+        {
+            for (const ztUuid& c : qi->GetCurvesInSurface(entry.first, k.type))
+            {
+                json one = TessellateCurve(qi, c, k.name);
+                if (!one.is_null()) curves.push_back(std::move(one));
+            }
+        }
+
+        surfaces.push_back(json{
+            { "uuid",   entry.first.GetString() },
+            { "name",   Utf8(surface->GetData().name) },
+            { "curves", curves },
+        });
+    }
+
+    // ── 봉제선 ──────────────────────────────────────────────
+    //
+    // `.zls` 구조 그대로다: 측 2개 × 그룹 × 파트, 파트가
+    // `{curve, surface, t0, t1}`. **한 커브의 t0~t1 구간**이 반대편 구간과
+    // 꿰매진다. `t0 > t1` 이면 방향이 뒤집힌 것이고, 그건 데이터가 말하는
+    // 사실이라 우리가 정규화하지 않는다 — 화면이 대응선을 그을 때 필요하다.
+    //
+    // ★ `Cut(t0, t1)` 이 그 구간만 잘라 준다. 우리가 베지어를 다시 풀지
+    //   않는다는 규칙이 여기서도 그대로 선다.
+    for (const auto& entry : qi->GetSeams())
+    {
+        const ztDesignSeamData* data = qi->GetSeamData(entry.first);
+        if (!data) continue;
+
+        json sides = json::array();
+        for (const auto& side : data->seam)
+        {
+            json parts = json::array();
+            for (const auto& group : side)
+            {
+                for (const auto& part : group)
+                {
+                    ztGeomCubicBezierCurve geom =
+                        qi->CreateGeomCubicBezierCurve(part.curveUuid, true);
+                    // ⚠️ `t[0] > t[1]` 이면 방향이 뒤집힌 파트다. `Cut` 은
+                    //    오름차순을 기대하므로 여기서만 정렬하고, **원래 값은
+                    //    응답에 그대로 싣는다** — 방향은 데이터가 말하는
+                    //    사실이고 화면이 대응선을 그을 때 필요하다.
+                    const float a = (std::min)(part.t[0], part.t[1]);
+                    const float b = (std::max)(part.t[0], part.t[1]);
+                    ztGeomCubicBezierCurve seg = geom.Cut(a, b);
+
+                    std::vector<ztDesign2DPoint> tess;
+                    seg.SmartTessellation(tess);
+
+                    json pts = json::array();
+                    bool ok = true;
+                    for (const ztDesign2DPoint& p : tess)
+                    {
+                        if (p.x < -1e30f || p.x > 1e30f ||
+                            p.y < -1e30f || p.y > 1e30f) { ok = false; break; }
+                        pts.push_back(p.x);
+                        pts.push_back(p.y);
+                    }
+                    if (!ok || pts.size() < 4) continue;
+
+                    parts.push_back(json{
+                        { "curve",   part.curveUuid.GetString()   },
+                        { "surface", part.surfaceUuid.GetString() },
+                        { "t0",      part.t[0] },
+                        { "t1",      part.t[1] },
+                        { "pts",     pts       },
+                    });
+                }
+            }
+            sides.push_back(parts);
+        }
+
+        seams.push_back(json{
+            { "uuid",  entry.first.GetString() },
+            { "sides", sides },
+        });
+    }
+
+    // ── 스티치 ──────────────────────────────────────────────
+    //
+    // 이쪽은 **색을 자기가 들고 있다**(`baseColor`). 이미지의 색 있는 변이
+    // 여기서 나오는지는 그려 보고 대조한다 — 이 단위가 답할 수 있는 것은
+    // "몇 개이고 어느 커브에 붙어 있는가" 까지다.
+    for (const auto& entry : qi->GetStitches())
+    {
+        const ztDesignStitchData* data = qi->GetStitchData(entry.first);
+        if (!data) continue;
+
+        json curves = json::array();
+        for (const ztUuid& c : data->bezierCurves)
+        {
+            json one = TessellateCurve(qi, c, "stitch");
+            if (!one.is_null()) curves.push_back(std::move(one));
+        }
+
+        stitches.push_back(json{
+            { "uuid",    entry.first.GetString() },
+            { "surface", data->surfaceUuid.GetString() },
+            { "color",   json::array({ data->baseColor.r, data->baseColor.g,
+                                       data->baseColor.b, data->baseColor.a }) },
+            { "curves",  curves },
+        });
+    }
+
+    return json{
+        { "surfaces", surfaces },
+        { "seams",    seams    },
+        { "stitches", stitches },
+    };
 }
 
 json MeshInfo(ZestManager& manager, void* listener)
@@ -1060,6 +1290,20 @@ int RunProtocolLoop(ZestManager& manager)
                 else
                 {
                     result = ReadSurfaces(manager);
+                }
+            }
+            else if (op == "design2d")
+            {
+                // 읽기 전용이다. 로드당 한 번이면 되고, 프레임 경로에 없다 —
+                // 커브·봉제선은 드레이프와 무관하게 고정이기 때문이다
+                // (L-2a 가 재단 도면에 대해 확인한 성질과 같은 이유다).
+                if (!manager.IsLoadedZls())
+                {
+                    ok = false; error = "씬이 로드되지 않았습니다";
+                }
+                else
+                {
+                    result = ReadDesign2D(manager);
                 }
             }
             else if (op == "setSurfaceSize")
