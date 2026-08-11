@@ -55,7 +55,11 @@
 
 import * as THREE from 'three';
 
-import type { DecodedPattern, PatternMaterial, PatternTransform2D } from '../protocol/index.ts';
+import { planFor, tintColorProfile } from '../panels/index.ts';
+import type {
+  DecodedPattern, PatternMaterial, PatternTransform2D, TextureAsset,
+} from '../protocol/index.ts';
+import { applyPlan, TextureCache } from './textures.ts';
 
 /** 패턴 하나에 대응하는 three 객체 묶음 */
 export interface PatternMesh {
@@ -88,9 +92,10 @@ export interface PatternMesh {
   /**
    * 씬이 정한 **진짜** 재질. 없으면 null.
    *
-   * ⚠️ **아직 화면에 반영되지 않는다.** `mesh.material` 은 여전히 아래
-   *    `PALETTE` 의 임의 색이다 — 배선은 materials-b 의 몫이고, 여기까지는
-   *    워커가 실어 준 값을 손실 없이 들고 있는 것까지다.
+   * ★ materials-c 부터 화면에 반영된다 — 다만 **무늬가 있을 때만**이다.
+   *   텍스처가 붙은 패턴은 이 색이 `mesh.material.color` 가 되고(glTF 의
+   *   `baseColorFactor` 와 같은 자리라 스냅샷과 곱셈 규칙이 맞는다), 무늬가
+   *   없으면 아래 `PALETTE` 의 임의 색으로 남는다.
    *
    * null 인 경우(재질 없는 패턴, 구버전 워커)에 흰색으로 메우지 않는다 —
    * 진짜 흰 옷과 구분할 수 없게 된다. 그때 쓸 것이 `PALETTE` 폴백이다.
@@ -105,22 +110,40 @@ export interface PatternMesh {
  * "패턴 하나가 통째로 뒤집힌 것"을 구분할 수 없다. 사람이 눈으로 판정하는
  * 단위(#12 는 `verify: manual`)라 색이 곧 검증 도구다.
  *
- * ★ materials-a 이후로 이것은 **폴백이 될 예정이다.** 워커가 씬의 진짜 색을
- *   실어 주지만(`PatternMesh.material`), 재질이 없는 패턴이 있고 그때는
- *   여기로 돌아와야 한다. `sample.zls` 는 5개 패턴이 **전부 흰색**이라 진짜
- *   색만 쓰면 옷이 흰 덩어리 하나로 보인다 — 그 씬에서는 폴백이 오히려
- *   정답이다. 무엇을 언제 쓸지는 materials-b 가 정한다. 지우지 말 것.
+ * ★ materials-c 부터 이것은 **폴백이다.** 무늬(텍스처)가 붙은 패턴은 씬의 진짜
+ *   색을 쓰고, 무늬가 없는 패턴만 여기로 온다. `sample.zls` 는 5개 패턴이
+ *   **전부 흰색**이라 진짜 색만 쓰면 옷이 흰 덩어리 하나로 보인다 — 그 씬에서는
+ *   폴백이 오히려 정답이다. 지우지 말 것.
  *
- * ⚠️ `verify/ui.ts` 의 `LIVE_PALETTE_BUCKETS` 가 이 다섯 색의 색상 칸을
- *    베껴 두고 "이 칸에 없는 민트/노랑이면 진짜 텍스처에서 온 것"이라는
- *    배제 논증에 쓴다. materials-b 가 진짜 색을 칠하는 순간 **이 팔레트는
- *    더 이상 실시간 옷이 낼 수 있는 색의 전부가 아니게 되고** 그 논증이
- *    조용히 깨진다. 지금은 아직 성립한다(색이 화면에 반영되지 않으므로).
+ * ⚠️ **`verify/ui.ts` 의 `LIVE_PALETTE_BUCKETS` 논증이 여기서 깨진다.** 그쪽은
+ *    이 다섯 색의 색상 칸을 베껴 두고 "이 칸에 없는 민트/노랑이면 스냅샷(진짜
+ *    텍스처)에서 온 것"이라는 배제 논증을 쓴다. 이제 실시간 옷도 민트·노랑을
+ *    낼 수 있으므로 그 논증은 성립하지 않는다 — 두 뷰를 색으로 가르려면 다른
+ *    기준이 필요하다(예: 무늬의 유무, 또는 텍스처 스위치를 끄고 비교).
  */
 const PALETTE = [0x7ea8d8, 0xd8a87e, 0x8fc9a0, 0xc98f9e, 0xb0a8d8] as const;
 
 function colorFor(index: number): number {
   return PALETTE[index % PALETTE.length] ?? 0xcccccc;
+}
+
+/**
+ * 씬의 진짜 색 → three 의 색. **색공간을 넘겨짚으면 안 된다.**
+ *
+ * ⚠️ 어느 공간으로 읽을지는 여기서 정하지 않는다 — `panels/textures.ts` 의
+ *    `tintColorProfile` 이 정한다. 무늬와 곱해지는 경우와 그렇지 않은 경우의
+ *    답이 다르고(실측으로 파랑이 2.5배 갈렸다), 그 판단은 DOM·three 없이
+ *    테스트되는 자리에 있어야 한다.
+ *
+ * (`avatar.ts` 의 같은 이름 함수와 같은 일이다. 두 벌인 이유도 거기와 같다 —
+ *  두 파일이 서로를 import 하지 않는 것이 규약이다.)
+ */
+function colorOf(m: PatternMaterial, profile: 'srgb' | 'linear'): THREE.Color {
+  const [r, g, b] = m.color;
+  return new THREE.Color().setRGB(
+    r, g, b,
+    profile === 'srgb' ? THREE.SRGBColorSpace : THREE.LinearSRGBColorSpace,
+  );
 }
 
 /**
@@ -145,6 +168,17 @@ export class ClothObject {
 
   #vertices = 0;
   #triangles = 0;
+
+  /**
+   * 마지막으로 받은 텍스처 표. 스위치를 껐다 켜는 데 왕복이 없어야 한다.
+   *
+   * ⚠️ `clear()` 에서 비우지 않는다 — `setTopology` 가 맨 앞에서 clear() 를
+   *    부르므로, 비우면 인자 없이 부르는 경로가 무늬를 잃는다.
+   */
+  #textures: readonly (TextureAsset | null)[] = [];
+  #texturesOn = true;
+  /** 아바타와 나눠 갖지 않는다 — `avatar.ts` 의 `#cache` 주석과 같은 이유다 */
+  readonly #cache = new TextureCache();
 
   constructor() {
     this.group.name = 'cloth';
@@ -172,8 +206,11 @@ export class ClothObject {
    * 기존 지오메트리를 전부 버리고 새로 만든다. 프레임 갱신에 이 함수를 쓰면
    * 매 프레임 GPU 버퍼를 새로 할당하게 된다. 그 경로는 `updatePositions()` 다.
    */
-  setTopology(patterns: readonly DecodedPattern[]): void {
+  setTopology(patterns: readonly DecodedPattern[], textures?: readonly (TextureAsset | null)[]): void {
     this.clear();
+
+    // 재질을 만들기 전에 갈아 끼운다 (`avatar.ts` 의 같은 자리 주석 참고).
+    if (textures) this.#textures = textures;
 
     patterns.forEach((p, i) => {
       const geometry = new THREE.BufferGeometry();
@@ -196,8 +233,26 @@ export class ClothObject {
       geometry.computeBoundingSphere();
       geometry.computeBoundingBox();
 
+      // ★ 무늬가 있으면 **씬의 진짜 색**을, 없으면 임의 팔레트를 쓴다.
+      //
+      //   임의 색 위에 텍스처를 곱하면 무늬가 통째로 물든다(민트 직물 × 파란
+      //   팔레트). 그렇다고 흰색으로 못 박아도 안 된다 — 스냅샷(glTF)이 정답지인데
+      //   익스포터가 쓰는 `baseColorFactor` 는 basecolor.xyz 이고, glTF 규약에서
+      //   baseColor = factor × 텍스처 다(protocol.cpp 의 "익스포터와 같은 네 가지"
+      //   주석). 즉 **스냅샷은 곱한다.** 실시간이 같은 그림이 되려면 여기도 곱해야 한다.
+      //   ⓘ 브라우저에서 두 뷰의 factor 를 꺼내 확인했다 — 스냅샷도 흰색이 아닌
+      //     색과 텍스처를 함께 갖고 있었다. 곱셈이 맞다.
+      //
+      //   ★ 그 factor 를 **어느 색공간으로 읽는가**는 또 다른 문제이고, 실측에서
+      //     2.5배 갈렸다 — `tintColorProfile` 주석에 숫자가 있다.
+      //
+      //   무늬가 없을 때 팔레트로 남는 이유는 원래대로다 — `sample.zls` 는 패턴이
+      //   전부 흰색이라 진짜 색만 쓰면 옷이 흰 덩어리 하나가 된다.
+      const plan = this.#texturesOn ? planFor(p.material, this.#textures, 'cloth') : null;
       const material = new THREE.MeshStandardMaterial({
-        color: colorFor(i),
+        color: plan && p.material
+          ? colorOf(p.material, tintColorProfile(plan, p.material.colorProfile))
+          : colorFor(i),
         // 옷은 두께 없는 껍질이다. 단면으로 두면 안쪽을 볼 때 통째로 사라진다.
         side: THREE.DoubleSide,
         roughness: 0.78,
@@ -212,6 +267,8 @@ export class ClothObject {
         polygonOffsetFactor: -1 - i,
         polygonOffsetUnits: -1 - i,
       });
+
+      if (plan) applyPlan(material, plan, this.#cache);
 
       const mesh = new THREE.Mesh(geometry, material);
       mesh.name = `pattern:${p.uuid}`;
@@ -255,6 +312,35 @@ export class ClothObject {
       this.#vertices += p.vertices;
       this.#triangles += p.triangles;
     });
+  }
+
+  /**
+   * 텍스처 표를 갈아 끼우거나 껐다 켠다. **왕복이 없다.**
+   *
+   * ★ 색도 같이 간다. 무늬가 붙으면 씬의 진짜 색으로, 떼면 임의 팔레트로
+   *   되돌린다 — `setTopology` 의 같은 판단을 여기서도 해야 한다. 색을 그대로
+   *   두면 텍스처를 껐을 때 옷 24장이 **직물별로 두 색**만 남아서 패턴 경계가
+   *   안 보인다(팔레트가 있는 이유가 정확히 그것이다).
+   */
+  applyTextures(on: boolean, textures?: readonly (TextureAsset | null)[]): void {
+    this.#texturesOn = on;
+    if (textures) this.#textures = textures;
+
+    let i = 0;
+    for (const p of this.#byUuid.values()) {
+      const index = i;
+      i += 1;
+      const mat = p.mesh.material;
+      if (Array.isArray(mat) || !(mat instanceof THREE.MeshStandardMaterial)) continue;
+
+      const plan = on ? planFor(p.material, this.#textures, 'cloth') : null;
+      applyPlan(mat, plan, this.#cache);
+      if (plan && p.material) {
+        mat.color.copy(colorOf(p.material, tintColorProfile(plan, p.material.colorProfile)));
+      } else {
+        mat.color.setHex(colorFor(index));
+      }
+    }
   }
 
   /**
@@ -336,5 +422,8 @@ export class ClothObject {
     this.#byUuid.clear();
     this.#vertices = 0;
     this.#triangles = 0;
+    // 표는 남긴다(`#textures` 주석). GPU 텍스처만 버린다 — 세대도 같이 올라가서
+    // 늦게 도착하는 로드가 새 씬에 무늬를 입히지 못한다.
+    this.#cache.clear();
   }
 }

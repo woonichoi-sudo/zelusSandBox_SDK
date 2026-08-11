@@ -14,7 +14,9 @@
  *    `open` 이벤트의 `reconnected` 를 보고 그냥 다시 부르면 된다.
  */
 
-import { decodePatterns, type GatewayClient } from '../protocol/index.ts';
+import {
+  decodeMeshTextures, decodePatterns, type GatewayClient, type TextureAsset,
+} from '../protocol/index.ts';
 import type { ClothObject } from './cloth.ts';
 import type { Viewer3D } from './viewer.ts';
 
@@ -25,6 +27,13 @@ export interface ShownScene {
   triangles: number;
   /** 로드부터 화면 반영까지 걸린 시간(ms). 103MB 씬이 ~830ms 였다 */
   elapsedMs: number;
+  /**
+   * 이 씬의 직물 텍스처 표 (materials-c). 호출자가 통계를 화면에 쓴다.
+   *
+   * 아바타 것은 여기 없다 — `avatarMesh` 는 별개의 왕복이고 `AvatarViewController`
+   * 가 그쪽 표를 들고 온다.
+   */
+  textures: (TextureAsset | null)[];
 }
 
 /**
@@ -68,10 +77,18 @@ export async function showScene(
     throw new Error('씬은 로드됐지만 패턴이 하나도 없습니다');
   }
 
-  viewer.cloth.setTopology(patterns);
+  // 텍스처 표는 `topology:true` 응답에만 온다 — 재질이 거기에만 실리기 때문이다.
+  // 즉 `patterns` 와 정확히 같은 수명이고, 그래서 같은 자리에서 함께 건다.
+  const textures = decodeMeshTextures(mesh);
+
+  viewer.cloth.setTopology(patterns, textures);
   // 가운데 칸의 옷. 카메라는 여기서 안 맞춘다 — 도면 범위는 `Unfolder.build()`
   // 가 계산하고, 그건 호출자가 `setTopology` 뒤에 부른다. 순서상 여기서는
   // 아직 범위를 모른다.
+  //
+  // ★ **표를 넘기지 않는다.** 가운데 칸은 재단 도면이라 로드 직후 `paperize()`
+  //   가 면을 흰 종이로 덮는다 — 무늬를 입혔다 곧바로 지우는 셈이고, 그동안
+  //   9.5MB 짜리 텍스처가 GPU 에 한 벌 더 올라간다.
   opts.mirror?.setTopology(patterns);
   if (opts.frameCamera !== false) viewer.frameCamera();
 
@@ -81,5 +98,6 @@ export async function showScene(
     vertices: viewer.cloth.vertexCount,
     triangles: viewer.cloth.triangleCount,
     elapsedMs: Math.round(performance.now() - t0),
+    textures,
   };
 }

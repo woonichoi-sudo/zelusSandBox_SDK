@@ -26,10 +26,12 @@ import type {
   AvatarPart,
   AvatarPartMaterial,
   FrameMesh,
+  MaterialTextures,
   PatternData,
   PatternMaterial,
   PatternTransform,
   PatternTransform2D,
+  TextureAsset,
 } from './types.ts';
 
 /** ES2025 `Uint8Array.fromBase64`. 아직 lib 에 없어서 직접 좁힌다 */
@@ -226,6 +228,137 @@ function decodeTransform2D(uuid: string, raw: unknown): PatternTransform2D | und
   return [...(raw as number[])] as unknown as PatternTransform2D;
 }
 
+// ── 텍스처 (materials-c) ────────────────────────────────────
+//
+// 응답 하나에 **표가 하나** 있고 머티리얼은 색인만 갖는다. 같은 파일이 여러
+// 슬롯·파트에 나오기 때문이다(속눈썹 하나가 네 번 참조된다). 여기서 하는 일은
+// 그 색인이 실제로 표 안을 가리키는지 확인하는 것뿐이다 — 밖을 가리키는 색인을
+// 통과시키면 그리는 쪽이 `undefined.url` 로 죽거나, 더 나쁘게는 **엉뚱한
+// 이미지**를 입힌다(피부에 직물 무늬가 붙는다). 어느 쪽이든 화면에서 원인을
+// 읽을 수 없다.
+
+/**
+ * 응답의 `textures` 표.
+ *
+ * ⚠️ **문자열이 오면 던진다.** 워커는 서버 절대경로를 싣고 게이트웨이가 그것을
+ *    `{id, url, bytes}` 로 바꿔 끼운다(bridge.ts `mapTextureTable`). 브라우저에
+ *    문자열이 도착했다는 것은 그 변환을 안 지났다는 뜻이고, 그건 서버 경로가
+ *    새어 나왔다는 뜻이다 — 조용히 무시하면 그 사고를 아무도 모른다.
+ *
+ * 거절된 칸(`null`)은 오류가 아니다. 허용 뿌리 밖이거나 파일이 사라진 경우이고,
+ * 그 슬롯만 텍스처 없이 그리면 된다.
+ */
+export function decodeTextureTable(raw: unknown, label = 'textures'): (TextureAsset | null)[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new Error(`${label} 는 배열이어야 합니다 (${typeof raw})`);
+
+  return raw.map((entry, i) => {
+    if (entry === null || entry === undefined) return null;
+    if (typeof entry === 'string') {
+      throw new Error(
+        `${label}[${i}] 가 경로 문자열입니다 — 게이트웨이의 URL 변환을 지나지 않았습니다`,
+      );
+    }
+    if (typeof entry !== 'object') {
+      throw new Error(`${label}[${i}] 가 객체가 아닙니다 (${typeof entry})`);
+    }
+    const src = entry as Record<string, unknown>;
+    const id = src['id'];
+    const url = src['url'];
+    const bytes = src['bytes'];
+    if (typeof id !== 'string' || id === '') throw new Error(`${label}[${i}].id 가 문자열이 아닙니다`);
+    if (typeof url !== 'string' || url === '') throw new Error(`${label}[${i}].url 이 문자열이 아닙니다`);
+    if (typeof bytes !== 'number' || !Number.isFinite(bytes)) {
+      throw new Error(`${label}[${i}].bytes 가 유한한 숫자가 아닙니다`);
+    }
+    return { id, url, bytes };
+  });
+}
+
+/**
+ * 머티리얼의 텍스처 색인 셋. 슬롯이 하나도 없으면 `undefined`.
+ *
+ * 색인은 **정수여야 하고 음수가 아니어야 한다.** 표 범위 검사는 여기서 하지
+ * 않는다 — 이 함수는 표를 모르고, 표는 응답 단위라 `decodePatterns` 쪽에 있다.
+ */
+function decodeMaterialTextures(label: string, raw: unknown): MaterialTextures | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(`${label}: material.textures 가 객체가 아닙니다`);
+  }
+  const src = raw as Record<string, unknown>;
+  const out: MaterialTextures = {};
+  for (const slot of ['basecolor', 'normal', 'alpha'] as const) {
+    const v = src[slot];
+    if (v === undefined) continue;
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
+      throw new Error(`${label}: material.textures.${slot} 이 0 이상의 정수가 아닙니다`);
+    }
+    out[slot] = v;
+  }
+  return Object.keys(out).length === 0 ? undefined : out;
+}
+
+/**
+ * 직물의 물리 크기 `[폭, 높이]` cm. 없거나 0 이하면 `undefined`.
+ *
+ * ★ 0 을 통과시키면 그리는 쪽이 `1/0 = Infinity` 로 반복 배수를 잡고, 텍스처가
+ *   한 점으로 뭉개진다. "모른다"로 만들어 반복 1 로 떨어뜨리는 편이 낫다.
+ */
+function decodePhysicalSize(label: string, raw: unknown): [number, number] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw) || raw.length !== 2) {
+    throw new Error(`${label}: material.physicalSizeCm 은 길이 2 의 배열이어야 합니다`);
+  }
+  const [w, h] = raw as [unknown, unknown];
+  if (typeof w !== 'number' || typeof h !== 'number' || !Number.isFinite(w) || !Number.isFinite(h)) {
+    throw new Error(`${label}: material.physicalSizeCm 에 유한한 숫자가 아닌 값이 있습니다`);
+  }
+  if (w <= 0 || h <= 0) return undefined;
+  return [w, h];
+}
+
+/** 텍스처 관련 필드 셋을 머티리얼에 얹는다. 옷·아바타가 **같은 함수**를 쓴다 */
+function attachTextureFields(
+  label: string,
+  src: Record<string, unknown>,
+  out: { textures?: MaterialTextures; physicalSizeCm?: [number, number];
+         useCustomBaseColor?: boolean; flipTextures?: boolean },
+): void {
+  const textures = decodeMaterialTextures(label, src['textures']);
+  if (textures) out.textures = textures;
+
+  const size = decodePhysicalSize(label, src['physicalSizeCm']);
+  if (size) out.physicalSizeCm = size;
+
+  if (typeof src['useCustomBaseColor'] === 'boolean') {
+    out.useCustomBaseColor = src['useCustomBaseColor'];
+  }
+  if (typeof src['flipTextures'] === 'boolean') out.flipTextures = src['flipTextures'];
+}
+
+/**
+ * 머티리얼의 텍스처 색인이 표 안을 가리키는지 확인한다.
+ *
+ * 응답 단위 검사라 머티리얼 디코더가 못 한다 — 그쪽은 표를 모른다. 밖을
+ * 가리키면 **그 슬롯을 지운다**(던지지 않는다): 표에서 밀려난 칸이 있는 것은
+ * 정상적인 일(게이트웨이가 거절)이고, 그 때문에 옷 전체가 안 그려지면 안 된다.
+ */
+function clampTextureRefs(
+  materials: readonly ({ textures?: MaterialTextures } | undefined)[],
+  table: readonly (TextureAsset | null)[],
+): void {
+  for (const m of materials) {
+    if (!m?.textures) continue;
+    for (const slot of ['basecolor', 'normal', 'alpha'] as const) {
+      const idx = m.textures[slot];
+      if (idx === undefined) continue;
+      if (idx >= table.length || table[idx] === null) delete m.textures[slot];
+    }
+    if (Object.keys(m.textures).length === 0) delete m.textures;
+  }
+}
+
 /**
  * `material` 검증 — 위 두 변환과 **같은 이유로 같은 일**을 한다.
  *
@@ -289,7 +422,7 @@ function decodeMaterial(uuid: string, raw: unknown): PatternMaterial | undefined
 
   const [r, g, b] = color as [number, number, number];
 
-  return {
+  const out: PatternMaterial = {
     fabricUuid,
     color: [r, g, b],
     colorProfile: profile,
@@ -297,6 +430,8 @@ function decodeMaterial(uuid: string, raw: unknown): PatternMaterial | undefined
     roughness: scalar('roughness'),
     metalness: scalar('metalness'),
   };
+  attachTextureFields(`패턴 ${uuid}`, src, out);
+  return out;
 }
 
 /**
@@ -379,7 +514,22 @@ export function decodePattern(p: PatternData): DecodedPattern {
  * 디코더도 하나다 — 두 경로가 갈라지면 한쪽만 조용히 깨진다 (SDK 와 같은 판단).
  */
 export function decodePatterns(mesh: FrameMesh): DecodedPattern[] {
-  return mesh.patterns.map(decodePattern);
+  const patterns = mesh.patterns.map(decodePattern);
+  // 색인이 표 안을 가리키는지는 **여기서만** 볼 수 있다 — 패턴 디코더는 표를 모른다.
+  clampTextureRefs(patterns.map((p) => p.material), decodeTextureTable(mesh.textures));
+  return patterns;
+}
+
+/**
+ * 응답의 텍스처 표. `decodePatterns` 와 **따로** 부른다.
+ *
+ * 왜 `DecodedPattern` 안에 넣지 않는가: 표는 **응답 하나에 하나**이고 패턴마다
+ * 하나가 아니다. 패턴에 복사해 넣으면 24벌이 생기고, 그리는 쪽이 어느 것이
+ * 정본인지 알 수 없게 된다. 중복을 없애려고 표를 만들어 놓고 디코딩에서 다시
+ * 복제하면 앞뒤가 안 맞는다.
+ */
+export function decodeMeshTextures(mesh: FrameMesh): (TextureAsset | null)[] {
+  return decodeTextureTable(mesh.textures);
 }
 
 // ── 아바타 (AM-1) ───────────────────────────────────────────
@@ -521,7 +671,7 @@ function decodeAvatarMaterial(label: string, raw: unknown): AvatarPartMaterial |
     return v;
   };
 
-  return {
+  const out: AvatarPartMaterial = {
     assetUuid,
     color,
     colorProfile: profile,
@@ -529,6 +679,8 @@ function decodeAvatarMaterial(label: string, raw: unknown): AvatarPartMaterial |
     roughness: scalar('roughness'),
     metalness: scalar('metalness'),
   };
+  attachTextureFields(label, src, out);
+  return out;
 }
 
 /**
@@ -634,11 +786,19 @@ export function decodeAvatar(a: AvatarMesh): DecodedAvatar {
  * `avatarMesh` 응답을 통째로 푼다.
  *
  * `joinInSimulation` 이 꺼진 아바타는 애초에 오지 않고, **액세서리(머리카락)도
- * 안 온다** — 알파 컷아웃 텍스처를 실을 통로가 아직 없어서다. 대머리로 보이는
- * 것이 정상이다.
+ * 안 온다** — 워커의 `AvatarMeshData` 가 액세서리를 싣지 않아서다. 대머리로
+ * 보이는 것이 정상이다.
  */
 export function decodeAvatars(res: AvatarMeshResult): DecodedAvatar[] {
-  return res.avatars.map(decodeAvatar);
+  const avatars = res.avatars.map(decodeAvatar);
+  const table = decodeTextureTable(res.textures);
+  clampTextureRefs(avatars.flatMap((a) => a.parts.map((p) => p.material)), table);
+  return avatars;
+}
+
+/** 아바타 응답의 텍스처 표. `decodeMeshTextures`(옷)와 같은 규약이다 */
+export function decodeAvatarTextures(res: AvatarMeshResult): (TextureAsset | null)[] {
+  return decodeTextureTable(res.textures);
 }
 
 /** 진단용 합계. 프레임당 대역폭을 눈으로 확인할 때 쓴다 */

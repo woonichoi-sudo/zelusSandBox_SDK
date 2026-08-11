@@ -10,6 +10,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <ztAssetManager.h>        // GetAppdataRoot — 직물 상대경로의 뿌리 (텍스처)
 #include <ztAvatarCommon.h>        // ztAvatarBodyParam·ztAvatarMeasurePart + 이름 함수
 #include <ztAvatarMeasurement.h>   // GetMeasuredLength — 적용 뒤 치수를 다시 잰다
 #include <ztAvatarShaper.h>        // ztAvatarShaperEx::MeasurementInfos (치수 목표값 배열)
@@ -1128,7 +1129,7 @@ json MeshInfo(ZestManager& manager, void* listener)
     };
 }
 
-// ── 텍스처 필드 덤프 (조사용, `textures:true` 일 때만) ──────────────
+// ── 텍스처 필드 덤프 (조사용, `texturesRaw:true` 일 때만) ──────────
 //
 // 실시간 뷰는 흰 몸 + 단색 옷인데 스냅샷(glTF)에는 피부·눈·직물 무늬가 다
 // 나온다. 그 차이가 텍스처이고, **워커가 그 이미지에 어떻게 닿는지**를 아직
@@ -1142,8 +1143,12 @@ json MeshInfo(ZestManager& manager, void* listener)
 //    자체가 사라진다.** 그래서 길이와 앞부분만 싣고, 앞부분도 출력 가능한
 //    ASCII 가 아니면 hex 로 바꾼다.
 //
-// 기본은 꺼져 있다. 켜는 쪽은 프로브뿐이고, 이 필드들이 무엇인지 정해지기
-// 전에는 실시간 응답에 얹을 이유가 없다.
+// ★ **이건 조사용이고, 실제 전송 형태는 아래 `TextureTable` 이다.**
+//   조사가 끝나 답이 나왔으므로(경로였다) 기본 경로는 이제 그쪽이다. 그래도
+//   지우지 않는 이유는 남은 미지수가 있어서다 — 색과 텍스처를 엔진이 어떻게
+//   섞는지(`useCustomBaseColor=false` 인데 색과 basecolor 가 공존한다)와
+//   roughness/specular/bump 를 쓸지가 아직 안 정해졌다. 다시 재야 할 때
+//   `tools/probe-texture.ts` 가 이 플래그를 켠다.
 namespace
 {
 
@@ -1247,6 +1252,171 @@ json MaterialTextureJson(const ztDesignMaterialData& d)
     };
 }
 
+// ── 텍스처 표 (실제 전송 형태, `textures:true`) ─────────────────────
+//
+// 조사(`texturesRaw`)가 답을 냈다: **전부 디스크 파일이고 워커는 경로만 실으면
+// 된다.** 이미지를 읽지도 base64 하지도 않는다 — 그러면 응답이 19.7MB 가 되고,
+// 무엇보다 **체형을 바꿀 때마다 다시 실리게 된다.** 텍스처는 체형이 바뀌어도
+// 안 변하므로 그 비용은 순수한 낭비다. 경로만 싣고 게이트웨이가 정적으로
+// 서빙하면 브라우저 캐시가 두 번째부터 0 바이트로 만든다.
+//
+// ── 왜 표(별도 배열)인가 — 같은 파일이 여러 번 나온다 ────────────
+// `eyelashes_alp.png` 는 **한 파트 안에서 basecolor 와 alpha 두 슬롯에** 들어
+// 있고, 좌우 속눈썹·좌우 눈이 같은 파일을 또 공유한다. 머티리얼에 경로를
+// 인라인하면 받는 쪽이 같은 이미지를 몇 번씩 내려받거나, 중복 제거를 스스로
+// 해야 한다. 표를 따로 두고 머티리얼이 **색인**만 갖게 하면 그 문제가 원리적으로
+// 사라지고, 게이트웨이도 파일당 한 번만 등록하면 된다.
+//
+// ── 상대경로를 여기서 푼다 ──────────────────────────────────────
+// 옷 직물은 `fabric_infile/CS-00120.png` 처럼 **상대경로**로 온다. 그 뿌리는
+// `ztAssetManager::GetAppdataRoot(true)` 이고(zwMaterialManager.cpp:954 가
+// 거기에 "fabric_infile/" 를 붙인다), 그 값을 아는 것은 엔진에 링크된 이
+// 프로세스뿐이다. 게이트웨이가 `%LOCALAPPDATA%` 로 추측하게 두면 exe 이름이
+// 바뀌는 날 조용히 어긋난다 — **경로는 아는 쪽이 완성해서 보낸다.**
+//
+// ⚠️ 슬롯을 셋(basecolor·normal·alpha)으로 줄였다. 근거는 아래 kTexSlots 참고.
+namespace
+{
+
+/**
+ * 응답 하나에 실리는 텍스처 파일 표. 경로를 정규화·중복 제거해 모은다.
+ *
+ * ⚠️ `isRawData` 인 머티리얼(= 문자열이 이미지 바이트)은 **버린다.** 실측된 두
+ *    씬에서는 전부 false 였지만, true 인 씬을 만나면 그 바이트를 경로로 착각해
+ *    싣게 된다. 출력 가능한 ASCII 인지 보고 아니면 없는 것으로 친다 — 조용히
+ *    틀린 경로를 싣는 것보다 텍스처가 안 나오는 편이 화면에서 읽힌다.
+ */
+class TextureTable
+{
+public:
+    /** 경로 하나를 넣고 색인을 돌려준다. 실을 수 없으면 -1 */
+    int Add(const std::string& raw)
+    {
+        if (raw.empty()) return -1;
+
+        // 원시 바이트 방어. 경로라면 전부 출력 가능한 ASCII 다(한글 경로는
+        // UTF-8 이라 여기 걸리지만, 에셋 경로가 한글인 경우가 관측된 적 없고
+        // 걸려도 "텍스처 없음" 으로 안전하게 떨어진다).
+        for (const char ch : raw)
+        {
+            const unsigned char c = static_cast<unsigned char>(ch);
+            if (c < 0x20 || c > 0x7E) return -1;
+        }
+
+        std::string full = IsAbsolute(raw) ? raw : (AppdataRoot() + raw);
+        for (char& ch : full) if (ch == '\\') ch = '/';
+
+        const auto it = mIndex.find(full);
+        if (it != mIndex.end()) return it->second;
+
+        const int idx = static_cast<int>(mPaths.size());
+        mPaths.push_back(full);
+        mIndex.emplace(std::move(full), idx);
+        return idx;
+    }
+
+    bool Empty() const { return mPaths.empty(); }
+
+    json ToJson() const
+    {
+        json items = json::array();
+        for (const std::string& p : mPaths) items.push_back(p);
+        return items;
+    }
+
+private:
+    static bool IsAbsolute(const std::string& s)
+    {
+        if (s.size() >= 2 && s[1] == ':') return true;              // C:\...
+        return !s.empty() && (s[0] == '/' || s[0] == '\\');         // \\서버, /...
+    }
+
+    /**
+     * `fabric_infile/…` 의 뿌리. 끝에 구분자가 붙은 형태다.
+     *
+     * 한 번만 묻는다 — 프로세스 수명 안에서 안 바뀌고, 이 함수는 머티리얼마다
+     * 불린다. 실측 `%LOCALAPPDATA%\z-emotion\zelusSandBoxd-demo\`.
+     */
+    static const std::string& AppdataRoot()
+    {
+        static const std::string root = []() -> std::string {
+            const ztString s = ztAssetManager::GetAppdataRoot(true);
+            std::string u = Utf8(std::wstring(s.c_str()));
+            if (!u.empty() && u.back() != '/' && u.back() != '\\') u.push_back('/');
+            return u;
+        }();
+        return root;
+    }
+
+    std::vector<std::string>   mPaths;
+    std::map<std::string, int> mIndex;
+};
+
+/**
+ * 실어 보낼 슬롯 셋.
+ *
+ * ★ 9종 중 셋만 고른 것은 **용량과 three.js 의 실효 둘 다** 때문이다. 실측
+ *   디스크 크기(사용자 씬):
+ *     basecolor 10.73MB · normal 1.45 · alpha 1.68   → 실음  (합 13.86MB)
+ *     roughness  8.37MB · specular 9.39 · bump 5.84  → 뺌    (합 23.60MB)
+ *   빼는 쪽이 넣는 쪽보다 크다. roughness 를 넣으면 첫 로딩이 +60% 인데
+ *   `MeshStandardMaterial` 에서 그 맵이 바꾸는 것은 하이라이트의 번짐 정도이고,
+ *   specular 는 애초에 대응하는 자리가 없다(`MeshPhongMaterial` 것이다).
+ *   bump 는 자리가 있지만(`bumpMap`) 민트 직물에만 있고 5.84MB 다.
+ *
+ *   ⚠️ 이건 **판단이지 관측이 아니다.** 화면에서 스냅샷과 재질감이 갈리면
+ *      여기에 줄을 더하는 것이 첫 수다 — 아래 `MaterialTextureRefs` 에 한 줄,
+ *      클라이언트에 한 줄이면 된다.
+ *
+ * ⚠️ UDIM 때문에 각 슬롯이 벡터인데 **첫 칸만 쓴다.** three.js 에 UDIM 을 그리는
+ *    길이 없고, 실측된 두 씬은 전부 원소 1개였다.
+ */
+json MaterialTextureRefs(const ztDesignMaterialData& d, TextureTable& table)
+{
+    json refs = json::object();
+
+    const auto put = [&](const char* name, const std::vector<std::string>& v) {
+        if (v.empty()) return;
+        const int idx = table.Add(v.front());
+        if (idx >= 0) refs[name] = idx;
+    };
+
+    put("basecolor", d.basecolorTexture);
+    put("normal",    d.normalTexture);
+    put("alpha",     d.alphaTexture);
+
+    return refs;
+}
+
+/**
+ * 머티리얼 json 에 텍스처 관련 필드를 얹는다. **셋 다 없으면 아무것도 안 얹는다.**
+ *
+ * ★ `physicalSizeCm` 이 없으면 무늬 크기가 통째로 틀린다. 옷의 `uvs` 는 0~1 이
+ *   아니라 **cm 단위 패턴 좌표**라(cloth.ts 머리말), 텍스처를 몇 번 반복할지는
+ *   직물의 물리 크기가 정한다. 실측 노랑 2.114cm / 민트 29.997cm — 같은 옷 안에서
+ *   14배 차이다. 이 값을 빼면 받는 쪽이 추측할 방법이 없다.
+ */
+void AttachTextureFields(json& m, const ztDesignMaterialData& d, TextureTable& table)
+{
+    json refs = MaterialTextureRefs(d, table);
+    if (!refs.empty()) m["textures"] = std::move(refs);
+
+    // 0 이나 음수는 "모른다" 다. 그때 1cm 로 메우면 무늬가 100배로 나온다.
+    if (d.width > 0.0f && d.height > 0.0f)
+    {
+        m["physicalSizeCm"] = { d.width, d.height };
+    }
+
+    // ⚠️ 이 둘은 **아직 해석이 안 끝났다.** `useCustomBaseColor=false` 인데
+    //    색과 basecolor 텍스처가 공존하는 머티리얼이 있어서, 엔진이 둘을
+    //    곱하는지 텍스처가 이기는지 모른다. 싣는 이유는 화면에서 갈랐을 때
+    //    받는 쪽이 판단할 재료가 이미 와 있어야 해서다.
+    m["useCustomBaseColor"] = d.useCustomBaseColor;
+    m["flipTextures"]       = d.flipTextures;
+}
+
+} // namespace
+
 // 토폴로지는 프레임 간 고정이므로 최초 1회만 보내면 된다.
 // 프레임마다 필요한 건 positions뿐이다.
 //
@@ -1256,9 +1426,11 @@ json MaterialTextureJson(const ztDesignMaterialData& d)
 // meshData 응답과 구독 중 frame 이벤트의 mesh 필드가 **같은 함수**를 쓴다.
 // zsVector3 재포장(아래)이 두 곳에 복사되면 언젠가 갈라지고, 그때 어긋난
 // 쪽은 화면이 깨져야만 드러난다.
-json MeshData(ZestManager& manager, bool includeTopology, bool includeTextures = false)
+json MeshData(ZestManager& manager, bool includeTopology, bool includeTextures = true,
+              bool includeTexturesRaw = false)
 {
     json patterns = json::array();
+    TextureTable textures;
 
     ztSceneQueryInterface* qi = QueryInterface(manager);
     if (!qi)
@@ -1535,8 +1707,10 @@ json MeshData(ZestManager& manager, bool includeTopology, bool includeTextures =
                 m["colorProfile"] =
                     (d.colorProfile == ztColorProfile::Linear) ? "linear" : "srgb";
 
-                // 조사용(`textures:true`). 옷의 직물 무늬가 어디 있는지 본다.
-                if (includeTextures) m["textures"] = MaterialTextureJson(d);
+                // ★ 직물 무늬. 경로는 아래 표에 모이고 여기엔 색인만 남는다.
+                if (includeTextures) AttachTextureFields(m, d, textures);
+                // 조사용(`texturesRaw:true`). 이걸 켜면 위 색인 대신 날것이 온다.
+                if (includeTexturesRaw) m["texturesRaw"] = MaterialTextureJson(d);
 
                 p["material"] = std::move(m);
             }
@@ -1560,7 +1734,11 @@ json MeshData(ZestManager& manager, bool includeTopology, bool includeTextures =
         patterns.push_back(std::move(p));
     }
 
-    return json{ { "patterns", patterns }, { "topology", includeTopology } };
+    json out{ { "patterns", patterns }, { "topology", includeTopology } };
+    // ⚠️ 비어 있으면 키를 아예 안 싣는다 — `[]` 를 보내면 받는 쪽이 "표는 왔는데
+    //    빈 것" 과 "이 워커는 텍스처를 모른다" 를 구분할 수 없다.
+    if (!textures.Empty()) out["textures"] = textures.ToJson();
+    return out;
 }
 
 // ── 아바타 메시 (AM-1) ──────────────────────────────────────
@@ -1692,7 +1870,8 @@ json MeshData(ZestManager& manager, bool includeTopology, bool includeTextures =
 //   머리가 덩어리로 나온다. 통로가 생기면 여기 붙일 자리다.
 
 /** 아바타 파트의 머티리얼. 옷 쪽(`MeshData`)과 같은 다섯 필드 + 색공간이다. */
-json AvatarMaterialJson(const ztDesignMaterialData& d, bool includeTextures = false)
+json AvatarMaterialJson(const ztDesignMaterialData& d, TextureTable& textures,
+                        bool includeTextures = true, bool includeTexturesRaw = false)
 {
     json j{
         { "assetUuid",    ztUuidSaver::Convert(d.assetUuid) },
@@ -1705,9 +1884,13 @@ json AvatarMaterialJson(const ztDesignMaterialData& d, bool includeTextures = fa
         { "colorProfile", (d.colorProfile == ztColorProfile::Linear) ? "linear" : "srgb" },
     };
 
-    // 조사용(`textures:true`). 피부·눈·속눈썹이 스냅샷에서만 제 색으로 나오는
-    // 이유를 여기서 찾는다.
-    if (includeTextures) j["textures"] = MaterialTextureJson(d);
+    // ★ 피부·눈·속눈썹. 옷과 **같은 표를 쓴다** — 한 응답 안에서 파일이
+    //   중복되면 안 된다는 규칙이 아바타 안에서 특히 중요하다: 속눈썹은 한
+    //   파트에서 basecolor·alpha 두 슬롯에 같은 파일을 쓰고, 좌우가 또 그것을
+    //   공유한다(같은 파일이 4번 나온다).
+    if (includeTextures) AttachTextureFields(j, d, textures);
+    // 조사용(`texturesRaw:true`).
+    if (includeTexturesRaw) j["texturesRaw"] = MaterialTextureJson(d);
 
     return j;
 }
@@ -1722,8 +1905,9 @@ struct GlobalMutexGuard
 };
 
 json AvatarMeshData(ZestManager& manager, bool includeTopology, bool includeNormals,
-                    bool includeTextures = false)
+                    bool includeTextures = true, bool includeTexturesRaw = false)
 {
+    TextureTable textures;
     json avatars = json::array();
 
     std::size_t totalV = 0, totalT = 0;
@@ -1880,13 +2064,14 @@ json AvatarMeshData(ZestManager& manager, bool includeTopology, bool includeNorm
                 if (zeta)
                 {
                     if (i < zetaMaterials.size())
-                        p["material"] = AvatarMaterialJson(zetaMaterials[i], includeTextures);
+                        p["material"] = AvatarMaterialJson(zetaMaterials[i], textures,
+                                                           includeTextures, includeTexturesRaw);
                 }
                 else if (mannequin)
                 {
                     p["material"] =
                         AvatarMaterialJson(mannequin->GetMaterialData(static_cast<unsigned int>(i)),
-                                           includeTextures);
+                                           textures, includeTextures, includeTexturesRaw);
                 }
             }
 
@@ -1930,13 +2115,16 @@ json AvatarMeshData(ZestManager& manager, bool includeTopology, bool includeNorm
         avatars.push_back(std::move(a));
     }
 
-    return json{
+    json out{
         { "avatars",        avatars },
         { "topology",       includeTopology },
         { "normals",        includeNormals },
         { "totalVertices",  totalV },
         { "totalTriangles", totalT },
     };
+    // 옷과 같은 규약 — 비어 있으면 키를 안 싣는다.
+    if (!textures.Empty()) out["textures"] = textures.ToJson();
+    return out;
 }
 
 const char* ModeName(ZestManager::AnimationMode m)
@@ -2404,8 +2592,16 @@ int RunProtocolLoop(ZestManager& manager)
             }
             else if (op == "meshData")
             {
+                // ★ `textures` 는 **기본이 켜짐**이다(`normals` 와 같은 쪽).
+                //   재질을 싣는 응답에서 그 재질의 텍스처만 빼는 조합이 쓸모가
+                //   없고, 기본을 꺼 두면 모든 호출자가 매번 기억해야 한다 —
+                //   `normals` 가 그 함정을 이미 한 번 보여줬다(bridge.ts:495).
+                //   비용도 작다: 실리는 것은 짧은 경로 문자열 몇 개이고,
+                //   `topology:false`(= 프레임 경로)에는 재질 자체가 없어서
+                //   한 글자도 늘지 않는다.
                 result = MeshData(manager, req.value("topology", false),
-                                  req.value("textures", false));
+                                  req.value("textures",    true),
+                                  req.value("texturesRaw", false));
             }
             else if (op == "avatarMesh")
             {
@@ -2420,7 +2616,8 @@ int RunProtocolLoop(ZestManager& manager)
                     result = AvatarMeshData(manager,
                                             req.value("topology", false),
                                             req.value("normals",  true),
-                                            req.value("textures", false));
+                                            req.value("textures",    true),
+                                            req.value("texturesRaw", false));
                 }
             }
             else if (op == "export")

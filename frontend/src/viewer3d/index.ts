@@ -39,6 +39,11 @@ export {
   type TopologyMismatch,
 } from './frameStream.ts';
 export { showScene, type ShownScene } from './loader.ts';
+/**
+ * 텍스처를 받아 재질에 거는 자리 (materials-c). 판단은 `panels/textures.ts` 가
+ * 하고 여기는 three 고유의 것(캐시·색공간·늦게 오는 로드)만 다룬다.
+ */
+export { applyPlan, TextureCache } from './textures.ts';
 export {
   SnapshotLoader,
   SnapshotStaleError,

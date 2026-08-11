@@ -52,9 +52,11 @@
 
 import {
   decodeAvatars,
+  decodeAvatarTextures,
   isAnimationFinished,
   type AvatarMeshResult,
   type DecodedAvatar,
+  type TextureAsset,
 } from '../protocol/index.ts';
 
 /**
@@ -103,7 +105,15 @@ export interface AvatarViewSink {
   /** 사용자가 켜 둔 상태의 **정본**. 이 컨트롤러는 사본을 두지 않는다 */
   readonly visible: boolean;
   setVisible(on: boolean): void;
-  setTopology(avatars: readonly DecodedAvatar[]): void;
+  /**
+   * `textures` 는 **선택 인자다** (materials-c). 표를 받은 구현은 그걸 걸고,
+   * 안 받는 구현(옛 가짜)은 그냥 무시한다 — 인자를 필수로 만들면 이 인터페이스를
+   * 만족하던 테스트용 가짜가 전부 깨진다.
+   */
+  setTopology(
+    avatars: readonly DecodedAvatar[],
+    textures?: readonly (TextureAsset | null)[],
+  ): void;
   /** 짝이나 정점 수가 어긋나면 `false`. 그때 토폴로지를 다시 받는다 */
   updatePositions(avatars: readonly DecodedAvatar[]): boolean;
   clear(): void;
@@ -199,6 +209,8 @@ export class AvatarViewController {
   #inFlight = false;
   /** 세워 둔 토폴로지의 서명. null 이면 아직 몸이 없다 */
   #signature: string | null = null;
+  /** 마지막 토폴로지와 함께 온 텍스처 표 (materials-c). 배선이 통계를 읽어 간다 */
+  #textures: readonly (TextureAsset | null)[] = [];
   #resyncBudget = MAX_TOPOLOGY_RETRY;
 
   #avatars = 0;
@@ -232,6 +244,17 @@ export class AvatarViewController {
 
   get stats(): AvatarViewStats {
     return { ...this.#stats };
+  }
+
+  /**
+   * 마지막 토폴로지와 함께 온 텍스처 표 (materials-c).
+   *
+   * ⚠️ 이 컨트롤러는 표를 **해석하지 않는다** — 사본을 sink 에 넘기고, 배선이
+   *    통계를 화면에 쓰라고 여기로 읽어 갈 뿐이다. 무늬를 켜고 끄는 판단은
+   *    `panels/textures.ts` 에 있다.
+   */
+  get textures(): readonly (TextureAsset | null)[] {
+    return this.#textures;
   }
 
   get view(): AvatarViewState {
@@ -415,7 +438,12 @@ export class AvatarViewController {
       }
 
       if (installedTopology && decoded.length > 0) {
-        this.#sink.setTopology(decoded);
+        // ★ 텍스처 표를 **같이** 넘긴다 (materials-c). `setTopology` 가 재질을
+        //   새로 만들므로, 안 넘기면 체형을 바꿔 토폴로지를 다시 세운 순간
+        //   몸이 흰색으로 돌아간다 — 크래시가 없어 원인을 못 찾는 종류다.
+        //   (표는 `topology:true` 응답에만 실린다. 그래서 여기가 유일한 자리다.)
+        this.#textures = decodeAvatarTextures(res);
+        this.#sink.setTopology(decoded, this.#textures);
         this.#signature = signatureOf(decoded);
         this.#resyncBudget = MAX_TOPOLOGY_RETRY;
       }

@@ -6,7 +6,7 @@
  *   node --experimental-strip-types tools/probe-texture.ts
  *
  * 테스트가 아니다. `smoke.ts` 가 단언으로 회귀를 잡는 물건이고, 이건 워커의
- * `textures:true` 가 무엇을 돌려주는지 **눈으로 보는** 물건이다.
+ * `texturesRaw:true` 가 무엇을 돌려주는지 **눈으로 보는** 물건이다.
  * `probe-avatarmesh.ts` 와 같은 성격이다.
  *
  * ── 왜 재는가 ───────────────────────────────────────────────
@@ -203,13 +203,13 @@ console.log(`   로드 후 mtime ${stamp()}   ← 달라지면 로드가 씬에�
 console.log('\n=== ① 아바타 파트의 텍스처 필드 ===');
 
 const av = await w.request<any>('avatarMesh',
-  { topology: true, normals: false, textures: true });
+  { topology: true, normals: false, texturesRaw: true });
 
 const avatarTx: TexDump[] = [];
 for (const a of av.avatars ?? []) {
   console.log(`\n[${a.subType}] ${a.uuid}  파트 ${a.parts.length}개`);
   for (const p of a.parts) {
-    const tx = p.material?.textures as TexDump | undefined;
+    const tx = p.material?.texturesRaw as TexDump | undefined;
     if (tx) avatarTx.push(tx);
     const c = p.material?.color;
     const colorStr = c ? `색 [${c.map((x: number) => x.toFixed(3)).join(', ')}]` : '색 없음';
@@ -220,14 +220,14 @@ for (const a of av.avatars ?? []) {
 // ── ② 옷 ─────────────────────────────────────────────────────
 console.log('\n=== ② 옷(패턴) 재질의 텍스처 필드 ===');
 
-const cloth = await w.request<any>('meshData', { topology: true, textures: true });
+const cloth = await w.request<any>('meshData', { topology: true, texturesRaw: true });
 
 // 패턴은 24개인데 직물 에셋은 2개다(노랑 16 / 민트 8). 같은 fabricUuid 는
 // 한 번만 찍는다 — 같은 것을 24번 보면 무엇이 다른지 안 보인다.
 const seen = new Map<string, TexDump>();
 const clothTx: TexDump[] = [];
 for (const p of cloth.patterns ?? []) {
-  const tx = p.material?.textures as TexDump | undefined;
+  const tx = p.material?.texturesRaw as TexDump | undefined;
   if (!tx) continue;
   clothTx.push(tx);
   const key = p.material.fabricUuid as string;

@@ -61,6 +61,12 @@ export type {
   Design2DStitch,
   Design2DSurface,
   ErrResponse,
+  // 텍스처 (materials-c). ★ 브라우저에 오는 `TextureEntry` 는 **항상**
+  // `TextureAsset | null` 이다 — 문자열(서버 절대경로)은 게이트웨이가
+  // 바꿔 끼우므로 여기 도착하지 않는다. 도착했다면 그건 사고다(decode.ts).
+  MaterialTextures,
+  TextureAsset,
+  TextureEntry,
   MeshDataResult,
   MeshInfoResult,
   OkResponse,

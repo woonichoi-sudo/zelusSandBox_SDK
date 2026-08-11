@@ -43,6 +43,9 @@ import {
   AvatarBodyPanel,
   AvatarMeasureController,
   AvatarViewController,
+  addStats,
+  statsOf,
+  TextureOptions,
   DrapingPanel,
   SideTabsPanel,
   SurfaceSizePanel,
@@ -63,6 +66,7 @@ import {
   GatewayClient,
   listScenes,
   uploadScene,
+  type TextureAsset,
   type SceneSummary,
 } from './protocol/index.ts';
 import {
@@ -73,6 +77,7 @@ import {
   ParamsPanel,
   SideTabs,
   SurfacePanel,
+  TextureSwitch,
 } from './ui/index.ts';
 import { Unfolder, UnfoldController, Viewer2D } from './viewer2d/index.ts';
 import {
@@ -558,10 +563,22 @@ const avatarView = new AvatarViewController({
   sink: viewer.avatar,
   hooks: {
     log,
-    onChange: paintAvatarView,
+    onChange: (view) => paintAvatarViewAndTextures(view),
     now: () => performance.now(),
   },
 });
+
+/**
+ * 아바타 상태가 바뀌면 텍스처 통계도 다시 센다 (materials-c).
+ *
+ * 여기 두는 이유: `refresh()` 를 부르는 자리가 여섯 곳(로드·체형·치수·드레이프·
+ * 리셋·폴링)이라, 그 자리마다 한 줄씩 넣으면 언젠가 하나를 빠뜨린다. 상태
+ * 변화를 한 곳에서 받는 편이 낫다 — 세는 것이 표 10칸이라 공짜다.
+ */
+function paintAvatarViewAndTextures(view: AvatarViewState): void {
+  paintAvatarView(view);
+  syncTextureStats();
+}
 
 const avatarSwitch = new AvatarViewSwitch({
   root: ui.view3dOpts,
@@ -571,6 +588,63 @@ const avatarSwitch = new AvatarViewSwitch({
 /** 체크박스 하나와 글자 한 줄. **상태는 만들지 않는다 — 받은 것만 그린다** */
 function paintAvatarView(view: AvatarViewState = avatarView.view): void {
   avatarSwitch.render(view);
+}
+
+// ── 실시간 뷰의 텍스처 (materials-c) ────────────────────────
+//
+// 여기 있는 것도 배선뿐이다. 반복 배수·슬롯 해석은 `panels/textures.ts`,
+// 실제로 받아 거는 것은 `viewer3d/textures.ts`, 체크박스는
+// `ui/textureSwitch.ts` 다.
+//
+// ★ **표는 두 곳에서 온다** — 옷은 `showScene`(meshData topology:true), 아바타는
+//   `avatarView`(avatarMesh topology:true). 둘은 **별개의 왕복**이라 도착 시점이
+//   다르고, 어느 쪽이 늦게 와도 화면 글자가 맞아야 한다. 그래서 각자 도착할 때
+//   `syncTextureStats()` 를 부르고 그 함수가 둘을 **합쳐서** 다시 센다.
+/** 마지막으로 화면에 반영한 켜짐 상태. 통계만 바뀐 갱신에 재질을 안 건드린다 */
+let texturesApplied = true;
+
+const textureOptions = new TextureOptions({
+  log,
+  onChange: (state) => {
+    textureSwitch.render(state);
+    // ⚠️ `setStats` 로도 이 콜백이 온다. 그때마다 재질을 다시 만지면 셰이더가
+    //    괜히 재컴파일된다 — 바뀐 것이 켜짐/꺼짐일 때만 화면을 건드린다.
+    if (state.enabled !== texturesApplied) {
+      texturesApplied = state.enabled;
+      applyTextures();
+    }
+  },
+});
+
+const textureSwitch = new TextureSwitch({
+  root: ui.view3dOpts,
+  port: textureOptions,
+});
+
+/** 옷 쪽 표. 아바타 것은 `avatarView.textures` 가 정본이라 사본을 두지 않는다 */
+let clothTextures: readonly (TextureAsset | null)[] = [];
+
+/**
+ * 두 표를 합쳐 화면 글자를 갱신한다.
+ *
+ * ⚠️ 사본을 하나로 합쳐서 들고 있으면 안 된다 — 옷과 아바타의 색인 공간이
+ *    **다르기 때문이다**(각 응답이 자기 표를 0번부터 센다). 합치는 것은
+ *    사람이 읽는 숫자뿐이고, 그리는 쪽은 각자 자기 표를 쓴다.
+ */
+function syncTextureStats(): void {
+  textureOptions.setStats(addStats(statsOf(clothTextures), statsOf(avatarView.textures)));
+}
+
+/**
+ * 스위치가 바뀌었다. **왕복이 없다** — 이미 받아 둔 것을 걸었다 뗀다.
+ *
+ * 로드 때 다시 부를 필요가 없다: 두 객체가 켜짐 상태를 **자기 안에** 들고 있어서
+ * (`applyTextures` 가 세운 값), 다음 `setTopology` 가 그대로 따라간다.
+ */
+function applyTextures(): void {
+  const on = textureOptions.enabled;
+  viewer.cloth.applyTextures(on);
+  viewer.avatar.applyTextures(on);
 }
 
 // ── 옷 사이즈 (L-3b) ────────────────────────────────────────
@@ -828,6 +902,10 @@ function clearScene(): void {
   // 씬이 아직 있는 것처럼 보인다 — 옷 메시와 그룹이 갈려 있는 대가다.
   viewer2d.design.clear();
   paintDraft2d();
+  // 무늬도 씬에 딸려 있다 (materials-c). 남겨 두면 "무늬 4장 · 13.9MB" 가
+  // 씬이 내려간 뒤에도 화면에 남아 아직 뭔가 있는 것처럼 말한다.
+  clothTextures = [];
+  textureOptions.clear();
   currentScene = null;
   // 아바타도 씬에 딸려 있다. `currentScene = null` 뒤에 불러야
   // `refreshAvatarBody` 가 "씬 없음" 갈래로 간다.
@@ -1181,6 +1259,11 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
       mirror: viewer2d.cloth,
     });
     currentScene = sceneId;
+    // ★ 옷의 직물 무늬 (materials-c). `showScene` 이 이미 화면에 걸었고, 여기서
+    //   하는 일은 화면 글자를 위해 표를 들고 있는 것뿐이다. 아바타 쪽 표는
+    //   `avatarView` 가 자기 왕복에서 가져오고, 둘을 합치는 것이 아래 함수다.
+    clothTextures = shown.textures;
+    syncTextureStats();
     playback.sceneLoaded(sceneId);
     // 새 토폴로지가 섰다. 칸에 남아 있던 옛 프레임을 버리고 정지 상태를 푼다.
     stream.resume();

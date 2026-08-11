@@ -135,6 +135,27 @@ export {
   type DrapingView,
 } from './draping.ts';
 
+/**
+ * 실시간 뷰의 텍스처 (materials-c). ★ **옷의 UV 는 cm 라 반복 배수를 물리
+ * 크기에서 뽑아야 한다** — 아바타(0~1 UV)와 식이 다르다(원본 머리말).
+ */
+export {
+  addStats,
+  EMPTY_TEXTURE_STATS,
+  planFor,
+  tintColorProfile,
+  repeatFor,
+  resolveSlots,
+  statsOf,
+  TextureOptions,
+  type TextureOptionsHooks,
+  type TextureOptionsState,
+  type TexturePlan,
+  type TextureSlotUrls,
+  type TextureStats,
+  type TextureUvKind,
+} from './textures.ts';
+
 export {
   SurfaceSizePanel,
   validateSize,

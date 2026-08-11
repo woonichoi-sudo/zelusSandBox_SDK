@@ -26,6 +26,7 @@ import path from 'node:path';
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
 
 import { createExportRoutes, createSceneRoutes, ExportStore, SceneStore } from './files.ts';
+import { createTextureRoutes, defaultTextureRoots, TextureStore } from './textures.ts';
 import { SessionManager, type SessionsOptions } from './sessions.ts';
 
 /**
@@ -102,6 +103,15 @@ export interface GatewayOptions {
   exportTtlMs?: number;
   /** 연결 하나가 보유할 수 있는 산출물 수. 기본 DEFAULT_MAX_EXPORTS_PER_SESSION (4) */
   maxExportsPerSession?: number;
+  /**
+   * 텍스처를 내보내도 되는 **허용 뿌리**. 기본 `defaultTextureRoots()`
+   * (= `%LOCALAPPDATA%\z-emotion`, 환경변수 `TEXTURE_ROOTS` 로 대체 가능).
+   *
+   * ⚠️ **빈 배열은 "전부 허용"이 아니라 "전부 금지"다.** 이 목록 밖의 경로는
+   *    워커가 줘도 열리지 않는다 — 사용자가 올린 `.zls` 안의 문자열이 결국
+   *    여기까지 오기 때문이다(`textures.ts` 머리말).
+   */
+  textureRoots?: readonly string[];
   /**
    * 프론트엔드 빌드 산출물(`frontend/dist`)을 서빙할 디렉토리 (#11).
    *
@@ -203,6 +213,7 @@ export class Gateway {
   #routeHooks: RouteHooks[] = [];
   #scenes: SceneStore;
   #exports: ExportStore;
+  #textures: TextureStore;
   #sessions: SessionManager;
 
   constructor(opts: GatewayOptions = {}) {
@@ -218,6 +229,14 @@ export class Gateway {
         ? {}
         : { maxPerSession: opts.maxExportsPerSession }),
     });
+    // ★ 씬·익스포트와 달리 **디렉토리가 아니라 허용 뿌리**를 받는다. 우리가 쓰는
+    //   저장소가 아니라, 엔진이 만든 파일을 **내보내도 되는 범위**라서다.
+    //   뿌리가 비면(LOCALAPPDATA 가 없는 환경 등) 텍스처 기능이 통째로 꺼진다 —
+    //   "빈 목록 = 전부 허용" 으로 해석하면 설정을 빠뜨렸을 때 최악으로 열린다.
+    this.#textures = new TextureStore({
+      roots: opts.textureRoots ?? defaultTextureRoots(),
+      onLog: (line) => this.#log(line),
+    });
     this.#app = express();
     this.#configure(this.#app);
     this.#http = createHttpServer(this.#app);
@@ -230,6 +249,7 @@ export class Gateway {
       ...(opts.sessions ?? {}),
       scenes: this.#scenes,
       exports: this.#exports,
+      textures: this.#textures,
       log: (line) => this.#log(line),
     });
     this.#sessions.attach(this.#http);
@@ -276,6 +296,16 @@ export class Gateway {
    * 씬 저장소와 대칭이다 — 세션이 만든 파일의 경로를 아는 곳이 여기 하나뿐이고,
    * 클라이언트는 id와 `/api/exports/<id>`만 본다.
    */
+  /**
+   * 텍스처 파일 등록소.
+   *
+   * 씬·익스포트와 달리 **디스크를 소유하지 않는다** — 엔진이 만든 파일을
+   * id 로 가리키기만 한다. `gw.textures.size` 가 등록된 파일 수다.
+   */
+  get textures(): TextureStore {
+    return this.#textures;
+  }
+
   get exports(): ExportStore {
     return this.#exports;
   }
@@ -350,6 +380,7 @@ export class Gateway {
     //     start()가 리스닝 직전에 처리한다 — 생성자에서 await할 필요가 없다.
     use(createSceneRoutes(this.#scenes)); // #5 POST/GET /api/scenes
     use(createExportRoutes(this.#exports)); // #10 GET /api/exports/:id
+    use(createTextureRoutes(this.#textures)); // GET /api/textures/:id
 
     // (b) 바깥에서 주입한 라우트. 내장 뒤, catch-all 앞.
     for (const register of this.#opts.routes ?? []) use(register);

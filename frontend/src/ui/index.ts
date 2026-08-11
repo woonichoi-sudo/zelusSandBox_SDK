@@ -35,6 +35,16 @@ export {
   type AvatarViewSwitchPort,
 } from './avatarViewSwitch.ts';
 
+/**
+ * 실시간 3D 뷰의 텍스처 표시 스위치 (materials-c). 아바타 스위치 바로 옆이고,
+ * 켜짐/꺼짐의 정본은 `panels/textures.ts` 의 `TextureOptions` 다.
+ */
+export {
+  TextureSwitch,
+  type TextureSwitchOptions,
+  type TextureSwitchPort,
+} from './textureSwitch.ts';
+
 /** 치수 25개를 cm 로 편집한다 (W-2). 같은 탭의 아래 칸이다 */
 export {
   AvatarMeasurePanel,

@@ -25,10 +25,12 @@
  * `computeVertexNormals()` 로 만든다 — **몸 색이 전부 흰색이라 형태를 드러내는
  * 것이 조명과 음영뿐**이고, 법선이 틀리면 흰 덩어리가 된다.
  *
- * ── 색은 흰색이 정상이다 ────────────────────────────────────
- * 제타의 파트 재질은 전부 `[1,1,1] srgb` 다. 진짜 피부색은 텍스처이고 이
- * 프로토콜에 이미지를 실을 통로가 아직 없다 — "색이 안 왔다" 가 아니다.
- * 머리카락(액세서리)도 같은 이유로 안 실린다. 대머리가 정상이다.
+ * ── 색은 흰색이 정상이다. 피부색은 텍스처다 ─────────────────
+ * 제타의 파트 재질은 전부 `[1,1,1] srgb` 다. 진짜 피부색은 **텍스처**이고
+ * materials-c 에서 그 통로가 생겼다(`applyTextures`) — 색 `[1,1,1]` 에
+ * basecolor 를 곱하면 텍스처가 그대로 나오므로 두 값이 다투지 않는다.
+ * 텍스처가 도착하기 전(또는 꺼 뒀을 때)의 흰 몸은 여전히 정상이다.
+ * 머리카락(액세서리)은 워커가 아직 안 싣는다 — 대머리가 정상이다.
  *
  * ── 경계 상자는 응답의 것을 쓴다 ────────────────────────────
  * `positions` 전체로 다시 재면 안 된다. 아바타 정점 버퍼에는 **어떤 삼각형도
@@ -38,7 +40,9 @@
 
 import * as THREE from 'three';
 
-import type { AvatarPartMaterial, DecodedAvatar, DecodedAvatarPart } from '../protocol/index.ts';
+import { planFor, tintColorProfile } from '../panels/index.ts';
+import type { AvatarPartMaterial, DecodedAvatar, DecodedAvatarPart, TextureAsset } from '../protocol/index.ts';
+import { applyPlan, TextureCache } from './textures.ts';
 
 /** 파트 하나에 대응하는 three 객체 묶음 */
 export interface AvatarPartMesh {
@@ -82,14 +86,23 @@ function toIndexArray(indices: Int32Array): Uint32Array {
   return new Uint32Array(new Uint32Array(indices.buffer, indices.byteOffset, indices.length));
 }
 
-/** 워커의 색 → three 의 색. `colorProfile` 없이 해석하면 안 된다 */
-function colorOf(m: AvatarPartMaterial): THREE.Color {
+/**
+ * 워커의 색 → three 의 색. **색공간을 넘겨짚으면 안 된다.**
+ *
+ * 어느 공간으로 읽을지는 `panels/textures.ts` 의 `tintColorProfile` 이 정한다 —
+ * 무늬와 곱해질 때와 아닐 때의 답이 다르다(옷에서 파랑이 2.5배 갈렸다).
+ *
+ * ⓘ 제타의 파트 색은 실측상 전부 `[1,1,1]` 이나 `[0,0,0]` 이라 **지금은 두 답이
+ *   같은 값을 낸다.** 그래도 옷과 같은 규칙을 쓰는 이유는, 엔진이 언젠가 아바타
+ *   재질에 흰색 아닌 색을 채우는 날 같은 함정이 여기서 되살아나서다.
+ */
+function colorOf(m: AvatarPartMaterial, profile: 'srgb' | 'linear'): THREE.Color {
   const [r, g, b] = m.color;
   return new THREE.Color().setRGB(
     r,
     g,
     b,
-    m.colorProfile === 'srgb' ? THREE.SRGBColorSpace : THREE.LinearSRGBColorSpace,
+    profile === 'srgb' ? THREE.SRGBColorSpace : THREE.LinearSRGBColorSpace,
   );
 }
 
@@ -117,6 +130,22 @@ export class AvatarObject {
   #wanted = true;
   /** 지금 실시간 뷰인가 */
   #live = true;
+
+  /**
+   * 마지막으로 받은 텍스처 표. **스위치를 껐다 켤 때 왕복하지 않으려고 들고 있다.**
+   *
+   * ⚠️ `setTopology` 가 재질을 새로 만들므로 표도 그때 다시 걸어야 한다. 안 걸면
+   *    체형을 바꾼 뒤(= topology 재설치가 일어난 경우) 몸만 흰색으로 돌아간다.
+   */
+  #textures: readonly (TextureAsset | null)[] = [];
+  #texturesOn = true;
+
+  /**
+   * 이미지 캐시. **옷과 나눠 갖지 않는다** — 아바타 텍스처와 직물 파일이 겹치는
+   * 경우가 없어서 공유해 얻을 것이 없고, 나눠 두면 `clear()` 가 서로를 밟지
+   * 않는다(씬 로드에서 두 객체가 각자 `clear()` 를 부른다).
+   */
+  readonly #cache = new TextureCache();
 
   constructor() {
     this.group.name = 'avatar';
@@ -170,8 +199,14 @@ export class AvatarObject {
    * 기존 지오메트리를 전부 버리고 새로 만든다. 체형이 바뀔 때마다 이걸 부르면
    * 매번 GPU 버퍼를 새로 할당하게 된다. 그 경로는 `updatePositions()` 다.
    */
-  setTopology(avatars: readonly DecodedAvatar[]): void {
+  setTopology(avatars: readonly DecodedAvatar[], textures?: readonly (TextureAsset | null)[]): void {
     this.clear();
+
+    // ★ 표를 **재질을 만들기 전에** 갈아 끼운다. `#build` 가 곧바로 텍스처를
+    //   걸므로, 뒤에 넣으면 새 몸이 한 프레임 동안 옛 무늬를 입는다.
+    //   인자가 없으면(구버전 호출자) 들고 있던 것을 그대로 쓴다 — 체형 변경으로
+    //   토폴로지를 다시 세울 때 표만 잃어버리는 일을 막는다.
+    if (textures) this.#textures = textures;
 
     for (const a of avatars) {
       for (const p of a.parts) {
@@ -260,8 +295,11 @@ export class AvatarObject {
     }
 
     const transparent = m.opacity < 1;
-    return new THREE.MeshStandardMaterial({
-      color: colorOf(m),
+    // ★ 피부·눈·속눈썹. 제타의 파트 색은 전부 `[1,1,1]` 이라 곱해도 텍스처가
+    //   그대로 나온다 — 색과 무늬가 다투지 않는 유일한 경우다(옷은 다르다).
+    const plan = this.#texturesOn ? planFor(m, this.#textures, 'avatar') : null;
+    const mat = new THREE.MeshStandardMaterial({
+      color: colorOf(m, tintColorProfile(plan, m.colorProfile)),
       side: THREE.DoubleSide,
       roughness: m.roughness,
       metalness: m.metalness,
@@ -269,6 +307,28 @@ export class AvatarObject {
       transparent,
       depthWrite: !transparent,
     });
+    if (plan) applyPlan(mat, plan, this.#cache);
+    return mat;
+  }
+
+  /**
+   * 텍스처 표를 갈아 끼우거나 껐다 켠다. **왕복이 없다** — 이미 받아 둔 표를
+   * 화면에 걸었다 뗐다 할 뿐이다.
+   *
+   * ⚠️ 재질을 새로 만들지 않는다. 새로 만들면 `opacity`·`side` 같은 씬의 값이
+   *    이 함수에도 복제되고, 두 곳이 갈라지는 날 속눈썹이 불투명해진다.
+   */
+  applyTextures(on: boolean, textures?: readonly (TextureAsset | null)[]): void {
+    this.#texturesOn = on;
+    if (textures) this.#textures = textures;
+
+    for (const p of this.#byKey.values()) {
+      const mat = p.mesh.material;
+      if (Array.isArray(mat) || !(mat instanceof THREE.MeshStandardMaterial)) continue;
+      const plan = on ? planFor(p.material, this.#textures, 'avatar') : null;
+      applyPlan(mat, plan, this.#cache);
+      if (p.material) mat.color.copy(colorOf(p.material, tintColorProfile(plan, p.material.colorProfile)));
+    }
   }
 
   /**
@@ -355,5 +415,9 @@ export class AvatarObject {
     this.#vertices = 0;
     this.#triangles = 0;
     this.#bounds = null;
+    // ★ 표는 **버리지 않는다.** `setTopology` 가 맨 앞에서 clear() 를 부르므로,
+    //   여기서 지우면 인자 없이 부르는 경로(체형 변경 후 재설치)가 무늬를 잃는다.
+    //   GPU 텍스처는 버린다 — 세대도 같이 올라가 늦게 도착하는 로드가 무효가 된다.
+    this.#cache.clear();
   }
 }

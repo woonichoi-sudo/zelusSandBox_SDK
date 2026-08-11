@@ -208,6 +208,45 @@ export type PatternTransform2D = [
  *
  * 진짜 N:1 인 축은 **직물 에셋**(`fabricUuid`)이다 — 위 24개가 2개로 묶인다.
  */
+/**
+ * 머티리얼이 참조하는 텍스처 — **응답의 `textures` 표 색인**이다.
+ *
+ * 슬롯 셋으로 줄인 근거는 `protocol.cpp` 의 `kTexSlots` 주석에 있다(용량 대비
+ * three.js 에서의 실효). 없는 슬롯은 **키가 아예 없다** — `null` 을 넣으면
+ * "텍스처 없음" 과 "표에서 밀렸음" 이 같은 모양이 된다.
+ */
+export interface MaterialTextures {
+  /** 색 텍스처. **sRGB 로 읽어야 한다** (아래 두 슬롯은 아니다) */
+  basecolor?: number;
+  /** 탄젠트 공간 노멀맵. 선형이다 */
+  normal?: number;
+  /** 투명도. 선형이다. ⚠️ basecolor 와 **같은 파일일 수 있다**(속눈썹) */
+  alpha?: number;
+}
+
+/**
+ * 응답에 실린 텍스처 파일 한 칸.
+ *
+ * ── 워커와 게이트웨이가 다른 것을 싣는다 ────────────────────
+ * 워커는 **서버 절대경로 문자열**을 싣고, 게이트웨이가 그것을 id + 다운로드
+ * URL 로 **바꿔 끼운다** — `load` 의 `{loaded, path}` → `{loaded, scene}`,
+ * `export` 의 `{path}` → `{id, url}` 과 정확히 같은 처리다(bridge.ts).
+ * 서버 경로가 브라우저에 나가면 #5·#7 이 세운 규칙이 여기서 무너진다.
+ *
+ * 게이트웨이가 **거절한 칸은 `null`** 이다 — 허용 뿌리 밖이거나, 파일이 없거나,
+ * 확장자가 아닌 경우다. 색인이 밀리면 안 되므로 칸을 지우지 않고 비운다.
+ */
+export interface TextureAsset {
+  /** 32자리 hex. 경로의 해시라 **같은 파일이면 항상 같다**(브라우저 캐시가 산다) */
+  id: string;
+  /** `/api/textures/<id>`. 상대 경로다 — 오리진은 클라이언트가 안다 */
+  url: string;
+  bytes: number;
+}
+
+/** 워커가 싣는 것(경로) 또는 게이트웨이가 바꿔 끼운 것(자산) 또는 거절(null) */
+export type TextureEntry = string | TextureAsset | null;
+
 export interface PatternMaterial {
   /**
    * 직물 에셋 uuid. **패턴을 직물별로 묶는 유일한 키다.**
@@ -239,6 +278,28 @@ export interface PatternMaterial {
   roughness: number;
   /** 0~1. 실측상 두 씬 모두 0 이었다. */
   metalness: number;
+  /** 직물 무늬. 없으면 아예 오지 않는다 (`textures:false` 이거나 텍스처 없는 재질) */
+  textures?: MaterialTextures;
+  /**
+   * 직물의 **물리 크기 `[폭, 높이]` cm.** 텍스처 타일링이 여기서 나온다.
+   *
+   * ★ 옷의 `uvs` 는 0~1 이 아니라 **cm 단위 패턴 좌표**다. 따라서 한 장이
+   *   덮는 UV 범위가 곧 이 값이고, 반복 배수는 `1 / 폭`, `1 / 높이` 다.
+   *   실측 노랑 2.114cm / 민트 29.997cm — 같은 옷 안에서 14배 차이라,
+   *   이 값을 무시하면 무늬 크기가 통째로 틀린다.
+   *
+   * 0 이하면 아예 오지 않는다("모른다"를 1cm 로 메우면 무늬가 100배가 된다).
+   */
+  physicalSizeCm?: [number, number];
+  /**
+   * ⚠️ **아직 해석이 안 끝났다.** 실측된 두 씬 모두 `false` 인데 색과 basecolor
+   *    텍스처가 **공존한다** — 엔진이 둘을 곱하는지 텍스처가 이기는지 코드로는
+   *    확정하지 못했다. 싣는 이유는 화면에서 갈랐을 때 받는 쪽에 재료가 이미
+   *    와 있어야 해서다.
+   */
+  useCustomBaseColor?: boolean;
+  /** 실측상 두 씬 모두 `false`. three.js 의 `texture.flipY` 와 대응한다 */
+  flipTextures?: boolean;
 }
 
 export interface PatternData {
@@ -296,6 +357,19 @@ export interface PatternData {
 export interface MeshDataResult {
   patterns: PatternData[];
   topology: boolean;
+  /**
+   * 이 응답이 참조하는 텍스처 파일 표. **머티리얼은 여기 색인만 갖는다.**
+   *
+   * 표를 따로 두는 이유는 중복이다 — 같은 파일이 여러 슬롯·여러 파트에 나온다
+   * (속눈썹은 한 파트 안에서 basecolor·alpha 두 슬롯, 게다가 좌우가 공유해
+   * 같은 파일이 네 번 나온다). 인라인하면 받는 쪽이 같은 이미지를 몇 번씩
+   * 내려받거나 스스로 중복 제거를 해야 한다.
+   *
+   * ⚠️ 텍스처가 하나도 없으면 **키 자체가 없다** (`[]` 가 아니다) — "표는 왔는데
+   *    빈 것" 과 "이 워커는 텍스처를 모른다" 를 구분할 수 있어야 한다.
+   *    `topology:false`(= 프레임 이벤트) 에는 재질 자체가 없으므로 항상 없다.
+   */
+  textures?: TextureEntry[];
 }
 
 // ── 아바타 메시 (AM-1) ──────────────────────────────────────
@@ -322,6 +396,21 @@ export interface AvatarPartMaterial {
   opacity: number;
   roughness: number;
   metalness: number;
+  /**
+   * 피부·눈·속눈썹. 옷과 **같은 표**(`AvatarMeshResult.textures`)를 가리킨다.
+   *
+   * 실측: Face/Body/Legs/Arms/Eye 는 `basecolor` 하나, 속눈썹은 같은 파일이
+   * `basecolor` 와 `alpha` **둘 다**, Pupil·Cornea 는 텍스처 없이 색만(검정).
+   */
+  textures?: MaterialTextures;
+  /**
+   * 아바타에서는 실측상 항상 `[1, 1]` 이다. 옷과 달리 UV 가 이미 0~1 정규화된
+   * 텍스처 좌표라 **타일링에 쓰면 안 된다** — 그리는 쪽은 아바타에 반복 1 을
+   * 고정한다(우연히 1/1 = 1 로 맞아떨어지지만 근거가 다르므로 기대지 않는다).
+   */
+  physicalSizeCm?: [number, number];
+  useCustomBaseColor?: boolean;
+  flipTextures?: boolean;
 }
 
 /**
@@ -434,6 +523,9 @@ export interface AvatarMeshResult {
    *    들어 있다(실측 씬의 glTF 에 `zeta_accessory12` 노드가 있다). 뺀 이유는
    *    텍스처다 — 머리카락은 알파 컷아웃 이미지가 없으면 판때기로 보이는데,
    *    이 프로토콜에 이미지를 실을 통로가 아직 없다.
+   *
+   *    ⓘ 이제 통로는 생겼다(아래 `textures`). 다만 액세서리를 **싣는** 경로가
+   *      `AvatarMeshData` 에 아직 없다 — 그건 별개의 일이다.
    */
   avatars: AvatarMesh[];
   /** 요청한 값이 그대로 온다. 받은 응답에 indices 가 있는지 판정하는 데 쓴다 */
@@ -441,6 +533,14 @@ export interface AvatarMeshResult {
   normals: boolean;
   totalVertices: number;
   totalTriangles: number;
+  /**
+   * 텍스처 파일 표. 규약은 `MeshDataResult.textures` 와 같다 — **아바타 안에서
+   * 특히 중요하다**: 속눈썹 한 파일이 슬롯 둘 × 좌우 둘 = 네 번 참조된다.
+   *
+   * 실측(제타 아바타): 6칸 5.79MB — face 0.66 / body 1.14 / leg 1.46 /
+   * arm 0.84 / eye 1.29 / eyelashes 0.40.
+   */
+  textures?: TextureEntry[];
 }
 
 export interface SetParamsResult {

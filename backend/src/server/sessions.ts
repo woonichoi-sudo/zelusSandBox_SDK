@@ -71,6 +71,7 @@ import { PoolExhaustedError, SessionPool, type Op, type PoolOptions } from '../s
 import type { MeshDataResult } from '../sdk/protocol.ts';
 import { SessionBridge, type ClientEvent, type ClientOutbound } from './bridge.ts';
 import type { ExportStore, SceneStore } from './files.ts';
+import type { TextureStore } from './textures.ts';
 
 /** 게이트웨이 종료 — 표준 going away */
 export const CLOSE_SHUTDOWN = 1001;
@@ -261,6 +262,13 @@ export interface SessionManagerOptions extends SessionsOptions {
    * 하나뿐이어야 하고, 그 경로가 필요한 곳은 브리지의 build 뿐이다.
    */
   exports?: ExportStore;
+  /**
+   * 텍스처 파일 등록소. 없으면 브리지가 메시 응답에서 `textures` 표를 떼어 낸다.
+   *
+   * 앞의 둘과 달리 **op 을 막지 않는다** — 텍스처가 없어도 메시는 그려져야 한다
+   * (bridge.ts 의 `BuildContext.textures` 주석).
+   */
+  textures?: TextureStore;
   log?: (line: string) => void;
 }
 
@@ -737,6 +745,7 @@ export class SessionManager {
           : null,
         ...(this.#opts.scenes === undefined ? {} : { scenes: this.#opts.scenes }),
         ...(this.#opts.exports === undefined ? {} : { exports: this.#opts.exports }),
+        ...(this.#opts.textures === undefined ? {} : { textures: this.#opts.textures }),
         sceneId,
         // 산출물 사이드카에 남는다. 로그의 세션 id와 같은 값이라 "이 파일을
         // 만든 연결"을 사후에 따라갈 수 있다.

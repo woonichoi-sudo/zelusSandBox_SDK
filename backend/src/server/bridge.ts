@@ -34,6 +34,7 @@
 
 import type { MeshDataResult, Op } from '../sdk/protocol.ts';
 import { isExportFormat, type ExportFormat, type ExportStore, type SceneStore } from './files.ts';
+import type { TextureStore } from './textures.ts';
 
 /**
  * 브리지가 워커에게 요구하는 표면 전부. SDK Worker가 그대로 만족한다.
@@ -124,6 +125,14 @@ export interface BuildContext {
   exports?: ExportStore | undefined;
   /** 이 연결의 id. 산출물 사이드카에 남는다(진단용) */
   sessionId?: string | undefined;
+  /**
+   * 텍스처 파일 등록소. 없으면 `textures` 표를 **통째로 떼어 낸다**.
+   *
+   * 씬·익스포트 저장소가 없을 때 그 op 을 거절하는 것과 판단이 다르다: 텍스처가
+   * 없어도 메시는 그려져야 한다(색 폴백이 이미 있다). 여기서 거절하면 저장소
+   * 하나 때문에 `meshData` 가 통째로 죽는다.
+   */
+  textures?: TextureStore | undefined;
 
   // ── 아래 둘은 **연결이 살아 있는 동안 변한다** ──────────────
   // BuildContext는 원래 생성 시점의 스냅샷이었지만, #10에서 두 가지가
@@ -481,12 +490,57 @@ const buildExport: Build = async (msg, ctx) => {
   };
 };
 
-const buildMeshData: Build = (msg) => {
+/**
+ * 워커의 `textures` 표(서버 절대경로) → 클라이언트의 표(id + URL).
+ *
+ * ★ **`load` 의 `{loaded, path}` → `{loaded, scene}` 과 정확히 같은 처리다.**
+ *   워커가 돌려주는 것은 `C:\Users\…\fabric_infile\TOP_Mesh.png` 이고, 그걸
+ *   그대로 중계하면 #5·#7 이 세운 "경로는 밖으로 안 나간다"가 여기서 무너진다.
+ *   게다가 그 경로가 브라우저에 있으면 다음 단계는 "그 경로를 파라미터로 받는
+ *   서빙 라우트"가 되고, 그게 곧 임의 파일 읽기다. 그래서 URL 에 경로가 아니라
+ *   **등록된 id** 만 실린다(`textures.ts` 머리말).
+ *
+ * 거절한 칸은 `null` 이다 — 색인이 밀리면 머티리얼이 엉뚱한 이미지를 가리킨다.
+ * 저장소가 아예 없으면 키를 **떼어 낸다**: 빈 배열을 주면 받는 쪽이 "표는
+ * 왔는데 다 거절됐다"로 읽어 없는 원인을 찾게 된다.
+ */
+function mapTextureTable(store: TextureStore | undefined) {
+  return async (result: unknown): Promise<unknown> => {
+    if (!isRecord(result) || Array.isArray(result)) return result;
+    const raw = result['textures'];
+    if (!Array.isArray(raw)) return result;
+
+    if (!store || !store.enabled) {
+      const out = { ...result };
+      delete out['textures'];
+      return out;
+    }
+    return { ...result, textures: await store.registerAll(raw) };
+  };
+}
+
+/**
+ * `topology` 와 `textures` 를 거른다.
+ *
+ * ⚠️ `textures` 의 기본값은 **true** 다 — 워커와 같은 쪽이다(`normals` 가
+ *    남긴 교훈: 게이트웨이가 기본값을 흉내 내다 뒤집으면 아무도 모른다).
+ *    `=== true` 로 접으면 안 되는 이유가 정확히 그것이다.
+ */
+const buildMeshData: Build = (msg, ctx) => {
   const topology = msg['topology'];
   if (topology !== undefined && typeof topology !== 'boolean') {
     reject('topology는 불린이어야 합니다');
   }
-  return { payload: { topology: topology === true } };
+
+  const textures = msg['textures'];
+  if (textures !== undefined && typeof textures !== 'boolean') {
+    reject('textures는 불린이어야 합니다');
+  }
+
+  return {
+    payload: { topology: topology === true, textures: textures !== false },
+    mapResult: mapTextureTable(ctx.textures),
+  };
 };
 
 /**
@@ -496,7 +550,7 @@ const buildMeshData: Build = (msg) => {
  *    법선을 싣는 쪽이 기본이므로, 여기서도 "없으면 true" 로 맞춘다 —
  *    `=== true` 로 접으면 게이트웨이를 지나는 순간 기본값이 뒤집힌다.
  */
-const buildAvatarMesh: Build = (msg) => {
+const buildAvatarMesh: Build = (msg, ctx) => {
   const topology = msg['topology'];
   if (topology !== undefined && typeof topology !== 'boolean') {
     reject('topology는 불린이어야 합니다');
@@ -507,7 +561,21 @@ const buildAvatarMesh: Build = (msg) => {
     reject('normals는 불린이어야 합니다');
   }
 
-  return { payload: { topology: topology === true, normals: normals !== false } };
+  const textures = msg['textures'];
+  if (textures !== undefined && typeof textures !== 'boolean') {
+    reject('textures는 불린이어야 합니다');
+  }
+
+  return {
+    payload: {
+      topology: topology === true,
+      normals: normals !== false,
+      textures: textures !== false,
+    },
+    // 옷과 **같은 함수**를 쓴다. 두 벌이 되면 한쪽만 고쳐지는 날 아바타 텍스처만
+    // 서버 경로를 그대로 내보내게 된다.
+    mapResult: mapTextureTable(ctx.textures),
+  };
 };
 
 // ── 화이트리스트 ────────────────────────────────────────────
@@ -776,6 +844,7 @@ export class SessionBridge {
       scenes: opts.scenes,
       sceneId: opts.sceneId,
       exports: opts.exports,
+      textures: opts.textures,
       sessionId: opts.sessionId,
       loadedScene: opts.sceneId,
       ownExports: [],
