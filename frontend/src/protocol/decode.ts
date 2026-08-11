@@ -21,6 +21,10 @@
  */
 
 import type {
+  AvatarMesh,
+  AvatarMeshResult,
+  AvatarPart,
+  AvatarPartMaterial,
   FrameMesh,
   PatternData,
   PatternMaterial,
@@ -376,6 +380,265 @@ export function decodePattern(p: PatternData): DecodedPattern {
  */
 export function decodePatterns(mesh: FrameMesh): DecodedPattern[] {
   return mesh.patterns.map(decodePattern);
+}
+
+// ── 아바타 (AM-1) ───────────────────────────────────────────
+//
+// **옷과 정반대의 규약이 하나 있다.** 패턴의 `positions` 는 패턴 로컬이라
+// `transform` 을 곱해야 월드가 되지만(ISSUE-011), 아바타의 `positions` 는
+// **이미 월드 cm** 다 — 엔진이 `localTransform` 을 정점에 구워서 준다. 그래서
+// 아래 타입에는 `transform` 이 아예 없다. 옷의 디코더를 베껴 오면 여기에
+// 없는 필드를 찾다가, 없으니 identity 로 메우고 지나가게 된다(그건 우연히
+// 맞는다). 진짜 사고는 **그리는 쪽이 `cloth.ts` 를 베껴 변환을 거는 것**이고
+// 그러면 몸이 옷에서 떨어져 선다.
+//
+// 나머지는 패턴과 같은 규약이다: `topology:true` 로 받았을 때만 `indices`·
+// `uvs`·`material` 이 실리고, 없는 것은 오류가 아니다.
+
+/** 아바타 파트 하나. three.js 가 그대로 받을 수 있는 형태 */
+export interface DecodedAvatarPart {
+  /** 엔진의 파트 순서. `name` 은 중복될 수 있으므로 짝의 정본은 이쪽이다 */
+  index: number;
+  name: string;
+  vertices: number;
+  triangles: number;
+  /** ★ **월드 cm.** 어떤 변환도 곱하지 마라 */
+  positions: Float32Array;
+  /**
+   * `normals:false` 로 요청했을 때만 없다.
+   *
+   * ⚠️ **topology 가 아니라 positions 와 한 몸이다.** 몸이 휘면 법선도 바뀐다 —
+   *    최초 1회만 받아 두면 몸은 움직이는데 음영만 옛 자세로 굳는다.
+   */
+  normals?: Float32Array;
+  /** topology:true 일 때만 */
+  indices?: Int32Array;
+  /** topology:true 일 때만. 옷의 `uvs` 와 달리 **텍스처 좌표**다(cm 가 아니다) */
+  uvs?: Float32Array;
+  /** topology:true 일 때만. 없는 것은 오류가 아니다 — 흰색으로 메우지 않는다 */
+  material?: AvatarPartMaterial;
+}
+
+/** 아바타 한 구 */
+export interface DecodedAvatar {
+  uuid: string;
+  subType: 'zeta' | 'mannequin';
+  /** `avatarBody`/`setAvatarMeasurements` 가 대상으로 삼는 아바타인가 */
+  current: boolean;
+  parts: DecodedAvatarPart[];
+  vertices: number;
+  triangles: number;
+  animation: boolean;
+  animationTime: number;
+  /** `[현재, 전체]`. 끝났는지는 `isAnimationFinished()` 가 판정한다 */
+  frameInfo: [number, number];
+  /**
+   * 워커가 **인덱스가 가리키는 정점만으로** 다시 잰 월드 AABB (cm).
+   *
+   * ⚠️ **화면이 `positions` 전체로 다시 재면 안 된다.** 아바타 정점 버퍼에는
+   *    어떤 삼각형도 참조하지 않는 쓰레기 정점이 섞여 있어서, 다시 재면 상자가
+   *    커지고 카메라를 거기 맞추면 몸이 구석에 박힌다.
+   */
+  bounds?: { min: [number, number, number]; max: [number, number, number] };
+}
+
+/**
+ * 애니메이션이 끝났는가 — **`cur + 1 >= total`.**
+ *
+ * ★ 이 판정이 클라이언트에 있는 이유는 워커가 못 하기 때문이다. 엔진의
+ *   `IsAnimationFinished()` 는 `const` 인데 내부에서 mutable 플래그를 지우고,
+ *   시뮬 실행기가 바로 그 플래그로 아바타 갱신 여부를 정한다 — 워커가 읽으면
+ *   시뮬 동작 자체가 바뀐다. 그래서 워커는 `frameInfo` 를 실어 주고 판정은
+ *   여기서 한다.
+ *
+ * `total <= 0`(애니메이션이 없다)이면 **끝난 것으로 본다** — 갱신을 계속
+ * 요청할 이유가 없다.
+ */
+export function isAnimationFinished(a: { frameInfo: readonly [number, number] }): boolean {
+  const [cur, total] = a.frameInfo;
+  if (total <= 0) return true;
+  return cur + 1 >= total;
+}
+
+/** 길이 3 의 유한한 숫자 배열. bounds 가 이걸 쓴다 */
+function triple(label: string, raw: unknown): [number, number, number] {
+  if (!Array.isArray(raw) || raw.length !== 3) {
+    throw new Error(
+      `${label} 은 길이 3 의 배열이어야 합니다 `
+      + `(${Array.isArray(raw) ? `길이 ${raw.length}` : typeof raw})`,
+    );
+  }
+  for (const v of raw) {
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      throw new Error(`${label} 에 유한하지 않은 값이 있습니다`);
+    }
+  }
+  const [x, y, z] = raw as [number, number, number];
+  return [x, y, z];
+}
+
+/**
+ * 아바타 파트의 재질 — `decodeMaterial`(옷)과 **같은 이유로 같은 일**을 한다.
+ *
+ * 다른 것은 uuid 필드 이름(`assetUuid`)뿐이다. 두 함수를 합치지 않는 이유는
+ * 그 이름이 프로토콜에 그렇게 박혀 있어서고, 합치면 한쪽이 바뀔 때 다른 쪽이
+ * 조용히 따라 바뀐다.
+ *
+ * ⚠️ 없는 것(`undefined`)은 오류가 아니다 — `topology:false` 로 받았을 때가
+ *    그렇다. 흰색으로 메우면 **진짜 흰 몸**과 구분할 수 없어진다(제타의 몸은
+ *    실제로 전부 흰색이다).
+ */
+function decodeAvatarMaterial(label: string, raw: unknown): AvatarPartMaterial | undefined {
+  if (raw === undefined || raw === null) return undefined;
+
+  if (typeof raw !== 'object') {
+    throw new Error(`${label}: material 이 객체가 아닙니다 (${typeof raw})`);
+  }
+
+  const src = raw as Record<string, unknown>;
+
+  const assetUuid = src['assetUuid'];
+  if (typeof assetUuid !== 'string') {
+    throw new Error(`${label}: material.assetUuid 가 문자열이 아닙니다`);
+  }
+
+  const color = triple(`${label}: material.color`, src['color']);
+
+  const profile = src['colorProfile'];
+  if (profile !== 'srgb' && profile !== 'linear') {
+    // 넘겨짚지 않는다. 틀린 쪽으로 짚으면 색이 어긋나는데 아무도 예외를 못 본다.
+    throw new Error(
+      `${label}: material.colorProfile 은 'srgb' | 'linear' 여야 합니다 `
+      + `(${JSON.stringify(profile)})`,
+    );
+  }
+
+  const scalar = (key: 'opacity' | 'roughness' | 'metalness'): number => {
+    const v = src[key];
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      throw new Error(`${label}: material.${key} 가 유한한 숫자가 아닙니다`);
+    }
+    return v;
+  };
+
+  return {
+    assetUuid,
+    color,
+    colorProfile: profile,
+    opacity: scalar('opacity'),
+    roughness: scalar('roughness'),
+    metalness: scalar('metalness'),
+  };
+}
+
+/**
+ * 파트 하나를 푼다. **길이를 검증하는 것이 본체다** (`decodePattern` 과 같다).
+ *
+ * 어긋난 채 three 로 넘기면 지오메트리가 조용히 뒤틀리거나 마지막 몇 정점이
+ * 원점에 붙는다 — 화면만 보고는 디코딩 문제인지 엔진 문제인지 알 수 없다.
+ */
+export function decodeAvatarPart(avatarUuid: string, p: AvatarPart): DecodedAvatarPart {
+  const label = `아바타 ${avatarUuid} 파트 ${p.index}(${p.name})`;
+
+  const positions = p.positions
+    ? decodeFloat32(p.positions, `${label} positions`)
+    : new Float32Array(0);
+  if (p.positions && positions.length !== p.vertices * 3) {
+    throw new Error(
+      `${label}: positions 길이가 맞지 않습니다 `
+      + `(${positions.length} !== vertices ${p.vertices} × 3)`,
+    );
+  }
+
+  const out: DecodedAvatarPart = {
+    index: p.index,
+    name: p.name,
+    vertices: p.vertices,
+    triangles: p.triangles,
+    positions,
+  };
+
+  if (p.normals) {
+    const normals = decodeFloat32(p.normals, `${label} normals`);
+    if (normals.length !== p.vertices * 3) {
+      throw new Error(
+        `${label}: normals 길이가 맞지 않습니다 `
+        + `(${normals.length} !== vertices ${p.vertices} × 3)`,
+      );
+    }
+    out.normals = normals;
+  }
+
+  if (p.indices) {
+    const indices = decodeInt32(p.indices, `${label} indices`);
+    if (indices.length !== p.triangles * 3) {
+      throw new Error(
+        `${label}: indices 길이가 맞지 않습니다 `
+        + `(${indices.length} !== triangles ${p.triangles} × 3)`,
+      );
+    }
+    out.indices = indices;
+  }
+
+  if (p.uvs) {
+    const uvs = decodeFloat32(p.uvs, `${label} uvs`);
+    if (uvs.length !== p.vertices * 2) {
+      throw new Error(
+        `${label}: uvs 길이가 맞지 않습니다 (${uvs.length} !== vertices ${p.vertices} × 2)`,
+      );
+    }
+    out.uvs = uvs;
+  }
+
+  const material = decodeAvatarMaterial(label, p.material);
+  if (material) out.material = material;
+
+  return out;
+}
+
+/** 아바타 하나를 푼다 */
+export function decodeAvatar(a: AvatarMesh): DecodedAvatar {
+  const parts = a.parts.map((p) => decodeAvatarPart(a.uuid, p));
+
+  const info = a.frameInfo;
+  if (!Array.isArray(info) || info.length !== 2
+    || typeof info[0] !== 'number' || typeof info[1] !== 'number') {
+    throw new Error(`아바타 ${a.uuid}: frameInfo 는 숫자 두 개여야 합니다`);
+  }
+
+  const out: DecodedAvatar = {
+    uuid: a.uuid,
+    subType: a.subType,
+    current: a.current,
+    parts,
+    vertices: a.vertices,
+    triangles: a.triangles,
+    animation: a.animation,
+    animationTime: a.animationTime,
+    frameInfo: [info[0], info[1]],
+  };
+
+  // 없을 수 있다 — 정점이 하나도 없는 아바타가 그렇다. 0 으로 메우지 않는다
+  // (원점 크기 0 인 상자에 카메라를 맞추면 화면이 통째로 이상해진다).
+  if (a.bounds) {
+    out.bounds = {
+      min: triple(`아바타 ${a.uuid}: bounds.min`, a.bounds.min),
+      max: triple(`아바타 ${a.uuid}: bounds.max`, a.bounds.max),
+    };
+  }
+
+  return out;
+}
+
+/**
+ * `avatarMesh` 응답을 통째로 푼다.
+ *
+ * `joinInSimulation` 이 꺼진 아바타는 애초에 오지 않고, **액세서리(머리카락)도
+ * 안 온다** — 알파 컷아웃 텍스처를 실을 통로가 아직 없어서다. 대머리로 보이는
+ * 것이 정상이다.
+ */
+export function decodeAvatars(res: AvatarMeshResult): DecodedAvatar[] {
+  return res.avatars.map(decodeAvatar);
 }
 
 /** 진단용 합계. 프레임당 대역폭을 눈으로 확인할 때 쓴다 */

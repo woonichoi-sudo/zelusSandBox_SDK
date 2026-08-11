@@ -101,6 +101,26 @@ export {
 } from './avatarMeasure.ts';
 
 /**
+ * 실시간 뷰의 몸을 **언제 다시 받을지** (AM-1). op 하나가 448KB~1.9MB 이고
+ * 워커의 시뮬을 24~29ms 멈추므로, 타이밍 자체가 이 모듈의 본체다.
+ * 재생 중에는 `POLL_MS` 간격으로 받고 `frameInfo` 가 끝을 알리면 멈춘다.
+ */
+export {
+  AvatarViewController,
+  MAX_TOPOLOGY_RETRY,
+  POLL_MS,
+  type AvatarCause,
+  type AvatarRefreshResult,
+  type AvatarViewHooks,
+  type AvatarViewOptions,
+  type AvatarViewPhase,
+  type AvatarViewPort,
+  type AvatarViewSink,
+  type AvatarViewState,
+  type AvatarViewStats,
+} from './avatarView.ts';
+
+/**
  * 저장된 드레이프 적용 (W-1). **`reset` 과 같은 자리의 op 이다** — 성공하면
  * 워커가 프레임 카운터를 -1 로 되돌린다(원본 머리말 참고).
  */

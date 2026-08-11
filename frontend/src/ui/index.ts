@@ -24,6 +24,17 @@ export {
   type AvatarPanelOptions,
 } from './avatarPanel.ts';
 
+/**
+ * 실시간 3D 뷰의 아바타 표시 스위치 (AM-1). 켜짐/꺼짐의 정본은 `AvatarObject`
+ * 이고 이 위젯은 `AvatarViewController` 를 통해 읽어서 그리기만 한다 —
+ * `Design2DOptions` 와 같은 규약이다.
+ */
+export {
+  AvatarViewSwitch,
+  type AvatarViewSwitchOptions,
+  type AvatarViewSwitchPort,
+} from './avatarViewSwitch.ts';
+
 /** 치수 25개를 cm 로 편집한다 (W-2). 같은 탭의 아래 칸이다 */
 export {
   AvatarMeasurePanel,

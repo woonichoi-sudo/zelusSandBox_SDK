@@ -24,6 +24,11 @@
  *   viewer.setMode('snapshot');            // 실시간 옷과 **동시에 보이지 않는다**
  */
 
+/**
+ * 실시간 뷰의 몸 (AM-1). ★ 정점이 **월드 cm** 다 — `cloth.ts` 와 정반대로
+ * 변환을 걸지 않는다. 원본 머리말 참고.
+ */
+export { AvatarObject, type AvatarPartMesh } from './avatar.ts';
 export { ClothObject, type PatternMesh } from './cloth.ts';
 export {
   FrameStream,

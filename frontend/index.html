@@ -271,11 +271,57 @@
            위쪽으로 옮긴다. 두 줄로 접히는 것은 그대로 허용한다 — 잘라서
            숨기면 단축키 안내가 화면에서 사라진다.
       */
+      /*
+        ⚠️ `max-width` 가 **칸 전체에서 오른쪽 위를 뺀 만큼**으로 줄었다 (AM-1).
+           이 문구는 단축키까지 붙어 690px 남짓 뻗어 3D 칸(1280px 에서 448px)
+           에서 두 줄로 접히는데, 그 두 줄이 칸 폭을 다 쓰면 오른쪽 위의
+           아바타 스위치(`#view3dOpts`)와 글자가 겹쳐 찍힌다. 힌트는
+           `pointer-events: none` 이라 클릭은 안 뺏지만 **읽을 수 없게 된다.**
+           줄이면 세 줄로 접힐 뿐이고, 잘라서 숨기지는 않는다.
+
+           15.5rem 의 근거(실측, 창 1450px → 3D 칸 533px): 스위치 상자가
+           오른쪽 0.5rem 에서 시작해 최대 14rem 을 쓰므로 오른쪽에서
+           14.5rem 이 예약된다. 힌트는 왼쪽 0.75rem 에서 시작하니 그만큼을
+           더 빼야 두 상자가 안 만난다 — 13rem 으로 뒀을 때 실제로 19px
+           겹쳤다.
+      */
       #hint {
         position: absolute; left: 0.75rem; top: 0.5rem; z-index: 2;
-        max-width: calc(100% - 1.5rem);
+        max-width: calc(100% - 15.5rem);
         opacity: 0.35; pointer-events: none;
       }
+
+      /*
+        ── 실시간 뷰의 아바타 스위치 (AM-1) ──────────────────────
+        칸 **오른쪽 위**에 둔다. 왼쪽 위는 `#hint`, 아래 가운데는
+        `#unfoldWrap`, 화면 왼쪽 아래는 `#paramsWrap`(fixed) 가 이미 쓴다.
+
+        가운데 칸의 `#draft2dOpts`(D2-e)와 **같은 규칙·같은 클래스**다:
+        상자는 `pointer-events: none`, 라벨만 `auto`. 상자가 통째로 클릭을
+        먹으면 그 사각형 안에서는 3D 를 회전시킬 수 없다.
+
+        `text-align: right` 는 장식이 아니다 — 상태 글자가 "몸을 받는 중…
+        (1.9MB)" 에서 "아바타 1 · 정점 28,564" 로 길이가 오가는데, 왼쪽
+        정렬이면 그때마다 오른쪽 끝이 들쭉날쭉해진다.
+      */
+      /*
+        ⚠️ **폭에 상한이 있어야 한다.** 상태 글자는 "아바타 1 · 정점 28,564"
+           에서 "이 씬에는 시뮬에 참여하는 아바타가 없습니다" 나 실패 사유까지
+           길이가 크게 오간다. 상한이 없으면 긴 글자가 왼쪽으로 뻗어 `#hint` 를
+           덮는다 — 위 `#hint` 의 15.5rem 이 이 14rem 과 짝이다. 넘치면 잘리지
+           않고 **여러 줄로 접힌다**(글자가 사라지면 안 된다).
+      */
+      #view3dOpts {
+        position: absolute; right: 0.5rem; top: 0.5rem; z-index: 3;
+        display: flex; flex-direction: column; align-items: flex-end; gap: 0.15rem;
+        max-width: min(14rem, calc(100% - 1rem));
+        pointer-events: none;
+        font-size: 11px; text-align: right;
+      }
+      /* 상태 글자. 계측값이 아니라 **사용자에게 하는 말**이라 흐리게 두지 않는다 */
+      .dstat { opacity: 0.6; }
+      .dstat.err { color: #ff9a9a; opacity: 1; }
+      .dstat:empty { display: none; }
 
       /*
         파라미터 패널 (#16). `#logWrap` 과 **같은 패턴**이다 — 바닥에 고정해
@@ -502,6 +548,20 @@
 
       <!-- 단축키 문구는 `src/panels/shortcuts.ts` 의 SHORTCUT_HINT 가 채운다 -->
       <div id="hint">좌드래그 회전 · 우드래그 팬 · 휠 줌 &nbsp;|&nbsp; 격자 한 칸 = 10cm</div>
+
+      <!--
+        ── 아바타 표시 스위치 + 상태 (AM-1) ────────────────────
+        체크박스와 글자는 `src/ui/avatarViewSwitch.ts` 가 만든다(여기는 빈
+        자리다). 켜짐/꺼짐의 **정본은 `viewer3d/avatar.ts` 의 `AvatarObject`**
+        이고, 언제 다시 받을지는 `panels/avatarView.ts` 가 정한다.
+
+        ⚠️ 글자가 붙어 있는 이유: 첫 요청이 **1.9MB** 라 눈에 띄게 걸리고,
+           몸이 안 보이는 이유가 셋(끔 / 씬 없음 / 아바타 없는 씬)인데 화면상
+           셋 다 똑같이 "몸이 없다" 로 보인다. 어느 쪽인지는 글자만 말할 수 있다.
+        ⚠️ **스냅샷 모드에서는 스위치와 무관하게 몸이 내려간다** — 익스포트한
+           glTF 에 아바타가 이미 들어 있어서, 켜 두면 몸이 두 벌 겹친다.
+      -->
+      <div id="view3dOpts"></div>
 
       <!--
         2D 펼침 (#15-b). 좌표 변환·보간은 `src/viewer2d/unfold.ts`, 상태 판정은

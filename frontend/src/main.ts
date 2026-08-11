@@ -42,13 +42,16 @@
 import {
   AvatarBodyPanel,
   AvatarMeasureController,
+  AvatarViewController,
   DrapingPanel,
   SideTabsPanel,
   SurfaceSizePanel,
   PlaybackController,
   shortcutFor,
   SHORTCUT_HINT,
+  type AvatarCause,
   type AvatarMeasureView,
+  type AvatarViewState,
   type DrapingView,
   type PlaybackView,
   type ShortcutAction,
@@ -65,6 +68,7 @@ import {
 import {
   AvatarMeasurePanel,
   AvatarPanel,
+  AvatarViewSwitch,
   Design2DOptions,
   ParamsPanel,
   SideTabs,
@@ -97,6 +101,8 @@ const ui = {
   draft2dEmpty: el<HTMLElement>('draft2dEmpty'),
   // 재단 도면의 표시 스위치가 그려질 자리 (D2-e)
   draft2dOpts: el<HTMLElement>('draft2dOpts'),
+  // 실시간 뷰의 아바타 스위치가 그려질 자리 (AM-1)
+  view3dOpts: el<HTMLElement>('view3dOpts'),
   scene: el<HTMLSelectElement>('scene'),
   load: el<HTMLButtonElement>('load'),
   file: el<HTMLInputElement>('file'),
@@ -450,6 +456,11 @@ async function applyAvatarBody(): Promise<void> {
     //   치수 패널에 알려 화면이 "이 숫자는 그 전에 잰 값" 이라고 말하게
     //   한다. 이 한 줄이 없으면 화면이 조용히 거짓말을 한다.
     avatarMeasure.noteBodyParamsApplied();
+    // ★ 몸이 실제로 다시 만들어졌다 (AM-1). 슬라이더 29개는 정규화 값이라
+    //   숫자만 봐서는 몸이 어떻게 변했는지 알 수 없다 — 이 한 줄이 그 결과를
+    //   화면에 세운다. `refreshPose` 를 안 쓰는 이유는 **옷은 안 움직이기
+    //   때문**이다(셰이퍼는 시뮬을 되돌리지 않는다).
+    void avatarView.refresh('체형');
     log(
       `아바타 체형 — 적용 ${res.applied.length}개`
       + (res.unknown.length > 0 ? ` · ⚠ 모르는 키 ${res.unknown.join(', ')}` : ''),
@@ -526,6 +537,40 @@ async function applyAvatarMeasurements(): Promise<void> {
 /** 표 하나와 글자 한 줄. **상태는 만들지 않는다 — 받은 것만 그린다** */
 function paintMeasure(view: AvatarMeasureView = avatarMeasure.view): void {
   measurePanel.render(view);
+}
+
+// ── 실시간 뷰의 아바타 (AM-1) ───────────────────────────────
+//
+// 여기 있는 것도 배선뿐이다. **언제 다시 받을지는 `panels/avatarView.ts`**
+// (DOM 없음 → Node 테스트가 붙는 자리), **그리는 것은 `viewer3d/avatar.ts`**,
+// 체크박스는 `ui/avatarViewSwitch.ts` 다.
+//
+// ★ **새 갱신 경로를 만들지 않는다.** 몸이 바뀌는 시점은 옷의 포즈가 바뀌는
+//   시점과 같아서(로드 · 체형 · 치수 · 드레이프 · 리셋), 이미 있는
+//   `refreshPose()` 와 `applyAvatarBody()` 자리에 한 줄씩 끼우는 것이 전부다.
+//   유일하게 새로 생긴 것이 **재생 중 폴링**이고, 그것도 rAF 에 `tick` 한 줄이다.
+//
+// `client` 를 어댑터 없이 넘길 수 있는 이유는 `PlaybackPort` 와 같다 —
+// `AvatarViewPort` 가 구조적 타입이라 `GatewayClient` 가 이미 만족하고,
+// `viewer.avatar`(AvatarObject)가 `AvatarViewSink` 를 이미 만족한다.
+const avatarView = new AvatarViewController({
+  port: client,
+  sink: viewer.avatar,
+  hooks: {
+    log,
+    onChange: paintAvatarView,
+    now: () => performance.now(),
+  },
+});
+
+const avatarSwitch = new AvatarViewSwitch({
+  root: ui.view3dOpts,
+  port: avatarView,
+});
+
+/** 체크박스 하나와 글자 한 줄. **상태는 만들지 않는다 — 받은 것만 그린다** */
+function paintAvatarView(view: AvatarViewState = avatarView.view): void {
+  avatarSwitch.render(view);
 }
 
 // ── 옷 사이즈 (L-3b) ────────────────────────────────────────
@@ -729,8 +774,18 @@ paintDraping();
  *   `Reset()` 하므로 사정이 정확히 같다 — 그래서 로그 문구만 갈라 두고 구현은
  *   하나로 둔다(두 벌이 되면 한쪽만 고쳐지는 날이 온다).
  */
-async function refreshPose(cause = '리셋'): Promise<void> {
+async function refreshPose(cause: AvatarCause = '리셋'): Promise<void> {
   if (!currentScene || !client.connected) return;
+  // ★ **몸도 같이 온다** (AM-1). 이 함수를 부르는 세 자리(리셋 · 드레이프 ·
+  //   치수)가 전부 아바타를 움직인다 — 드레이프는 팔이 내려오고(실측: x 범위
+  //   ±61.3 → ±29.9cm), 치수는 정점 28,564개가 100% 이동하고, 리셋은
+  //   애니메이션을 처음으로 되돌린다. 안 받으면 **옷만 새 자세이고 몸은 옛
+  //   자세**라, 화면에서는 좌표계가 틀렸을 때와 구분되지 않는다.
+  //
+  //   옷보다 **먼저** 보낸다. 워커는 stdin 을 순차 처리하므로 순서가 곧 화면에
+  //   반영되는 순서인데, 몸이 뒤면 옷이 새 자세로 튄 다음 몸이 따라오는 것이
+  //   눈에 보인다. `topology` 판단은 컨트롤러가 한다 — 여기서 정하지 않는다.
+  await avatarView.refresh(cause);
   // 칸에 남아 있는 옛 런의 프레임을 먼저 버린다. 안 그러면 방금 받은 리셋
   // 포즈를 다음 rAF 가 드레이프된 프레임으로 덮어쓴다.
   stream.resume();
@@ -755,6 +810,9 @@ async function refreshPose(cause = '리셋'): Promise<void> {
  */
 function clearScene(): void {
   viewer.cloth.clear();
+  // 몸도 씬에 딸려 있다 (AM-1). 옷만 지우면 **몸만 남아 서 있어서** 씬이 아직
+  // 있는 것처럼 보인다 — 가운데 칸에서 커브만 남던 것과 같은 계열의 사고다.
+  avatarView.clear();
   dropSnapshot();
   stream.resume();
   // 도면 좌표는 씬에 딸려 있다. 남겨 두면 다음 씬의 패턴에 옛 배치가 섞인다.
@@ -802,6 +860,10 @@ function paintPlayback(view: PlaybackView = playback.view): void {
   //   재연결 직후처럼 둘이 갈라지면 [적용] 이 켜져 있는데 워커는 "씬이 없다"
   //   로 답하고, 그 왕복은 15초짜리로 오해받는다.
   avatarMeasure.setScene(view.scene !== null);
+  // ★ 몸도 같은 사실을 쓴다 (AM-1). `currentScene` 이 아니라 `view.scene` 이라야
+  //   한다 — 재연결 직후처럼 둘이 갈라지면 448KB~1.9MB 짜리 왕복이 "씬이 없다"
+  //   로 실패하고, 그 실패가 화면에 빨간 글자로 남는다(고장이 아닌데).
+  avatarView.setScene(view.scene !== null);
   // ★ 재생 중에는 파라미터 [적용] 을 잠근다. **위젯은 열어 둔다** — 값을 미리
   //   맞춰 두고 정지한 뒤 한 번에 보낼 수 있다. 잠그는 이유는 시뮬이 도는
   //   도중의 변경이 어떻게 반영되는지 **측정한 적이 없어서**다. 한 런의
@@ -877,6 +939,13 @@ viewer.onBeforeRender(() => {
   //   `apply` 는 t=0 이면 아무 일도 하지 않으므로 2D 를 안 쓰는 동안의 비용이 0 이다.
   if (out.status === 'applied') unfolder.sync(viewer.cloth.patterns);
   unfolder.apply(viewer.cloth.patterns, unfoldControl.effectiveT);
+  // ★ 재생 중 몸 갱신 (AM-1). **여기서 조건을 보지 않는다** — 폴링 간격도,
+  //   애니메이션이 끝났는지도, 왕복이 겹치는지도 전부 컨트롤러가 판단한다.
+  //   그 판단이 이 파일로 새는 순간 Node 테스트가 원리적으로 못 붙는다
+  //   (ISSUE-009 가 그 반대편에서 났다). 여기 있는 것은 "지금 재생 중인가"
+  //   라는 사실 하나를 넘기는 것뿐이고, 대부분의 프레임에서 불리언 비교
+  //   몇 개로 끝난다.
+  avatarView.tick(playback.playing);
   // 화면에 숫자를 찍는 것은 초당 4회면 충분하다. 매 rAF 로 textContent 를
   // 건드리면 60/s 로 레이아웃을 흔들면서, 정작 읽을 수는 없다.
   const now = performance.now();
@@ -1134,6 +1203,18 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
     // 메시가 아니라 디자인 계층에 있고, 실패해도 도면 자체는 서야 하므로
     // 로드의 성패에 묶지 않는다.
     void refreshDesign2d();
+    // ★ 실시간 뷰의 몸 (AM-1). **로드의 성패에 묶지 않는다** — 1.9MB 라
+    //   눈에 띄게 걸리고, 몸이 없어도 옷은 서야 한다(디자인 정보와 같은 판단).
+    //   `playback.sceneLoaded` 가 방금 지났으므로 컨트롤러는 씬을 알고 있다.
+    //
+    //   ⓘ 카메라를 **몸이 도착한 뒤에 한 번 더** 맞춘다. 위 `showScene` 의
+    //     `frameCamera` 는 옷(약 100cm)만 보고 잡은 것이라, 그대로 두면
+    //     177cm 짜리 몸의 머리가 화면 밖으로 나간다. 사용자가 시점을 잡아 둔
+    //     경우(재연결 재로드, `refit:false`)에는 빼앗지 않는다.
+    const refit = opts.refit !== false;
+    void avatarView.refresh('로드').then((r) => {
+      if (r.installedTopology && refit) viewer.frameCamera();
+    });
     // 오른쪽 칸 (L-3a). 아바타는 씬에 딸려 있으므로 씬이 바뀌면 반드시 다시
     // 읽는다 — 안 읽으면 옛 씬의 체형이 새 아바타의 값인 척한다.
     void refreshAvatarBody();
@@ -1373,6 +1454,26 @@ declare global {
      * UI 를 의심할 자리가 아니다.
      */
     avatarMeasure: AvatarMeasureController;
+    /**
+     * AM-1 의 진단 표면 — 실시간 뷰의 몸.
+     *
+     * `avatarView.view.text` 가 화면이 말하고 있어야 하는 글자다. 몸이 안
+     * 보일 때 여기서 세 가지가 갈린다: `view.visible` 이 false 면 **사용자가
+     * 꺼 둔 것**, `view.phase` 가 'noAvatar' 면 **씬에 아바타가 없는 것**,
+     * 'error' 면 `stats.lastError` 가 이유다. 셋 다 화면상 똑같이 보인다.
+     *
+     * ★ `stats.resyncs` 가 0 이 아니면 **`topology:false` 로 받은 몸의 모양이
+     *   달라진 적이 있다**는 뜻이다 — AM-1 의 실측("드레이프 뒤에도 uuid·파트·
+     *   정점 수는 그대로")이 이 씬에서는 성립하지 않는다는 증거이고, 그
+     *   사실만으로 프로토콜 쪽을 볼 이유가 생긴다.
+     * `stats.polls` 는 재생 중 폴링 횟수다. 애니메이션이 끝났는데도 계속
+     * 오르면 `frameInfo` 판정(`isAnimationFinished`)이 안 먹고 있는 것이다.
+     *
+     * `cobalt.viewer.avatar.boundingBox()` 가 몸이 선 자리이고, 옷의
+     * `cobalt.viewer.cloth.boundingBox()` 와 **같은 공간에 있어야 한다** —
+     * 어긋나면 몸에서 옷이 떨어져 보인다(ISSUE-011 의 증상).
+     */
+    avatarView: AvatarViewController;
     viewer2d: Viewer2D;
     unfolder2d: Unfolder;
     stream: FrameStream;
@@ -1410,6 +1511,7 @@ globalThis.cobalt = {
   surfaceSize,
   draping,
   avatarMeasure,
+  avatarView,
   viewer2d,
   unfolder2d,
   stream,

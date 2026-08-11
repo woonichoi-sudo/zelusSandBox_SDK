@@ -21,11 +21,17 @@ export {
 
 export {
   base64ToBytes,
+  decodeAvatar,
+  decodeAvatarPart,
+  decodeAvatars,
   decodeFloat32,
   decodeInt32,
   decodePattern,
   decodePatterns,
+  isAnimationFinished,
   meshStats,
+  type DecodedAvatar,
+  type DecodedAvatarPart,
   type DecodedPattern,
 } from './decode.ts';
 
@@ -66,6 +72,11 @@ export type {
   AvatarBodyResult,
   AvatarMeasurement,
   SetAvatarBodyResult,
+  // 아바타 메시 (AM-1). ★ 정점이 **월드 cm** 다 — 옷과 달리 변환을 곱하면 안 된다
+  AvatarMesh,
+  AvatarMeshResult,
+  AvatarPart,
+  AvatarPartMaterial,
   // 치수로 몸 만들기 · 드레이프 (W-1)
   AvatarMeasurementTargets,
   SetAvatarMeasurementsResult,

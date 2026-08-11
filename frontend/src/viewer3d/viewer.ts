@@ -23,6 +23,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 
 import type { DraftingBounds } from '../viewer2d/index.ts';
+import { AvatarObject } from './avatar.ts';
 import { ClothObject } from './cloth.ts';
 import { SnapshotObject } from './snapshotView.ts';
 
@@ -55,6 +56,18 @@ export type ViewMode = 'live' | 'snapshot';
 
 export class Viewer3D {
   readonly cloth = new ClothObject();
+
+  /**
+   * 실시간 뷰의 **몸** (AM-1).
+   *
+   * `cloth` 와 **같은 좌표계에 선다** — 아바타 정점은 월드 cm 이고 옷은
+   * `transform` 을 `Mesh` 에 걸어 월드로 온다(ISSUE-011). 둘이 같은 자리에
+   * 서는지가 이 단위의 눈 판정 기준이다: 어긋나면 몸에서 옷이 떨어져 보인다.
+   *
+   * 스냅샷 모드에서는 자동으로 내려간다 — 그쪽 glTF 에 아바타가 이미 들어
+   * 있어서 켜 두면 몸이 두 벌 겹친다 (`setMode` 참고).
+   */
+  readonly avatar = new AvatarObject();
 
   /**
    * 익스포트한 glTF 가 서는 자리 (#: 아바타 + 진짜 색).
@@ -154,6 +167,9 @@ export class Viewer3D {
     this.#scene.add(this.#grid);
 
     this.#scene.add(this.cloth.group);
+    // 몸은 옷과 **같은 씬·같은 좌표계**다 (AM-1). 그룹을 따로 두는 것은
+    // 가시성과 수명을 따로 다루기 위해서지 자리가 달라서가 아니다.
+    this.#scene.add(this.avatar.group);
     this.#scene.add(this.snapshot.group);
     // 두 그룹의 visible 을 처음부터 한 곳에서 정한다. 생성자에서 이걸 빼면
     // "아직 setMode 를 안 불렀을 때" 라는 정의되지 않은 상태가 생긴다.
@@ -193,6 +209,11 @@ export class Viewer3D {
     this.#mode = mode;
     const live = mode === 'live';
     this.cloth.group.visible = live;
+    // ★ 몸도 같은 한 값에서 파생된다 (AM-1). **스냅샷에는 아바타가 이미 들어
+    //   있어서**, 여기서 안 내리면 같은 몸이 두 벌 겹쳐 서고 두께 0 인 껍질끼리
+    //   깊이가 같아 얼룩진다. 사용자 스위치(`avatar.setVisible`)와 곱해지는
+    //   자리는 `AvatarObject` 안이다 — 두 값을 여기서 각각 쓰면 갈라진다.
+    this.avatar.setModeLive(live);
     this.snapshot.group.visible = !live;
   }
 
@@ -260,7 +281,7 @@ export class Viewer3D {
   frameCamera(padding = 1.35): void {
     // 지금 보이는 쪽에 맞춘다. 스냅샷은 아바타까지 들어 있어 경계가 옷보다
     // 훨씬 크므로(약 170cm), 옷 기준으로 잡으면 머리가 화면 밖으로 나간다.
-    const box = this.#mode === 'snapshot' ? this.snapshot.boundingBox() : this.cloth.boundingBox();
+    const box = this.#mode === 'snapshot' ? this.snapshot.boundingBox() : this.#liveBox();
     if (box.isEmpty()) return;
 
     const size = box.getSize(new THREE.Vector3());
@@ -295,6 +316,22 @@ export class Viewer3D {
     // 여기뿐이라, 다른 데서 기억하면 두 값이 갈라진다.
     this.#gridHome = this.#grid.position.clone();
     this.#grid3dScale = this.#grid.scale.x;
+  }
+
+  /**
+   * 실시간 뷰가 실제로 담아야 하는 것 — **옷 ∪ (보이는) 몸** (AM-1).
+   *
+   * 몸이 서기 전에는 옷만이라 이 함수가 없던 때와 결과가 같다. 몸이 서면
+   * 경계가 100cm → 177cm 로 자라는데, 옷 기준으로 잡아 두면 **머리가 화면
+   * 밖으로 나간다**(스냅샷이 옷 상자를 안 쓰는 것과 정확히 같은 이유다).
+   *
+   * 꺼 놓은 몸은 세지 않는다 — 안 보이는 것에 화각을 뺏기면 옷이 작아진다.
+   */
+  #liveBox(): THREE.Box3 {
+    const box = this.cloth.boundingBox();
+    if (!this.avatar.shown) return box;
+    const body = this.avatar.boundingBox();
+    return body.isEmpty() ? box : box.union(body);
   }
 
   /**
@@ -606,6 +643,7 @@ export class Viewer3D {
     this.#resizeObserver.disconnect();
     this.#controls.dispose();
     this.cloth.clear();
+    this.avatar.clear();
     this.snapshot.clear();
     this.#grid.geometry.dispose();
     (this.#grid.material as THREE.Material).dispose();
