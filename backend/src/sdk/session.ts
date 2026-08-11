@@ -13,6 +13,8 @@ import {
   type MeshDataResult,
   type MeshInfoResult,
   type PatternData,
+  type AvatarBodyResult,
+  type SetAvatarBodyResult,
   type SetParamsResult,
   type SimulationParams,
   type StatusResult,
@@ -214,6 +216,26 @@ export class Session extends EventEmitter {
 
   setParams(params: Partial<SimulationParams>): Promise<SetParamsResult> {
     return this.#call('setParams', { params });
+  }
+
+  /**
+   * 아바타 체형과 치수를 읽는다 (L-3a).
+   *
+   * ⚠️ 돌아오는 `measurements[].real` 은 **로드 시점 값이고 체형을 바꿔도
+   *    갱신되지 않는다** (`AvatarBodyResult` 주석 참고).
+   */
+  avatarBody(): Promise<AvatarBodyResult> {
+    return this.#call('avatarBody');
+  }
+
+  /**
+   * 체형을 쓴다. 키는 `avatarBody()` 가 준 `bodyParams` 의 이름이고 값은 0~1 이다.
+   *
+   * 돌려주는 `avatar` 는 **쓰고 나서 다시 읽은 값**이다 — 요청값의 메아리가
+   * 아니므로, 반영 여부를 이 응답만으로 판정할 수 있다.
+   */
+  setAvatarBody(bodyParams: Record<string, number>): Promise<SetAvatarBodyResult> {
+    return this.#call('setAvatarBody', { bodyParams });
   }
 
   meshInfo(): Promise<MeshInfoResult> {

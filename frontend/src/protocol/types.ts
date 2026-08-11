@@ -27,6 +27,11 @@ import type {
 } from '../../../backend/src/sdk/protocol.ts';
 
 export type {
+  // 아바타 체형 (L-3a). ⚠️ `AvatarMeasurement.real` 은 로드 시점 값이고
+  // 체형을 바꿔도 갱신되지 않는다 — 원본 주석 참고.
+  AvatarBodyResult,
+  AvatarMeasurement,
+  SetAvatarBodyResult,
   ErrResponse,
   MeshDataResult,
   MeshInfoResult,

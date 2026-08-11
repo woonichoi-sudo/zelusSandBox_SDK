@@ -42,6 +42,8 @@ import {
   type MeshInfoResult,
   type ServerEvent,
   type ServerMessage,
+  type AvatarBodyResult,
+  type SetAvatarBodyResult,
   type SetParamsResult,
   type SimulationParams,
   type StatusResult,
@@ -495,6 +497,26 @@ export class GatewayClient {
   /** 모르는 키는 막지 않는다 — 서버가 `unknown[]` 으로 되돌려준다 */
   setParams(params: Partial<SimulationParams> & Record<string, number | boolean>): Promise<SetParamsResult> {
     return this.request<SetParamsResult>('setParams', { params });
+  }
+
+  /**
+   * 아바타 체형과 치수를 읽는다 (L-3a).
+   *
+   * ⚠️ `measurements[].real` 은 **로드 시점 값이고 체형을 바꿔도 갱신되지
+   *    않는다.** 화면이 이 값을 "지금 치수" 로 보여주면 거짓말이 된다.
+   */
+  avatarBody(): Promise<AvatarBodyResult> {
+    return this.request<AvatarBodyResult>('avatarBody');
+  }
+
+  /**
+   * 체형을 쓴다. 키는 `avatarBody()` 가 준 이름, 값은 정규화 0~1 이다.
+   *
+   * 돌려주는 `avatar` 는 **쓰고 나서 다시 읽은 값**이므로, 반영 여부를 이
+   * 응답만으로 판정할 수 있다(요청값의 메아리가 아니다).
+   */
+  setAvatarBody(bodyParams: Record<string, number>): Promise<SetAvatarBodyResult> {
+    return this.request<SetAvatarBodyResult>('setAvatarBody', { bodyParams });
   }
 
   meshInfo(): Promise<MeshInfoResult> {

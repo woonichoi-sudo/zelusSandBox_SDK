@@ -260,6 +260,34 @@ const buildSetParams: Build = (msg) => {
 };
 
 /**
+ * setAvatarBody: 체형 값은 **숫자만** 받는다 (L-3a).
+ *
+ * `buildSetParams` 와 갈리는 점 하나 — 여기에는 불린이 없다.
+ * `ztAvatarBodyParam` 29개가 전부 float 이라, 불린을 통과시키면 워커에서
+ * `is_number()` 에 걸려 조용히 `unknown` 으로 돌아간다. 그러면 사용자는
+ * "적용이 안 됐다" 만 보고 왜인지는 못 본다 — 여기서 거절해야 이유가 남는다.
+ *
+ * 범위(0~1)는 **검사하지 않는다.** 정규화라는 것은 실측이지 계약이 아니고,
+ * 여기서 클램프하면 엔진이 범위 밖 값을 실제로 어떻게 다루는지가 우리 코드에
+ * 가려진다. 같은 이유로 `setParams` 도 범위를 엔진에 맡긴다.
+ */
+const buildSetAvatarBody: Build = (msg) => {
+  const bodyParams = msg['bodyParams'];
+  if (!isRecord(bodyParams) || Array.isArray(bodyParams)) {
+    reject('bodyParams 필드가 필요합니다 (객체)');
+  }
+
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(bodyParams)) {
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      reject(`bodyParams.${k}는 숫자여야 합니다 (받은 값: ${describe(v)})`);
+    }
+    out[k] = v;
+  }
+  return { payload: { bodyParams: out } };
+};
+
+/**
  * export: 클라이언트는 **형식만** 준다. 산출물 위치는 서버가 정한다 (#10).
  *
  *   { id, op: 'export' }                    → gltf
@@ -403,6 +431,17 @@ const OPS: Record<Op, OpRule> = {
 
   // 타입만 거른다. 범위는 엔진의 몫 — 아래 buildSetParams 참고
   setParams: { allow: true, build: buildSetParams },
+
+  // ── 아바타 체형 (L-3a) ────────────────────────────────────
+  //
+  // 읽기는 무해하다 — 값 54개(체형 29 + 치수 25)를 돌려줄 뿐이고 씬을 안 바꾼다.
+  avatarBody: { allow: true },
+
+  // 쓰기. 타입만 거르고 **범위는 엔진에 맡긴다** — setParams 와 같은 판단이다.
+  // 정규화 0~1 이라는 것은 실측이지 계약이 아니고, 여기서 클램프하면 엔진이
+  // 실제로 어떻게 처리하는지가 우리 코드에 가려진다. 모르는 키는 워커가
+  // unknown 으로 되돌려 준다(ISSUE-014 를 되풀이하지 않는 자리다).
+  setAvatarBody: { allow: true, build: buildSetAvatarBody },
 
   meshInfo: { allow: true },
 

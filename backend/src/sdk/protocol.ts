@@ -22,6 +22,8 @@ export type Request =
   | { id: number; op: 'status' }
   | { id: number; op: 'getParams' }
   | { id: number; op: 'setParams'; params: Partial<SimulationParams> }
+  | { id: number; op: 'avatarBody' }
+  | { id: number; op: 'setAvatarBody'; bodyParams: Record<string, number> }
   | { id: number; op: 'meshInfo' }
   | { id: number; op: 'meshData'; topology?: boolean }
   | { id: number; op: 'export'; path: string; format?: 'gltf' | 'zbin' }
@@ -279,6 +281,56 @@ export interface SetParamsResult {
   applied: string[];
   /** 서버가 모르는 키. 오타를 조용히 삼키지 않기 위해 되돌려준다 */
   unknown: string[];
+}
+
+// ── 아바타 체형 (L-3a) ──────────────────────────────────────
+//
+// 데스크톱 앱에 이 UI가 없다. 엔진에는 완비돼 있고 노출만 안 돼 있었다.
+// 워커는 `ztSceneQueryInterface` 로 데이터를 왕복시킨다
+// (`GetAvatarData` → 수정 → `UpdateAvatar`). 실측으로 그 왕복이 지오메트리까지
+// 바꾼다는 것을 확인했다 — 같은 씬에서 height 0.5/0.8 의 glTF 해시가 다르다.
+
+/**
+ * 치수 한 항목. **cm 다.**
+ *
+ * ⚠️ `real` 은 **로드 시점의 값이고 체형을 바꿔도 갱신되지 않는다.** 워커가
+ *    수정본을 만들 때 이 필드를 그대로 복사해 넘기고, 엔진이 되써주지 않기
+ *    때문이다(실측). 화면이 이 값을 "지금 치수" 로 보여주면 거짓말이 된다 —
+ *    체형을 만진 뒤에는 씬을 다시 로드해야 맞는 값이 나온다.
+ */
+export interface AvatarMeasurement {
+  /** 엔진이 계산해 둔 실측치. 위 경고 참고 */
+  real: number;
+  /** 목표 치수. 지정된 적이 없으면 없다 (엔진의 FLT_MIN 을 워커가 걸러낸다) */
+  expected?: number;
+  locked: boolean;
+}
+
+export interface AvatarBodyResult {
+  /** 씬에 아바타가 없으면 false 이고 나머지 필드가 없다 */
+  hasAvatar: boolean;
+  uuid?: string;
+  /**
+   * 체형 29개. 키는 엔진이 정한 이름(`ztAvatarBodyParamUtils::GetParamName`)이고
+   * 값은 **정규화된 0~1** 이다(실측: 사용자 씬이 전부 0.5). cm 가 아니다 —
+   * cm 단위의 몸을 보려면 `measurements` 쪽이다.
+   */
+  bodyParams?: Record<string, number>;
+  /** 치수 25개. 키는 `ztAvatarMeasureUtils::GetMeasurePartName` */
+  measurements?: Record<string, AvatarMeasurement>;
+}
+
+export interface SetAvatarBodyResult {
+  applied: string[];
+  /** 모르는 키. `setParams` 와 같은 규약이다 (ISSUE-014 를 되풀이하지 않는다) */
+  unknown: string[];
+  /**
+   * **쓰고 나서 다시 읽은 값이다 — 요청값의 메아리가 아니다.**
+   *
+   * 이 구분이 이 op 의 설계 근거다. 메아리치면 엔진이 아무 일도 안 했을
+   * 때조차 성공으로 보인다.
+   */
+  avatar: AvatarBodyResult;
 }
 
 /**

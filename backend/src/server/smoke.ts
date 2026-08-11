@@ -2608,7 +2608,7 @@ async function main(): Promise<void> {
 
   // ── 7-9. 화이트리스트 전수 ────────────────────────────
   // OPS 테이블은 **데이터**다. 한 줄이 틀리면 문이 조용히 열리거나 기능이
-  // 조용히 사라지는데, 어느 쪽도 다른 테스트가 잡지 못한다. 그래서 18개를
+  // 조용히 사라지는데, 어느 쪽도 다른 테스트가 잡지 못한다. 그래서 20개를
   // 전부 통과시켜 본다 — 실제 워커로 하면 18번의 왕복이지만, 가짜 릴레이는
   // "워커에 닿았는가"까지 함께 볼 수 있어 오히려 판정이 강하다:
   // 차단된 op은 ok:false인 것으로 부족하고 **워커에 닿지 않아야** 한다.
@@ -2640,12 +2640,18 @@ async function main(): Promise<void> {
         ['ping', true], ['version', true], ['init', true], ['load', true],
         ['clear', true], ['start', true], ['pause', true], ['reset', true],
         ['step', true], ['status', true], ['getParams', true], ['setParams', true],
+        // 아바타 체형 (L-3a). 읽기는 무해하고, 쓰기는 buildSetAvatarBody 가
+        // 타입만 거른 뒤 워커에 닿는다.
+        ['avatarBody', true], ['setAvatarBody', true],
         ['meshInfo', true], ['meshData', true], ['subscribe', true], ['unsubscribe', true],
         ['export', true], ['quit', false],
       ];
       const extra: Record<string, Record<string, unknown>> = {
         load: { scene: sceneId },
         setParams: { params: { timeStep: 0.01 } },
+        // build 가 bodyParams 를 요구한다. 없으면 차단이 아니라 **거절**로
+        // 떨어져서 "화이트리스트가 막았다"와 구분되지 않는다.
+        setAvatarBody: { bodyParams: { height: 0.5 } },
       };
 
       let id = 100;
@@ -2661,9 +2667,9 @@ async function main(): Promise<void> {
         );
       }
 
-      check('표가 프로토콜 op 18개를 전부 덮는다', TABLE.length === 18, `${TABLE.length}개`);
+      check('표가 프로토콜 op 20개를 전부 덮는다', TABLE.length === 20, `${TABLE.length}개`);
       check(
-        'allowedOps()가 허용 17개와 정확히 일치 (거부 문구에 실리는 목록)',
+        'allowedOps()가 허용 19개와 정확히 일치 (거부 문구에 실리는 목록)',
         allowedOps().slice().sort().join(',')
           === TABLE.filter(([, a]) => a).map(([o]) => o).sort().join(','),
         allowedOps().join(','),
