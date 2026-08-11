@@ -62,6 +62,10 @@ export type {
   ServerEvent,
   ServerMessage,
   ServerResponse,
+  // 아바타 체형 (L-3a)
+  AvatarBodyResult,
+  AvatarMeasurement,
+  SetAvatarBodyResult,
   SetParamsResult,
   SimulationParams,
   StatusResult,

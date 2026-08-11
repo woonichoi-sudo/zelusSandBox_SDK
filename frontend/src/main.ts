@@ -40,6 +40,7 @@
  */
 
 import {
+  AvatarBodyPanel,
   PlaybackController,
   shortcutFor,
   SHORTCUT_HINT,
@@ -55,7 +56,7 @@ import {
   uploadScene,
   type SceneSummary,
 } from './protocol/index.ts';
-import { ParamsPanel } from './ui/index.ts';
+import { AvatarPanel, ParamsPanel } from './ui/index.ts';
 import { Unfolder, UnfoldController, Viewer2D } from './viewer2d/index.ts';
 import {
   FrameStream,
@@ -104,6 +105,8 @@ const ui = {
   paramsWrap: el<HTMLDetailsElement>('paramsWrap'),
   params: el<HTMLElement>('params'),
   paramsBadge: el<HTMLElement>('paramsBadge'),
+  // 아바타 체형 패널이 그려질 오른쪽 칸 (L-3a)
+  avatarPanel: el<HTMLElement>('avatarPanel'),
   // 2D 펼침 (#15-b). 슬라이더 하나와 글자 두 자리 — 판단은 `viewer2d/` 다.
   unfold: el<HTMLInputElement>('unfold'),
   unfoldStat: el<HTMLElement>('unfoldStat'),
@@ -341,6 +344,74 @@ ui.paramsWrap.addEventListener('toggle', () => {
   if (ui.paramsWrap.open && params.stale) void params.refresh();
 });
 
+// ── 아바타 체형 (L-3a) ──────────────────────────────────────
+//
+// #16 이 세운 3층을 그대로 따른다: 판단은 `panels/avatarBody.ts`(DOM 없음),
+// 그리는 것은 `ui/avatarPanel.ts`, 배선은 여기.
+//
+// `ParamsPanel` 과 달리 이 패널은 **접히지 않는다** — 오른쪽 칸이 자기 자리라
+// 항상 보인다. 그래서 `markStale`/`toggle` 같은 지연 갱신 장치가 없고, 씬이
+// 바뀔 때 그냥 읽는다. 왕복 하나(값 54개)라 비용이 작다.
+const avatarBody = new AvatarBodyPanel();
+
+const avatarPanel = new AvatarPanel({
+  root: ui.avatarPanel,
+  panel: avatarBody,
+  onEdit: (key, value) => {
+    avatarBody.edit(key, value);
+    avatarPanel.render();
+  },
+  onApply: () => void applyAvatarBody(),
+  onRevert: () => {
+    avatarBody.revert();
+    avatarPanel.render();
+  },
+});
+
+/** 워커의 체형을 다시 읽어 화면에 붓는다. 씬이 없으면 비운다 */
+async function refreshAvatarBody(): Promise<void> {
+  if (!currentScene || !client.connected) {
+    avatarBody.clear();
+    avatarPanel.render();
+    return;
+  }
+  try {
+    avatarBody.setFromWorker(await client.avatarBody());
+  } catch (err: unknown) {
+    // 못 읽었으면 **옛 값을 남기지 않는다.** 남기면 화면이 지금 아바타와
+    // 무관한 숫자를 "현재 체형" 이라고 말한다.
+    avatarBody.clear();
+    log(`아바타 체형을 읽지 못했습니다: ${message(err)}`);
+  }
+  avatarPanel.render();
+}
+
+/**
+ * 바뀐 값만 보낸다.
+ *
+ * ★ 응답의 `avatar` 는 **워커가 되읽은 값**이다(요청값의 메아리가 아니다).
+ *   그대로 화면에 부으면, 엔진이 값을 클램프했거나 아무 일도 안 했을 때 그
+ *   사실이 화면에 그대로 드러난다.
+ */
+async function applyAvatarBody(): Promise<void> {
+  const payload = avatarBody.payload();
+  if (Object.keys(payload).length === 0) return;
+  try {
+    const res = await client.setAvatarBody(payload);
+    avatarBody.applied(res.avatar);
+    log(
+      `아바타 체형 — 적용 ${res.applied.length}개`
+      + (res.unknown.length > 0 ? ` · ⚠ 모르는 키 ${res.unknown.join(', ')}` : ''),
+    );
+    if (res.unknown.length > 0) {
+      status(`워커가 모르는 체형 키가 있습니다: ${res.unknown.join(', ')}`, true);
+    }
+  } catch (err: unknown) {
+    status(`아바타 체형 적용 실패: ${message(err)}`, true);
+  }
+  avatarPanel.render();
+}
+
 // ── 재생 컨트롤 (#14) ───────────────────────────────────────
 //
 // 상태와 전이는 `panels/playback.ts` 가 전부 정한다. 여기 있는 것은 (a) 포트로
@@ -413,6 +484,9 @@ function clearScene(): void {
   unfolder2d.clear();
   paintDraft2d();
   currentScene = null;
+  // 아바타도 씬에 딸려 있다. `currentScene = null` 뒤에 불러야
+  // `refreshAvatarBody` 가 "씬 없음" 갈래로 간다.
+  void refreshAvatarBody();
   ui.stat.textContent = '-';
   ui.frames.textContent = '-';
   // 파라미터는 씬에 딸려 있다. 씬이 내려갔으면 화면의 값은 더 이상 아무것도
@@ -754,6 +828,9 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
     unfolder2d.build(viewer2d.cloth.patterns);
     unfolder2d.apply(viewer2d.cloth.patterns, 1);
     paintDraft2d();
+    // 오른쪽 칸 (L-3a). 아바타는 씬에 딸려 있으므로 씬이 바뀌면 반드시 다시
+    // 읽는다 — 안 읽으면 옛 씬의 체형이 새 아바타의 값인 척한다.
+    void refreshAvatarBody();
     const u = unfolder.stats;
     log(
       `2D 도면 — 패턴 ${u.placed}/${u.patterns} 배치됨`

@@ -18,3 +18,8 @@ export {
   type ParamsPhase,
   type ParamsPort,
 } from './paramsPanel.ts';
+
+export {
+  AvatarPanel,
+  type AvatarPanelOptions,
+} from './avatarPanel.ts';

@@ -67,3 +67,12 @@ export {
   type ShortcutAction,
   type TargetLike,
 } from './shortcuts.ts';
+
+export {
+  AvatarBodyPanel,
+  type AvatarBodyView,
+  type AvatarField,
+  type AvatarGroup,
+  type AvatarMeasureRow,
+  type AvatarPhase,
+} from './avatarBody.ts';
