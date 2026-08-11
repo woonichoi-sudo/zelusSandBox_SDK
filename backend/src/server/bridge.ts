@@ -288,6 +288,38 @@ const buildSetAvatarBody: Build = (msg) => {
 };
 
 /**
+ * setSurfaceSize: uuid 는 필수, 크기는 **둘 중 하나만 있어도 된다** (L-3b).
+ *
+ * 둘 다 요구하지 않는 이유는 워커 쪽과 같다 — 화면이 항상 두 값을 들고 있어야
+ * 하면, 폭만 고치려던 사용자가 높이를 낡은 값으로 덮어쓴다.
+ *
+ * ⚠️ **둘 다 없으면 거절한다.** 통과시키면 워커가 "지금 값으로 다시 쓰기" 를
+ *    하고 성공을 돌려주는데, 아무것도 안 바뀐 성공은 화면에서 "바꿨다" 로
+ *    읽힌다. 크기 없이 부르는 것은 실수이므로 여기서 이유를 남긴다.
+ */
+const buildSetSurfaceSize: Build = (msg) => {
+  const uuid = msg['uuid'];
+  if (typeof uuid !== 'string' || uuid === '') {
+    reject('uuid 필드가 필요합니다 (문자열)');
+  }
+
+  const out: Record<string, string | number> = { uuid };
+  for (const k of ['width', 'height'] as const) {
+    const v = msg[k];
+    if (v === undefined) continue;
+    if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) {
+      reject(`${k}는 0보다 큰 숫자여야 합니다 (받은 값: ${describe(v)})`);
+    }
+    out[k] = v;
+  }
+
+  if (out['width'] === undefined && out['height'] === undefined) {
+    reject('width 나 height 중 하나는 있어야 합니다');
+  }
+  return { payload: out };
+};
+
+/**
  * export: 클라이언트는 **형식만** 준다. 산출물 위치는 서버가 정한다 (#10).
  *
  *   { id, op: 'export' }                    → gltf
@@ -442,6 +474,16 @@ const OPS: Record<Op, OpRule> = {
   // 실제로 어떻게 처리하는지가 우리 코드에 가려진다. 모르는 키는 워커가
   // unknown 으로 되돌려 준다(ISSUE-014 를 되풀이하지 않는 자리다).
   setAvatarBody: { allow: true, build: buildSetAvatarBody },
+
+  // ── 옷 사이즈 (L-3b) ──────────────────────────────────────
+  //
+  // 읽기는 무해하다 — 서피스 24개의 이름과 크기를 돌려줄 뿐이다.
+  surfaces: { allow: true },
+
+  // 쓰기. uuid 는 **워커가 검증한다** — 없는 uuid 면 에러로 되돌린다. 여기서
+  // 미리 목록을 들고 있으려면 게이트웨이가 씬 상태를 따라다녀야 하는데,
+  // 그건 세션이 이미 하는 일을 두 번 하는 것이고 갈라지면 더 나쁘다.
+  setSurfaceSize: { allow: true, build: buildSetSurfaceSize },
 
   meshInfo: { allow: true },
 

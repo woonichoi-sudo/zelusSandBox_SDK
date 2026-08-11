@@ -15,6 +15,7 @@ import {
   type PatternData,
   type AvatarBodyResult,
   type SetAvatarBodyResult,
+  type SurfacesResult,
   type SetParamsResult,
   type SimulationParams,
   type StatusResult,
@@ -236,6 +237,22 @@ export class Session extends EventEmitter {
    */
   setAvatarBody(bodyParams: Record<string, number>): Promise<SetAvatarBodyResult> {
     return this.#call('setAvatarBody', { bodyParams });
+  }
+
+  /** 서피스(패턴) 목록과 크기를 읽는다. **cm 다** (L-3b) */
+  surfaces(): Promise<SurfacesResult> {
+    return this.#call('surfaces');
+  }
+
+  /**
+   * 서피스 하나의 크기를 바꾼다. **폭·높이 중 하나만 줘도 된다** — 안 준 쪽은
+   * 지금 값을 그대로 쓴다.
+   *
+   * 돌려주는 것은 **바꾼 뒤의 전체 목록**이다. 엔진이 크기를 조정했으면 그
+   * 사실이 응답에 그대로 드러난다(실측: 폭을 +30% 하면 높이가 0.03% 흔들린다).
+   */
+  setSurfaceSize(uuid: string, size: { width?: number; height?: number }): Promise<SurfacesResult> {
+    return this.#call('setSurfaceSize', { uuid, ...size });
   }
 
   meshInfo(): Promise<MeshInfoResult> {

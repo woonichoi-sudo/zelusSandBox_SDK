@@ -76,3 +76,11 @@ export {
   type AvatarMeasureRow,
   type AvatarPhase,
 } from './avatarBody.ts';
+
+export {
+  SurfaceSizePanel,
+  validateSize,
+  type SurfacePhase,
+  type SurfaceRow,
+  type SurfaceSizeView,
+} from './surfaceSize.ts';

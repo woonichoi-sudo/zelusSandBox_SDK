@@ -44,6 +44,7 @@ import {
   type ServerMessage,
   type AvatarBodyResult,
   type SetAvatarBodyResult,
+  type SurfacesResult,
   type SetParamsResult,
   type SimulationParams,
   type StatusResult,
@@ -517,6 +518,21 @@ export class GatewayClient {
    */
   setAvatarBody(bodyParams: Record<string, number>): Promise<SetAvatarBodyResult> {
     return this.request<SetAvatarBodyResult>('setAvatarBody', { bodyParams });
+  }
+
+  /** 서피스(패턴) 목록과 크기. **cm 다** (L-3b) */
+  surfaces(): Promise<SurfacesResult> {
+    return this.request<SurfacesResult>('surfaces');
+  }
+
+  /**
+   * 서피스 하나의 크기를 바꾼다. 폭·높이 중 **하나만 줘도 된다.**
+   *
+   * 돌려주는 것은 **바꾼 뒤의 전체 목록**이라, 엔진이 값을 조정했으면 그
+   * 사실이 응답에 그대로 드러난다.
+   */
+  setSurfaceSize(uuid: string, size: { width?: number; height?: number }): Promise<SurfacesResult> {
+    return this.request<SurfacesResult>('setSurfaceSize', { uuid, ...size });
   }
 
   meshInfo(): Promise<MeshInfoResult> {

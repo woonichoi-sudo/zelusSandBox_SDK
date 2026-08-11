@@ -23,3 +23,8 @@ export {
   AvatarPanel,
   type AvatarPanelOptions,
 } from './avatarPanel.ts';
+
+export {
+  SurfacePanel,
+  type SurfacePanelOptions,
+} from './surfacePanel.ts';

@@ -41,6 +41,7 @@
 
 import {
   AvatarBodyPanel,
+  SurfaceSizePanel,
   PlaybackController,
   shortcutFor,
   SHORTCUT_HINT,
@@ -56,7 +57,7 @@ import {
   uploadScene,
   type SceneSummary,
 } from './protocol/index.ts';
-import { AvatarPanel, ParamsPanel } from './ui/index.ts';
+import { AvatarPanel, ParamsPanel, SurfacePanel } from './ui/index.ts';
 import { Unfolder, UnfoldController, Viewer2D } from './viewer2d/index.ts';
 import {
   FrameStream,
@@ -107,6 +108,8 @@ const ui = {
   paramsBadge: el<HTMLElement>('paramsBadge'),
   // 아바타 체형 패널이 그려질 오른쪽 칸 (L-3a)
   avatarPanel: el<HTMLElement>('avatarPanel'),
+  // 옷 사이즈 패널 (L-3b). 같은 칸의 체형 아래에 이어 붙는다
+  surfacePanel: el<HTMLElement>('surfacePanel'),
   // 2D 펼침 (#15-b). 슬라이더 하나와 글자 두 자리 — 판단은 `viewer2d/` 다.
   unfold: el<HTMLInputElement>('unfold'),
   unfoldStat: el<HTMLElement>('unfoldStat'),
@@ -412,6 +415,67 @@ async function applyAvatarBody(): Promise<void> {
   avatarPanel.render();
 }
 
+// ── 옷 사이즈 (L-3b) ────────────────────────────────────────
+//
+// 체형과 같은 3층이되 **보내는 단위가 다르다** — 워커의 `setSurfaceSize` 가
+// 서피스 하나를 받으므로 [적용]도 행마다다(`panels/surfaceSize.ts`).
+const surfaceSize = new SurfaceSizePanel();
+
+const surfacePanel = new SurfacePanel({
+  root: ui.surfacePanel,
+  panel: surfaceSize,
+  onEdit: (uuid, axis, value) => {
+    surfaceSize.edit(uuid, axis, value);
+    surfacePanel.render();
+  },
+  onApply: (uuid) => void applySurfaceSize(uuid),
+  onRevert: (uuid) => {
+    surfaceSize.revert(uuid);
+    surfacePanel.render();
+  },
+});
+
+async function refreshSurfaces(): Promise<void> {
+  if (!currentScene || !client.connected) {
+    surfaceSize.clear();
+    surfacePanel.render();
+    return;
+  }
+  try {
+    surfaceSize.setFromWorker((await client.surfaces()).surfaces);
+  } catch (err: unknown) {
+    // 못 읽었으면 옛 목록을 남기지 않는다 — 남기면 화면이 지금 씬에 없는
+    // 패턴의 크기를 "현재 크기" 라고 말한다.
+    surfaceSize.clear();
+    log(`패턴 크기를 읽지 못했습니다: ${message(err)}`);
+  }
+  surfacePanel.render();
+}
+
+/**
+ * 행 하나를 보낸다.
+ *
+ * ★ 응답이 **바꾼 뒤의 전체 목록**이라 그대로 부으면 된다. 엔진이 값을
+ *   조정했으면(실측: 폭을 +30% 하면 높이가 0.03% 흔들린다) 그 사실이 화면에
+ *   그대로 드러난다 — 요청값을 화면에 남기면 그 조정이 가려진다.
+ */
+async function applySurfaceSize(uuid: string): Promise<void> {
+  const size = surfaceSize.payload(uuid);
+  if (!size) return;
+  try {
+    const res = await client.setSurfaceSize(uuid, size);
+    surfaceSize.setFromWorker(res.surfaces);
+    const now = res.surfaces.find((s) => s.uuid === uuid);
+    log(
+      `옷 사이즈 — ${now?.name ?? uuid}`
+      + (now ? ` → ${now.width.toFixed(2)} × ${now.height.toFixed(2)}cm` : ''),
+    );
+  } catch (err: unknown) {
+    status(`옷 사이즈 적용 실패: ${message(err)}`, true);
+  }
+  surfacePanel.render();
+}
+
 // ── 재생 컨트롤 (#14) ───────────────────────────────────────
 //
 // 상태와 전이는 `panels/playback.ts` 가 전부 정한다. 여기 있는 것은 (a) 포트로
@@ -487,6 +551,7 @@ function clearScene(): void {
   // 아바타도 씬에 딸려 있다. `currentScene = null` 뒤에 불러야
   // `refreshAvatarBody` 가 "씬 없음" 갈래로 간다.
   void refreshAvatarBody();
+  void refreshSurfaces();
   ui.stat.textContent = '-';
   ui.frames.textContent = '-';
   // 파라미터는 씬에 딸려 있다. 씬이 내려갔으면 화면의 값은 더 이상 아무것도
@@ -831,6 +896,8 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
     // 오른쪽 칸 (L-3a). 아바타는 씬에 딸려 있으므로 씬이 바뀌면 반드시 다시
     // 읽는다 — 안 읽으면 옛 씬의 체형이 새 아바타의 값인 척한다.
     void refreshAvatarBody();
+    // 패턴 크기도 씬에 딸려 있다 (L-3b).
+    void refreshSurfaces();
     const u = unfolder.stats;
     log(
       `2D 도면 — 패턴 ${u.placed}/${u.patterns} 배치됨`
@@ -1040,6 +1107,10 @@ declare global {
      * `unfolder2d` 는 왼쪽 칸의 `unfolder` 와 **다른 객체다** — 목표 정점이
      * 메시 로컬 좌표라 어느 옷의 것인지에 의존한다.
      */
+    /** L-3 의 진단 표면 — 오른쪽 칸. `avatarBody.view` / `surfaceSize.view` 가
+     *  화면이 무엇을 말하고 있어야 하는지의 정본이다 */
+    avatarBody: AvatarBodyPanel;
+    surfaceSize: SurfaceSizePanel;
     viewer2d: Viewer2D;
     unfolder2d: Unfolder;
     stream: FrameStream;
@@ -1073,6 +1144,8 @@ declare global {
 globalThis.cobalt = {
   client,
   viewer,
+  avatarBody,
+  surfaceSize,
   viewer2d,
   unfolder2d,
   stream,

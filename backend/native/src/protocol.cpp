@@ -4,7 +4,14 @@
 
 #include <zsTransform.h>   // 패턴 → 월드 변환 (MeshData)
 
+// 서피스 이름이 std::wstring 이라 UTF-8 변환에 WideCharToMultiByte 가 필요하다.
+// NOMINMAX 가 없으면 windows.h 의 min/max 매크로가 std::min/max 를 깨뜨린다.
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
 #include <ztAvatarCommon.h>        // ztAvatarBodyParam·ztAvatarMeasurePart + 이름 함수
+#include <ztDesignSurface.h>       // ztDesignSurfaceData::name (옷 사이즈)
 #include <ztDesign2DTransform.h>   // 서피스 2D 배치 (MeshData의 transform2d)
 #include <ztDesignAvatar.h>        // ztDesignAvatarData·ztDesignZetaData (체형)
 #include <ztDesignClothPattern.h>
@@ -274,6 +281,85 @@ bool WriteAvatarBody(ZestManager& manager, const json& body,
 
     if (!applied.empty()) qi->UpdateAvatar(uuid, next);
     return true;
+}
+
+// ── 옷 사이즈 (L-3b) ────────────────────────────────────────
+//
+// 데스크톱의 `Pattern` 패널에 있는 Width/Height 가 이것이다
+// (`MainGUI.cpp`). 아바타 체형과 달리 **엔진까지 안 내려가도 된다** —
+// `ZestManager` 가 셋을 다 갖고 있다:
+//
+//   GetSurfaceInfos()            서피스 목록 (map<ztUuid, unique_ptr<ztDesignSurface>>)
+//   GetSurfaceSize(uuid)         현재 크기 (zsVector2, cm)
+//   UpdateSizeSurface(uuid, 크기) 쓰기
+//
+// ⚠️ **uuid 문자열을 되파싱하지 않는다.** `ztUuidSaver::Convert(string)` 이
+//    있지만 `ztUuid::GetString()` 과 같은 형식이라는 보장이 헤더에 없다.
+//    형식이 어긋나면 "없는 서피스" 로 조용히 실패하는데, 그 증상이 화면에서는
+//    "크기를 바꿨는데 아무 일도 안 일어난다" 로만 보인다. 목록을 돌며
+//    `GetString()` 을 비교하면 그 위험이 원리적으로 없다 — 서피스 24개짜리
+//    선형 탐색이라 비용도 없다.
+
+/** 서피스 이름이 `std::wstring` 이라 JSON 에 실으려면 UTF-8 로 바꿔야 한다 */
+std::string Utf8(const std::wstring& w)
+{
+    if (w.empty()) return {};
+    const int need = ::WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
+                                           nullptr, 0, nullptr, nullptr);
+    if (need <= 0) return {};
+    std::string out((std::size_t)need, '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), out.data(), need, nullptr, nullptr);
+    return out;
+}
+
+json ReadSurfaces(ZestManager& manager)
+{
+    json items = json::array();
+
+    for (const auto& entry : manager.GetSurfaceInfos())
+    {
+        const ztDesignSurface* surface = entry.second.get();
+        if (!surface) continue;
+
+        const zsVector2 size = manager.GetSurfaceSize(entry.first);
+        items.push_back(json{
+            { "uuid",   entry.first.GetString() },
+            { "name",   Utf8(surface->GetData().name) },
+            { "width",  size.x },
+            { "height", size.y },
+        });
+    }
+
+    return json{ { "surfaces", items } };
+}
+
+/**
+ * 서피스 하나의 크기를 바꾼다.
+ *
+ * 폭·높이 중 **하나만 줘도 된다** — 안 준 쪽은 지금 값을 그대로 쓴다.
+ * 데스크톱 패널이 두 칸을 따로 편집하므로 같은 감각을 유지한다. 둘 다
+ * 요구하면 화면이 항상 두 값을 들고 있어야 하고, 그러면 한쪽만 고치려던
+ * 사용자가 다른 쪽을 낡은 값으로 덮어쓰게 된다.
+ *
+ * @return 0 = 성공, 1 = 그런 uuid 없음
+ */
+int WriteSurfaceSize(ZestManager& manager, const std::string& uuid,
+                     const json& req)
+{
+    for (const auto& entry : manager.GetSurfaceInfos())
+    {
+        if (entry.first.GetString() != uuid) continue;
+
+        const zsVector2 cur = manager.GetSurfaceSize(entry.first);
+        const float w = req.contains("width")  && req["width"].is_number()
+                        ? req["width"].get<float>()  : cur.x;
+        const float h = req.contains("height") && req["height"].is_number()
+                        ? req["height"].get<float>() : cur.y;
+
+        manager.UpdateSizeSurface(entry.first, zsVector2(w, h));
+        return 0;
+    }
+    return 1;
 }
 
 // base64 — 정점 버퍼를 JSON에 실어 보내기 위한 임시 수단이다.
@@ -963,6 +1049,42 @@ int RunProtocolLoop(ZestManager& manager)
                             { "avatar",  ReadAvatarBody(manager) },
                         };
                     }
+                }
+            }
+            else if (op == "surfaces")
+            {
+                if (!manager.IsLoadedZls())
+                {
+                    ok = false; error = "씬이 로드되지 않았습니다";
+                }
+                else
+                {
+                    result = ReadSurfaces(manager);
+                }
+            }
+            else if (op == "setSurfaceSize")
+            {
+                const std::string uuid = req.value("uuid", "");
+                if (!manager.IsLoadedZls())
+                {
+                    ok = false; error = "씬이 로드되지 않았습니다";
+                }
+                else if (uuid.empty())
+                {
+                    ok = false; error = "uuid가 필요합니다";
+                }
+                else if (WriteSurfaceSize(manager, uuid, req) != 0)
+                {
+                    // 조용히 성공으로 답하면 화면이 "바꿨다" 고 말하는데 아무
+                    // 일도 안 일어난다 — ISSUE-014 가 정확히 그 모양이었다.
+                    ok = false; error = "그런 서피스가 없습니다: " + uuid;
+                }
+                else
+                {
+                    // ★ 되읽어 싣는다. 엔진이 크기를 클램프하거나 비율을
+                    //   유지하려고 다른 값을 넣었다면 그 사실이 응답에 드러나야
+                    //   한다 — 요청값을 메아리치면 가려진다(setAvatarBody 와 같은 판단).
+                    result = ReadSurfaces(manager);
                 }
             }
             else if (op == "meshInfo")

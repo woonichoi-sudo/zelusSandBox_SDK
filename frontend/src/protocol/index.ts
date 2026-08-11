@@ -66,6 +66,9 @@ export type {
   AvatarBodyResult,
   AvatarMeasurement,
   SetAvatarBodyResult,
+  // 옷 사이즈 (L-3b)
+  SurfaceInfo,
+  SurfacesResult,
   SetParamsResult,
   SimulationParams,
   StatusResult,

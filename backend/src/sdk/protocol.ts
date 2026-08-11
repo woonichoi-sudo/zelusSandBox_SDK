@@ -24,6 +24,8 @@ export type Request =
   | { id: number; op: 'setParams'; params: Partial<SimulationParams> }
   | { id: number; op: 'avatarBody' }
   | { id: number; op: 'setAvatarBody'; bodyParams: Record<string, number> }
+  | { id: number; op: 'surfaces' }
+  | { id: number; op: 'setSurfaceSize'; uuid: string; width?: number; height?: number }
   | { id: number; op: 'meshInfo' }
   | { id: number; op: 'meshData'; topology?: boolean }
   | { id: number; op: 'export'; path: string; format?: 'gltf' | 'zbin' }
@@ -318,6 +320,24 @@ export interface AvatarBodyResult {
   bodyParams?: Record<string, number>;
   /** 치수 25개. 키는 `ztAvatarMeasureUtils::GetMeasurePartName` */
   measurements?: Record<string, AvatarMeasurement>;
+}
+
+// ── 옷 사이즈 (L-3b) ────────────────────────────────────────
+//
+// 데스크톱 `Pattern` 패널의 Width/Height 가 이것이다. 아바타 체형과 달리
+// `ZestManager` 안에서 끝난다(GetSurfaceInfos/GetSurfaceSize/UpdateSizeSurface).
+
+/** 서피스 하나. **크기는 cm 다** */
+export interface SurfaceInfo {
+  uuid: string;
+  /** 씬이 준 이름. 유일하지 않다 — 실측에서 "pattern 9" 가 셋이었다 */
+  name: string;
+  width: number;
+  height: number;
+}
+
+export interface SurfacesResult {
+  surfaces: SurfaceInfo[];
 }
 
 export interface SetAvatarBodyResult {

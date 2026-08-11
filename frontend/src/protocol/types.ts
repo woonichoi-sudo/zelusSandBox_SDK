@@ -32,6 +32,9 @@ export type {
   AvatarBodyResult,
   AvatarMeasurement,
   SetAvatarBodyResult,
+  // 옷 사이즈 (L-3b). 크기는 cm 다
+  SurfaceInfo,
+  SurfacesResult,
   ErrResponse,
   MeshDataResult,
   MeshInfoResult,
