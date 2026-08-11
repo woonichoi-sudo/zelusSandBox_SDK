@@ -37,6 +37,14 @@ export type {
   // (씬 데이터의 사본이라 쓰기가 닿지 않는다. 원본 주석에 실측이 있다).
   AvatarMeasurementTargets,
   SetAvatarMeasurementsResult,
+  // 아바타 메시 (AM-1). ★ 정점이 **월드 좌표**다 — 옷과 달리 변환을 곱하면
+  // 안 된다. 프레임 경로에 없는 요청-응답이고, 부를 시점은 씬 로드 / 체형 변경 /
+  // 드레이프 / 애니메이션 중이다. `normals` 는 topology 가 아니라 positions 와
+  // 한 몸이다(몸이 휘면 법선도 바뀐다). 원본 주석 참고
+  AvatarMesh,
+  AvatarMeshResult,
+  AvatarPart,
+  AvatarPartMaterial,
   // 드레이프 (W-1). ⚠️ `applied:false` 는 에러가 아니라 "그 씬에 자동 드레이프가
   // 없다" 이고, `applied:true` 는 프레임 카운터를 -1 로 되돌린다(= reset 과 같은 자리)
   DrapingItem,

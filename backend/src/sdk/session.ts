@@ -14,6 +14,7 @@ import {
   type MeshInfoResult,
   type PatternData,
   type AvatarBodyResult,
+  type AvatarMeshResult,
   type AvatarMeasurementTargets,
   type LoadDrapingResult,
   type SetAvatarBodyResult,
@@ -314,6 +315,26 @@ export class Session extends EventEmitter {
 
   meshData(topology = false): Promise<MeshDataResult> {
     return this.#call('meshData', { topology });
+  }
+
+  /**
+   * 아바타(사람 몸) 메시를 읽는다 (AM-1).
+   *
+   * ⚠️ **프레임마다 부르지 마라.** 이것은 스트리밍이 아니라 요청-응답이고,
+   *    한 번이 옷 한 프레임의 몇 배다. 부를 시점은 정해져 있다 — 씬 로드 /
+   *    체형 변경(`setAvatarMeasurements`·`setAvatarBody`) / `loadDraping`
+   *    (포즈가 크게 바뀐다) / 애니메이션 중. 자세한 것은
+   *    `AvatarMeshResult` 주석.
+   *
+   * ★ 정점은 **월드 좌표**다. 옷과 달리 변환을 곱하면 안 된다.
+   *
+   * @param topology indices/uvs/material 을 포함할지. 몸의 형태만 갱신할
+   *                 때는 false 로 두어 절반 이하로 줄인다.
+   * @param normals  엔진 법선을 포함할지(기본 true). 끄면 절반이 줄지만
+   *                 클라이언트가 직접 계산해야 하고 UV 이음매가 각져 보인다.
+   */
+  avatarMesh(topology = false, normals = true): Promise<AvatarMeshResult> {
+    return this.#call('avatarMesh', { topology, normals });
   }
 
   /** meshData를 받아 base64를 TypedArray로 풀어서 돌려준다. */

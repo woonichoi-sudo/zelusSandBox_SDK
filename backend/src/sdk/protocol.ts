@@ -42,6 +42,11 @@ export type Request =
   | { id: number; op: 'design2d' }
   | { id: number; op: 'meshInfo' }
   | { id: number; op: 'meshData'; topology?: boolean }
+  /**
+   * 아바타(사람 몸) 메시 (AM-1). **요청해야 오는 값이다** — 스트리밍에
+   * 얹혀 있지 않다. 언제 부르는지는 `AvatarMeshResult` 주석 참고.
+   */
+  | { id: number; op: 'avatarMesh'; topology?: boolean; normals?: boolean }
   | { id: number; op: 'export'; path: string; format?: 'gltf' | 'zbin' }
   | { id: number; op: 'quit' };
 
@@ -291,6 +296,151 @@ export interface PatternData {
 export interface MeshDataResult {
   patterns: PatternData[];
   topology: boolean;
+}
+
+// ── 아바타 메시 (AM-1) ──────────────────────────────────────
+//
+// 실시간 뷰에 몸을 세우기 위한 것이다. 여태 옷만 떠 있어서 체형을 바꿔도
+// 결과가 화면에 안 보였다.
+//
+// ★ `meshData` 와 별개의 op 인 이유 — 보내는 **주기**가 다르다.
+//   `meshData` 는 프레임 이벤트의 본체라 초당 수십 번 나가고, 아바타는
+//   그보다 훨씬 크면서 정해진 시점에만 바뀐다. 한 op 에 합치면 구독 중인
+//   클라이언트가 프레임마다 몸을 통째로 받는다.
+//
+//   다만 `topology` 플래그의 **의미는 `meshData` 와 똑같다** — 디코더가
+//   두 갈래가 되지 않게 일부러 맞췄다.
+
+/** 아바타 파트의 재질. 옷의 `PatternMaterial` 과 필드 의미가 같다. */
+export interface AvatarPartMaterial {
+  /** 아바타 에셋 uuid. 옷의 `fabricUuid` 자리에 해당한다 */
+  assetUuid: string;
+  /** `[r, g, b]`, 각 0~1. `colorProfile` 없이 해석하면 안 된다 */
+  color: [number, number, number];
+  colorProfile: 'srgb' | 'linear';
+  /** 0~1. 제타의 속눈썹은 1 미만이다 — 데스크톱도 이 값으로 반투명 처리한다 */
+  opacity: number;
+  roughness: number;
+  metalness: number;
+}
+
+/**
+ * 아바타의 렌더 파트 하나.
+ *
+ * 제타는 파트가 여럿이다 — 실측: Face / Body / Legs / Arms + 좌우
+ * Eye / Lashe / Pupil / Cornea. 파트마다 재질이 다르므로 합치면 안 된다.
+ */
+export interface AvatarPart {
+  /** `GetRenderMeshs()` 안의 인덱스. 엔진의 파트 순서 그대로다 */
+  index: number;
+  /** 엔진이 정한 파트 이름 ("Face", "Body", …) */
+  name: string;
+  vertices: number;
+  triangles: number;
+  /**
+   * base64. float32 x3, 촘촘히 포장됨.
+   *
+   * ★ **월드 좌표다. 어떤 변환도 곱하지 마라.** 옷(`PatternData.transform`)과
+   *   정반대다 — 아바타의 `localTransform` 은 엔진이 정점에 이미 구워 넣고,
+   *   glTF 익스포터도 아바타 노드에 항등변환을 준다. 그래서 이 타입에는
+   *   `transform` 필드가 아예 없다. 단위는 옷과 같은 cm.
+   */
+  positions?: string;
+  positionStride?: number;
+  /**
+   * base64. float32 x3. **`normals:false` 로 요청했을 때만 없다.**
+   *
+   * ⚠️ topology 가 아니라 **positions 와 한 몸**이다 — 몸이 휘면 법선도
+   *    바뀐다. 이걸 최초 1회만 받아 두면 몸은 움직이는데 음영만 옛 자세로
+   *    고정된다(크래시 없이 화면만 어색해지는 종류의 오류다).
+   */
+  normals?: string;
+  normalStride?: number;
+  /** base64. int32. **topology:true 일 때만** */
+  indices?: string;
+  indexStride?: number;
+  /** base64. float32 x2. 텍스처 좌표다(옷의 `uvs` 와 달리 cm 가 아니다). topology:true 일 때만 */
+  uvs?: string;
+  /**
+   * **topology:true 일 때만.** 없으면 아예 오지 않는다 — 옷과 같은 규약으로,
+   * "흰 몸" 과 "색을 모름" 을 구분할 수 있어야 한다.
+   */
+  material?: AvatarPartMaterial;
+}
+
+export interface AvatarMesh {
+  uuid: string;
+  /** `zeta` 는 치수로 조형되는 아바타, `mannequin` 은 에셋 마네킹 */
+  subType: 'zeta' | 'mannequin';
+  /** `avatarBody` / `setAvatarMeasurements` 가 대상으로 삼는 아바타인가 */
+  current: boolean;
+  parts: AvatarPart[];
+  /** 파트 합계. 실제로 실은 정점 수다 (요청값의 메아리가 아니다) */
+  vertices: number;
+  triangles: number;
+  /** 애니메이션을 가진 아바타인가. 제타는 항상 true */
+  animation: boolean;
+  animationTime: number;
+  /**
+   * `[현재 프레임, 전체 프레임]`.
+   *
+   * ★ **애니메이션이 끝났는지는 이 값으로 판정한다** — `cur + 1 >= total`.
+   *   엔진에 `IsAnimationFinished()` 가 있지만 **부르면 안 된다**: `const`
+   *   인데 내부에서 mutable 플래그를 지우고, 시뮬 실행기가 바로 그 플래그로
+   *   아바타 갱신 여부를 정한다. 워커가 대신 읽으면 시뮬 동작이 바뀐다.
+   *   실행기 자신도 상태 메시지를 만들 때 이 식을 쓴다.
+   */
+  frameInfo: [number, number];
+  /**
+   * 실제로 실은 정점에서 **다시 잰** 월드 AABB (cm). 정점이 하나도 없으면 없다.
+   *
+   * ⚠️ **인덱스가 가리키는 정점만 센 값이다.** 아바타 정점 버퍼에는 어떤
+   *    삼각형도 참조하지 않는 쓰레기 정점이 섞여 있을 수 있어서다(glTF
+   *    익스포터도 같은 이유로 POSITION min/max 를 인덱스로 돈다). 화면이
+   *    `positions` 전체로 상자를 다시 재면 이 값과 달라질 수 있고, 그쪽이
+   *    틀린 쪽이다 — 카메라를 그 상자에 맞추면 몸이 구석에 박힌다.
+   *
+   * 클라이언트가 "진짜 몸이 왔나" 를 이 값 하나로 판정할 수 있고,
+   * glTF 익스포트 산출물과 대조할 기준선이기도 하다.
+   */
+  bounds?: { min: [number, number, number]; max: [number, number, number] };
+}
+
+/**
+ * `avatarMesh` 의 결과.
+ *
+ * ── 언제 부르는가 ───────────────────────────────────────────
+ *   · 씬 로드 직후                — `topology:true`
+ *   · `setAvatarMeasurements` 뒤  — 몸이 다시 만들어진다
+ *   · `setAvatarBody` 뒤          — 위와 같다
+ *   · `loadDraping` 뒤            — ⚠️ **포즈가 크게 바뀐다.** 실측으로 팔이
+ *                                   내려오면서 x 범위가 ±61.3 → ±29.9cm 가
+ *                                   됐다. 다시 안 받으면 옷은 새 자세인데
+ *                                   몸만 옛 자세로 남는다.
+ *                                   ⓘ 같은 실측에서 uuid·파트 수·정점 수는
+ *                                   그대로였다 — `topology:false` 로 충분했다.
+ *                                   (씬 하나의 관측이다. 응답의 `uuid` 나
+ *                                    `vertices` 가 달라졌으면 topology 를
+ *                                    다시 받을 것.)
+ *   · 애니메이션 중               — 포즈가 움직인다. `frameInfo` 가 끝을 알린다
+ *
+ * ⚠️ **프레임마다 부르지 마라.** 옷 한 프레임의 몇 배다.
+ */
+export interface AvatarMeshResult {
+  /**
+   * `joinInSimulation` 이 꺼진 아바타는 오지 않는다 — 데스크톱 3D 뷰와 같은 필터다.
+   *
+   * ⚠️ **액세서리(머리카락 등)는 아직 안 온다.** 데스크톱과 glTF 익스포트에는
+   *    들어 있다(실측 씬의 glTF 에 `zeta_accessory12` 노드가 있다). 뺀 이유는
+   *    텍스처다 — 머리카락은 알파 컷아웃 이미지가 없으면 판때기로 보이는데,
+   *    이 프로토콜에 이미지를 실을 통로가 아직 없다.
+   */
+  avatars: AvatarMesh[];
+  /** 요청한 값이 그대로 온다. 받은 응답에 indices 가 있는지 판정하는 데 쓴다 */
+  topology: boolean;
+  normals: boolean;
+  totalVertices: number;
+  totalTriangles: number;
 }
 
 export interface SetParamsResult {

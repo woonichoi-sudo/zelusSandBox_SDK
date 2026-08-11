@@ -18,6 +18,8 @@
 #include <ztDesignSurface.h>       // ztDesignSurfaceData::name (옷 사이즈)
 #include <ztDesign2DTransform.h>   // 서피스 2D 배치 (MeshData의 transform2d)
 #include <ztDesignAvatar.h>        // ztDesignAvatarData·ztDesignZetaData (체형)
+#include <ztDesignMannequin.h>     // 마네킹 아바타 메시·머티리얼 (avatarMesh)
+#include <ztMutex.h>               // ztGlobalMutex — 아바타 메시 읽기 보호 (avatarMesh)
 #include <ztDesignBoundaryCurve.h> // ztBoundaryType (디자인 2D 커브 종류)
 #include <ztDesignClothPattern.h>
 #include <ztDesignSeam.h>          // ztDesignSeamData (봉제선)
@@ -1439,6 +1441,374 @@ json MeshData(ZestManager& manager, bool includeTopology)
     return json{ { "patterns", patterns }, { "topology", includeTopology } };
 }
 
+// ── 아바타 메시 (AM-1) ──────────────────────────────────────
+//
+// 실시간 뷰에는 여태 옷만 떠 있었다. 몸이 없으니 `setAvatarMeasurements` 로
+// 체형을 바꿔도 결과를 눈으로 볼 수 없다 — 이 op 이 있는 이유다.
+//
+// ── ★ 왜 `meshData` 확장이 아니라 새 op 인가 ────────────────
+//
+//   `MeshData()` 는 **프레임 이벤트의 본체**다(RunProtocolLoop 의
+//   `ev["mesh"] = MeshData(manager, false)`). 거기에 아바타를 얹으면 구독
+//   중인 클라이언트가 프레임마다 몸을 통째로 받는다. 이미 백프레셔가 걸린
+//   대역폭을 통째로 잡아먹는다 — `W_Bra top & Leggings.zls` 실측:
+//
+//     topology  normals   응답      비고
+//     true      true      1,947KB   106ms — 최초 1회용
+//     true      false     1,501KB
+//     false     true        895KB
+//     false     false       448KB    41ms — 형태만 갱신
+//     (같은 씬의 meshData topology:false = 212KB = 옷 한 프레임)
+//
+//   즉 **가장 작은 아바타 응답도 옷 한 프레임의 2.1배**다.
+//   `meshData` 에 "아바타 포함" 플래그를 다는 방법도 있지만, 그러면 같은
+//   함수가 프레임 경로와 요청 경로에서 다르게 동작하게 되고 그 분기가 곧
+//   틀릴 자리가 된다. **보내는 주기가 다르면 op 을 나눈다.**
+//
+//   대신 `topology` 플래그의 의미는 `meshData` 와 **똑같이** 맞췄다 — 받는
+//   쪽 디코더가 두 갈래가 되지 않게 하기 위해서다.
+//
+// ── 언제 부르는가 (클라이언트 규약) ─────────────────────────
+//   · 씬 로드 직후                   — 처음 세운다 (topology:true)
+//   · `setAvatarMeasurements` 뒤     — 몸이 다시 만들어진다
+//   · `setAvatarBody` 뒤             — 위와 같다
+//   · `loadDraping` 뒤               — ⚠️ **포즈가 크게 바뀐다.** 실측:
+//                                      팔이 내려오면서 x 범위가 ±61.3 →
+//                                      ±29.9cm 로 절반이 됐다. 다시 안 받으면
+//                                      옷은 새 자세에 걸리는데 몸만 옛 자세로
+//                                      남는다.
+//                                      ⓘ 같은 실측에서 아바타 uuid·파트 12개·
+//                                      정점 28,564 는 **그대로였다** — 즉 이
+//                                      씬에서는 topology:false 로 충분했다.
+//                                      (씬 하나의 관측이지 보장이 아니다.
+//                                       응답의 uuid/vertices 가 달라졌으면
+//                                       topology 를 다시 받을 것.)
+//   · 애니메이션 중                  — 포즈가 움직인다. `frameInfo` 로
+//                                      끝났는지 판정한다(아래)
+//
+// ── ⚠️ 부르면 안 되는 것 셋 ─────────────────────────────────
+//
+//   `IsUpdateRenderMesh()` / `IsForceUpdatedMesh()` 는 `const` 인데 **읽는
+//   순간 mutable 플래그를 지운다**(ztDesignAvatar.cpp 의 두 함수 모두
+//   `mIsX = false` 를 하고 나간다). 시뮬 실행기가 그 플래그를 소비하므로
+//   (ztSimulationStandardCPUExecutor.cpp:1905 의 `isNeedToUpdateAvatar`)
+//   워커가 부르면 **시뮬 동작 자체가 바뀐다.**
+//
+//   ★ 여기에 하나 더 있다 — **`IsAnimationFinished()` 도 같은 부류다.**
+//     이름만 보면 순수 조회 같지만 내부에서
+//     `IsUpdatedTempVeticesForSimulation()` 을 부르고, 그 함수가
+//     `mUpdatedTempVeticesForSimulation = false` 로 지운다
+//     (ztDesignAvatar.cpp:64-72, ztDesignZeta.cpp:339). 그리고 그 값은 바로
+//     위의 :1905 와 같은 줄에서 쓰인다. **그래서 이 op 은 부르지 않는다.**
+//
+//     대신 `frameInfo` 를 그대로 싣는다 — `GetFrameInfo()` 는 순수 조회이고,
+//     실행기 자신이 애니메이션 종료를 표시할 때 쓰는 판정
+//     (`info.first + 1 >= info.second`, :277-280)을 클라이언트가 같은 값으로
+//     다시 내릴 수 있다. 부작용 없이 같은 정보를 얻는 길이다.
+//
+// ── ⚠️ 뮤텍스 — 옷과 다르다 ─────────────────────────────────
+//
+//   옷은 `GetSimulationOutputMesh()` 가 `ztChangeTracker` 라 `Read()` 가
+//   이중버퍼의 안정된 쪽을 준다. **아바타에는 그 보호가 없다.**
+//   시뮬 스레드가 `ztGlobalMutex` 를 잡고 `designAvatar->Tick(dt)` 와
+//   `UpdateRenderMesh()` 로 정점을 덮어쓴다
+//   (ztSimulationStandardCPUExecutor.cpp:266-272, :347-365). 잠그지 않으면
+//   상반신은 이번 프레임, 하반신은 다음 프레임인 **찢어진 몸**이 나간다.
+//   그래서 추출 전체를 같은 뮤텍스로 감싼다.
+//
+//   ⚠️ 재진입 불가다(std::mutex). 이 안에서 부르는 엔진 함수가 같은 뮤텍스를
+//      잡으면 그대로 데드락이다. 확인했다 — `ztDesignZeta::GetRenderMeshs`
+//      → `GetBodySubMesh` 는 잠그지 않고(ztDesignZeta.cpp:456-540),
+//      `ztDesignMannequin` 쪽에서 잠그는 것은 `Recompute()` 하나뿐이다
+//      (:666). 그러니 이 안에서 **아바타를 바꾸는 함수를 부르면 안 된다.**
+//
+//   ⓘ `GetRenderMeshs()` 는 매번 **새 메시를 만들어 채워 돌려준다**
+//     (`std::make_shared<zsTriMesh>()` + `ConvertToTriMesh`). 즉 복사가
+//     락 안에서 끝나므로, 락을 놓은 뒤 그 shared_ptr 를 들고 있어도 안전하다.
+//     그래도 base64 인코딩까지 락 안에서 한다 — 코드가 한 덩어리여야
+//     "어디까지가 보호 구간인가" 가 헷갈리지 않는다.
+//
+// ── 좌표계 ──────────────────────────────────────────────────
+//
+//   ★ **월드다. 변환을 곱하면 안 된다.** 옷(ISSUE-011)과 정반대다.
+//
+//   근거 둘: (1) glTF 익스포터가 아바타 노드에
+//   `ZELUS::zsTransform::Identity()` 를 준다(zwGltfExporterImpl.cpp:521·582
+//   — 옷은 :392 에서 `GetTransformIn3D()` 를 준다). (2) `localTransform` 은
+//   정점에 **이미 구워져 있다**: 마네킹은
+//   `vertices[i] = localTransform * dynamicBodyVertices[i]`
+//   (ztDesignMannequin.cpp:1126·1140), 제타는 로드 시
+//   `mAvatarManager->SetLocalTransform(...)` (ztDesignZeta.cpp:204).
+//
+//   그래서 `transform` 키를 아예 싣지 않는다. 실으면 받는 쪽이 곱하고 싶어진다.
+//   단위는 옷과 같은 cm 다.
+//
+// ── 어느 접근자인가 ─────────────────────────────────────────
+//
+//   `GetRenderMeshs()` 다. `GetMeshes()` 가 아니다.
+//   제타에서 둘은 **다른 물건**이다:
+//     GetMeshes()     → 시뮬 충돌용 body mesh **1개** (ztDesignZeta.cpp:426)
+//     GetRenderMeshs() → 서브머티리얼별로 갈린 렌더 메시 여러 개
+//                        (몸 4 + 눈/속눈썹/동공/각막 8 = 12파트)
+//   데스크톱 3D 뷰(Renderer3D.cpp:499·551)와 익스포터가 둘 다 렌더 메시를
+//   쓴다. 화면에 몸을 세우는 것이 목적이므로 같은 것을 쓴다.
+//
+//   실측 파트 12개 — Face 4,310 / Body 2,964 / Legs 5,440 / Arms 7,058 /
+//   좌우 Eye 1,505 · Lashe 1,812 · Pupil 21 · Cornea 1,058 (합 28,564정점,
+//   48,198삼각형). 재질이 파트마다 달라서 합치면 안 된다(속눈썹·각막은
+//   alpha 0.5, 동공은 검정).
+//
+// ── ⚠️ 아직 안 싣는 것: 액세서리 ────────────────────────────
+//
+//   제타에는 `GetRenderAccessoryMeshes()` 로 머리카락 등이 따로 있고,
+//   데스크톱(Renderer3D.cpp:566-)과 익스포터(:526-548)는 그것도 그린다.
+//   실측한 씬의 glTF 에 `zeta_accessory12` 노드가 실제로 하나 더 있다.
+//
+//   여기서 뺀 이유는 **텍스처 때문**이다 — 액세서리는 basecolor + alpha
+//   **이미지**로 그려지고(머리카락은 알파 컷아웃이 없으면 판때기로 보인다),
+//   이 프로토콜에는 아직 이미지를 실어 보내는 통로가 없다. 색만 보내면
+//   머리가 덩어리로 나온다. 통로가 생기면 여기 붙일 자리다.
+
+/** 아바타 파트의 머티리얼. 옷 쪽(`MeshData`)과 같은 다섯 필드 + 색공간이다. */
+json AvatarMaterialJson(const ztDesignMaterialData& d)
+{
+    return json{
+        { "assetUuid",    ztUuidSaver::Convert(d.assetUuid) },
+        { "color",        { d.basecolor.x, d.basecolor.y, d.basecolor.z } },
+        { "opacity",      d.alpha },
+        { "roughness",    d.roughness },
+        { "metalness",    d.metalness },
+        // 옷과 같은 이유로 해석 규칙을 같이 보낸다 — 값이 아니라 규칙이라
+        // 상수처럼 보여도 빼면 받는 쪽이 추측하게 된다.
+        { "colorProfile", (d.colorProfile == ztColorProfile::Linear) ? "linear" : "srgb" },
+    };
+}
+
+/** ztGlobalMutex 를 예외 경로에서도 반드시 놓는다. 이 op 은 try 블록 안이다. */
+struct GlobalMutexGuard
+{
+    GlobalMutexGuard()  { ztGlobalMutex::GetInstance()->Lock(); }
+    ~GlobalMutexGuard() { ztGlobalMutex::GetInstance()->Unlock(); }
+    GlobalMutexGuard(const GlobalMutexGuard&) = delete;
+    GlobalMutexGuard& operator=(const GlobalMutexGuard&) = delete;
+};
+
+json AvatarMeshData(ZestManager& manager, bool includeTopology, bool includeNormals)
+{
+    json avatars = json::array();
+
+    std::size_t totalV = 0, totalT = 0;
+
+    ztSceneQueryInterface* qi = QueryInterface(manager);
+    if (!qi)
+    {
+        // 씬이 없어도 모양은 같아야 한다 — `MeshData` 와 같은 규약이다.
+        return json{
+            { "avatars", avatars }, { "topology", includeTopology },
+            { "normals", includeNormals },
+            { "totalVertices", totalV }, { "totalTriangles", totalT },
+        };
+    }
+
+    const ztUuid currentUuid = qi->GetCurrentAvatar();
+
+    GlobalMutexGuard lock;
+
+    for (const auto& entry : qi->GetAvatars())
+    {
+        const ztDesignAvatar* avatar = entry.second.get();
+        if (!avatar) continue;
+
+        // 데스크톱 3D 뷰(Renderer3D.cpp:973)와 익스포터
+        // (zwGltfExporterImpl.cpp:498)가 쓰는 것과 **같은 필터**다.
+        // 여기서 갈라지면 화면과 스냅샷에 다른 몸이 선다.
+        if (!avatar->JoinInSimulation()) continue;
+
+        const bool isZeta = (avatar->GetSubType() == ztAvatarSubType::Zeta);
+
+        // 제타는 서브머티리얼 배열이 파트와 1:1이고, 마네킹은 파트 인덱스로
+        // 하나씩 받는다. 익스포터·렌더러의 두 갈래를 그대로 옮긴 것이다.
+        const ztDesignZeta*      zeta      = dynamic_cast<const ztDesignZeta*>(avatar);
+        const ztDesignMannequin* mannequin = dynamic_cast<const ztDesignMannequin*>(avatar);
+
+        std::vector<ztDesignMaterialData> zetaMaterials;
+        if (zeta) zetaMaterials = zeta->GetBodySubMaterials();
+
+        const std::vector<std::shared_ptr<ZELUS::zsTriMesh>> meshes = avatar->GetRenderMeshs();
+
+        json parts = json::array();
+
+        std::size_t avatarV = 0, avatarT = 0;
+        float lo[3] = {  1e30f,  1e30f,  1e30f };
+        float hi[3] = { -1e30f, -1e30f, -1e30f };
+
+        for (std::size_t i = 0; i < meshes.size(); ++i)
+        {
+            const ZELUS::zsTriMesh* mesh = meshes[i].get();
+            if (!mesh) continue;
+
+            // 마네킹은 꺼진 파트가 있다(Renderer3D.cpp:505-507이 같은 검사를
+            // 한다). 제타는 항상 true 를 돌려주므로 이 줄이 무해하다
+            // (ztDesignZeta.cpp: GetMeshPartActivated → return true).
+            if (!avatar->GetMeshPartActivated(static_cast<unsigned int>(i))) continue;
+
+            const std::size_t nv = static_cast<std::size_t>(mesh->vertices.size());
+            const std::size_t ni = static_cast<std::size_t>(mesh->indices.size());
+
+            // 익스포터가 같은 검사로 건너뛴다(:515·567). 빈 파트를 실으면
+            // 받는 쪽이 정점 0짜리 지오메트리를 만들게 된다.
+            if (nv == 0 || ni == 0) continue;
+
+            avatarV += nv;
+            avatarT += ni / 3;
+
+            json p{
+                { "index",     static_cast<int>(i) },
+                { "name",      avatar->GetMeshPartName(static_cast<unsigned int>(i)) },
+                { "vertices",  nv },
+                { "triangles", ni / 3 },
+            };
+
+            // zsVector3는 SIMD 정렬 때문에 16바이트다. 옷과 **같은 이유로**
+            // float3로 다시 포장한다 — 그대로 보내면 4바이트씩 어긋난다.
+            {
+                std::vector<float> tight;
+                tight.reserve(nv * 3);
+                for (std::size_t k = 0; k < nv; ++k)
+                {
+                    const ZELUS::zsVector3& v = mesh->vertices[static_cast<int>(k)];
+                    tight.push_back(v.x);
+                    tight.push_back(v.y);
+                    tight.push_back(v.z);
+                }
+                p["positions"]      = Base64(tight.data(), tight.size() * sizeof(float));
+                p["positionStride"] = 12;
+            }
+
+            // ── AABB는 **인덱스가 가리키는 정점만** 본다 ─────────────
+            //
+            // ⚠️ 아바타 정점 버퍼에는 **어떤 삼각형도 참조하지 않는 쓰레기
+            //    정점이 섞일 수 있다.** glTF 익스포터가 그 사실을 알고 있고,
+            //    POSITION 접근자의 min/max를 구할 때 일부러 `for (int i :
+            //    trimesh->indices)` 로 돌린다(zwGltfExporterImpl.cpp:1691-1697
+            //    의 주석 "There can be garbage vertices in vertex buffer").
+            //
+            //    전체 정점으로 재면 상자가 엉뚱하게 커지고, 화면은 그 상자로
+            //    카메라를 맞추므로 **몸이 화면 구석에 조그맣게 박힌다** —
+            //    에러도 경고도 없이 "왜 이렇게 멀지" 로만 보인다.
+            //
+            //    쓰레기 정점 자체는 그대로 싣는다. 인덱스가 안 가리키므로
+            //    그리지 않고, 빼면 인덱스를 전부 다시 매겨야 한다.
+            for (std::size_t k = 0; k < ni; ++k)
+            {
+                const ZELUS::zsInt idx = mesh->indices[static_cast<int>(k)];
+                if (idx < 0 || static_cast<std::size_t>(idx) >= nv) continue;
+
+                const ZELUS::zsVector3& v = mesh->vertices[idx];
+                lo[0] = (std::min)(lo[0], v.x); hi[0] = (std::max)(hi[0], v.x);
+                lo[1] = (std::min)(lo[1], v.y); hi[1] = (std::max)(hi[1], v.y);
+                lo[2] = (std::min)(lo[2], v.z); hi[2] = (std::max)(hi[2], v.z);
+            }
+
+            // ★ 법선은 topology 가 아니라 **positions 와 한 몸**이다.
+            //   몸은 포즈·체형에 따라 휘므로 정점이 바뀌면 법선도 바뀐다.
+            //   토폴로지 쪽에 붙이면 최초 1회 받은 법선이 남아 **몸은 움직이는데
+            //   음영만 옛 자세로 고정**되는, 화면에서만 드러나는 오류가 된다.
+            //
+            //   대신 끌 수 있게 했다(`normals:false`). 위치와 같은 크기라
+            //   응답이 두 배가 되기 때문이다. 끄면 클라이언트가
+            //   computeVertexNormals 로 대신할 수 있다 — 다만 UV 이음매에서
+            //   각지게 보인다(엔진 법선은 그 자리를 부드럽게 잇는다).
+            if (includeNormals && mesh->normals.size() == mesh->vertices.size() && nv > 0)
+            {
+                std::vector<float> tight;
+                tight.reserve(nv * 3);
+                for (std::size_t k = 0; k < nv; ++k)
+                {
+                    const ZELUS::zsVector3& n = mesh->normals[static_cast<int>(k)];
+                    tight.push_back(n.x);
+                    tight.push_back(n.y);
+                    tight.push_back(n.z);
+                }
+                p["normals"]      = Base64(tight.data(), tight.size() * sizeof(float));
+                p["normalStride"] = 12;
+            }
+
+            if (includeTopology)
+            {
+                p["indices"]     = Base64(&mesh->indices[0], ni * sizeof(ZELUS::zsInt));
+                p["indexStride"] = static_cast<int>(sizeof(ZELUS::zsInt));
+
+                if (mesh->uvs.size() > 0)
+                {
+                    p["uvs"] = Base64(&mesh->uvs[0],
+                                      static_cast<std::size_t>(mesh->uvs.size())
+                                          * sizeof(ZELUS::zsVector2));
+                }
+
+                // ⚠️ 머티리얼이 없으면 키를 아예 싣지 않는다 — 옷과 같은 규약.
+                //    흰색을 대신 보내면 "흰 몸"과 "색을 모름"이 구분되지 않는다.
+                if (zeta)
+                {
+                    if (i < zetaMaterials.size())
+                        p["material"] = AvatarMaterialJson(zetaMaterials[i]);
+                }
+                else if (mannequin)
+                {
+                    p["material"] =
+                        AvatarMaterialJson(mannequin->GetMaterialData(static_cast<unsigned int>(i)));
+                }
+            }
+
+            parts.push_back(std::move(p));
+        }
+
+        totalV += avatarV;
+        totalT += avatarT;
+
+        // `GetFrameInfo()` 는 (현재 프레임, 전체 프레임)이다. 실행기가
+        // 종료를 판정하는 식이 `first + 1 >= second` 다
+        // (ztSimulationStandardCPUExecutor.cpp:277-280). 클라이언트가 같은
+        // 식을 쓰면 `IsAnimationFinished()`(부작용 있음, 위 주석)를 부르지
+        // 않고도 "이제 몸이 안 움직인다 = 더 안 받아도 된다"를 판정한다.
+        const std::pair<int, int> frameInfo = avatar->GetFrameInfo();
+
+        json a{
+            { "uuid",      ztUuidSaver::Convert(entry.first) },
+            { "subType",   isZeta ? "zeta" : "mannequin" },
+            { "current",   entry.first == currentUuid },
+            { "parts",     std::move(parts) },
+            { "vertices",  avatarV },
+            { "triangles", avatarT },
+            // 순수 조회다 — 제타는 상수 true, 마네킹은 fbx 상태를 읽기만 한다.
+            { "animation", avatar->IsAnimation() },
+            { "animationTime", avatar->GetAnimationTime() },
+            { "frameInfo", { frameInfo.first, frameInfo.second } },
+        };
+
+        // ★ 요청값의 메아리가 아니라 **우리가 실제로 실은 정점에서 잰 상자**다.
+        //   클라이언트가 "진짜 몸이 왔나"를 이 값 하나로 판정할 수 있고,
+        //   glTF 익스포트 산출물과 대조할 기준선이기도 하다(단위 cm).
+        if (avatarV > 0 && lo[0] <= hi[0])
+        {
+            a["bounds"] = json{
+                { "min", { lo[0], lo[1], lo[2] } },
+                { "max", { hi[0], hi[1], hi[2] } },
+            };
+        }
+
+        avatars.push_back(std::move(a));
+    }
+
+    return json{
+        { "avatars",        avatars },
+        { "topology",       includeTopology },
+        { "normals",        includeNormals },
+        { "totalVertices",  totalV },
+        { "totalTriangles", totalT },
+    };
+}
+
 const char* ModeName(ZestManager::AnimationMode m)
 {
     switch (m)
@@ -1905,6 +2275,21 @@ int RunProtocolLoop(ZestManager& manager)
             else if (op == "meshData")
             {
                 result = MeshData(manager, req.value("topology", false));
+            }
+            else if (op == "avatarMesh")
+            {
+                // 씬 없이 부르면 `avatars: []` 로 답할 수도 있지만, 그러면
+                // "아바타가 없는 씬"과 "씬이 없음"이 같은 응답이 된다.
+                if (!manager.IsLoadedZls())
+                {
+                    ok = false; error = "씬이 로드되지 않았습니다";
+                }
+                else
+                {
+                    result = AvatarMeshData(manager,
+                                            req.value("topology", false),
+                                            req.value("normals",  true));
+                }
             }
             else if (op == "export")
             {

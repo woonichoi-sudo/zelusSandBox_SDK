@@ -489,6 +489,27 @@ const buildMeshData: Build = (msg) => {
   return { payload: { topology: topology === true } };
 };
 
+/**
+ * `avatarMesh` — 불린 두 개만 통과시킨다.
+ *
+ * ⚠️ `normals` 의 기본값은 **true** 다(`topology` 와 반대). 안 보내면 워커가
+ *    법선을 싣는 쪽이 기본이므로, 여기서도 "없으면 true" 로 맞춘다 —
+ *    `=== true` 로 접으면 게이트웨이를 지나는 순간 기본값이 뒤집힌다.
+ */
+const buildAvatarMesh: Build = (msg) => {
+  const topology = msg['topology'];
+  if (topology !== undefined && typeof topology !== 'boolean') {
+    reject('topology는 불린이어야 합니다');
+  }
+
+  const normals = msg['normals'];
+  if (normals !== undefined && typeof normals !== 'boolean') {
+    reject('normals는 불린이어야 합니다');
+  }
+
+  return { payload: { topology: topology === true, normals: normals !== false } };
+};
+
 // ── 화이트리스트 ────────────────────────────────────────────
 
 /**
@@ -592,6 +613,25 @@ const OPS: Record<Op, OpRule> = {
   // 아니라 연결당 동시 요청 상한(maxInflight)이 이미 막는다. 프레임을 계속
   // 흘리는 경로는 이쪽이 아니라 subscribe(#8)다.
   meshData: { allow: true, build: buildMeshData },
+
+  // ── 아바타 메시 (AM-1) ────────────────────────────────────
+  //
+  // 읽기 전용이고 씬을 안 바꾼다. **이 테이블에서 가장 큰 응답이다** —
+  // `W_Bra top & Leggings.zls`(제타 아바타, 정점 28,564 · 파트 12) 실측:
+  //   topology:true  normals:true  → 1,947KB (106ms)
+  //   topology:true  normals:false → 1,501KB
+  //   topology:false normals:true  →   895KB
+  //   topology:false normals:false →   448KB (41ms)   ← 옷 한 프레임의 2.1배
+  // (같은 씬의 `meshData` topology:false 가 212KB.) 그래도
+  // `design2d` 와 같은 근거로 연타를 따로 막지 않는다: 워커가 stdin 을 순차
+  // 처리하고, 무한정 쌓이는 것은 연결당 동시 요청 상한(maxInflight)이 막는다.
+  //
+  // ★ **프레임 경로에 없다.** 부를 시점은 씬 로드 / 체형 변경 / 드레이프 /
+  //   애니메이션 중이고, 그 판단은 클라이언트가 한다. 게이트웨이가 여기서
+  //   주기를 정하려면 씬 상태를 따라다녀야 하는데 그건 세션이 하는 일이다.
+  //
+  // topology/normals 는 buildMeshData 와 같은 이유로 불린만 거른다.
+  avatarMesh: { allow: true, build: buildAvatarMesh },
 
   // frame 이벤트에 메시를 실으라고 워커에 켜는 스위치. **이벤트 중계의 유일한
   // 스위치가 이것이다** — 게이트웨이 쪽에 두 번째 스위치는 없다(frameEvent 주석).

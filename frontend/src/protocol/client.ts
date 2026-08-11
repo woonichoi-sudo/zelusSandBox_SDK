@@ -44,6 +44,7 @@ import {
   type ServerMessage,
   type AvatarBodyResult,
   type AvatarMeasurementTargets,
+  type AvatarMeshResult,
   type LoadDrapingResult,
   type SetAvatarBodyResult,
   type SetAvatarMeasurementsResult,
@@ -631,6 +632,26 @@ export class GatewayClient {
   /** `topology:true` 면 indices·uvs 까지. 프레임 간 고정이라 보통 한 번만 부른다 */
   meshData(topology = false): Promise<FrameMesh> {
     return this.request<FrameMesh>('meshData', { topology });
+  }
+
+  /**
+   * 아바타(사람 몸) 메시 (AM-1).
+   *
+   * ⚠️ **프레임마다 부르지 마라.** 스트리밍이 아니라 요청-응답이고, 실측
+   *    `topology:true, normals:true` 한 번이 1,947KB 다(같은 씬의 옷 한
+   *    프레임 212KB 의 9배). 형태만 갱신하면 448KB 까지 내려간다. 부를 시점:
+   *    씬 로드(`topology:true`) / 체형 변경 뒤 / `loadDraping` 뒤
+   *    (**포즈가 크게 바뀐다** — 실측 x 범위 ±61.3 → ±29.9cm. uuid·정점 수는
+   *    그대로였으므로 `topology:false` 로 충분했다) / 애니메이션 중.
+   *
+   * ★ 정점은 **월드 좌표**다. 옷과 달리 변환을 곱하면 안 된다.
+   *
+   * 애니메이션이 끝났는지는 `avatars[i].frameInfo` 로 판정한다
+   * (`cur + 1 >= total`). 워커가 `IsAnimationFinished()` 를 대신 불러 줄 수는
+   * 없다 — 그 함수는 읽는 순간 시뮬이 쓰는 플래그를 지운다.
+   */
+  avatarMesh(topology = false, normals = true): Promise<AvatarMeshResult> {
+    return this.request<AvatarMeshResult>('avatarMesh', { topology, normals });
   }
 
   /**
