@@ -1128,6 +1128,125 @@ json MeshInfo(ZestManager& manager, void* listener)
     };
 }
 
+// ── 텍스처 필드 덤프 (조사용, `textures:true` 일 때만) ──────────────
+//
+// 실시간 뷰는 흰 몸 + 단색 옷인데 스냅샷(glTF)에는 피부·눈·직물 무늬가 다
+// 나온다. 그 차이가 텍스처이고, **워커가 그 이미지에 어떻게 닿는지**를 아직
+// 모른다. `ztDesignMaterialData` 에 텍스처 자리가 9종 있다(ztDesignMaterial.h:60-84)
+// — 여기를 통째로 찍어 경로인지 원시 데이터인지 빈 칸인지 눈으로 본다.
+//
+// ⚠️ `isRawData == true` 면 그 std::string 들이 **경로가 아니라 이미지 바이트**다
+//    (헤더 주석: "if true, then all string textures contain raw data").
+//    통째로 실으면 응답이 수십 MB 가 되고, 게다가 바이너리라 nlohmann 이
+//    UTF-8 이 아닌 바이트를 dump 할 때 예외(type_error.316)를 던져 **응답
+//    자체가 사라진다.** 그래서 길이와 앞부분만 싣고, 앞부분도 출력 가능한
+//    ASCII 가 아니면 hex 로 바꾼다.
+//
+// 기본은 꺼져 있다. 켜는 쪽은 프로브뿐이고, 이 필드들이 무엇인지 정해지기
+// 전에는 실시간 응답에 얹을 이유가 없다.
+namespace
+{
+
+constexpr std::size_t kTexHeadChars = 200;   // 경로면 이 안에 다 들어온다
+constexpr std::size_t kTexHexBytes  = 32;    // 바이너리면 매직넘버만 보면 된다
+
+/** 텍스처 문자열 하나 — 길이 + (읽을 수 있으면) 앞부분, 아니면 hex. */
+json TextureStringJson(const std::string& s)
+{
+    json j{ { "len", s.size() } };
+    if (s.empty()) return j;
+
+    const std::size_t headLen = (std::min)(s.size(), kTexHeadChars);
+
+    bool printable = true;
+    for (std::size_t i = 0; i < headLen; ++i)
+    {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x20 || c > 0x7E) { printable = false; break; }
+    }
+
+    if (printable)
+    {
+        j["head"]      = s.substr(0, headLen);
+        j["truncated"] = (s.size() > headLen);
+    }
+    else
+    {
+        // 이미지 원시 데이터로 의심된다 — 앞 몇 바이트로 포맷을 알 수 있다
+        // (PNG 89 50 4E 47, JPEG FF D8 FF).
+        static const char* kHex = "0123456789ABCDEF";
+        std::string hex;
+        const std::size_t n = (std::min)(s.size(), kTexHexBytes);
+        hex.reserve(n * 3);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const unsigned char c = static_cast<unsigned char>(s[i]);
+            hex.push_back(kHex[c >> 4]);
+            hex.push_back(kHex[c & 0x0F]);
+            hex.push_back(' ');
+        }
+        j["binary"] = true;
+        j["hex"]    = hex;
+    }
+    return j;
+}
+
+/** UDIM 때문에 9종 모두 벡터다. 원소 수와 각 원소를 그대로 보인다. */
+json TextureVectorJson(const std::vector<std::string>& v)
+{
+    json items = json::array();
+    for (const std::string& s : v) items.push_back(TextureStringJson(s));
+    return items;
+}
+
+} // namespace
+
+/** 머티리얼의 텍스처 관련 필드 전부. 조사용이라 해석하지 않고 날것으로 싣는다. */
+json MaterialTextureJson(const ztDesignMaterialData& d)
+{
+    return json{
+        // ★ 이 다섯이 갈래를 가른다: isRawData 면 위 문자열이 이미지 바이트,
+        //   아니면 경로. isInMemory / isCustom 은 그 경로가 어느 뿌리에서
+        //   시작하는지(프리셋 / 커스텀 / 씬 안)를 가른다.
+        { "isRawData",          d.isRawData },
+        { "isInMemory",         d.isInMemory },
+        { "isCustom",           d.isCustom },
+        { "isZipperFabric",     d.isZipperFabric },
+        { "useCustomBaseColor", d.useCustomBaseColor },
+        { "flipTextures",       d.flipTextures },
+
+        // 직물의 물리 크기(cm). 텍스처를 UV 에 몇 번 반복할지가 여기서 나온다.
+        { "physicalWidth",  d.width },
+        { "physicalHeight", d.height },
+
+        { "vectors", {
+            { "basecolor",       TextureVectorJson(d.basecolorTexture) },
+            { "roughness",       TextureVectorJson(d.roughnessTexture) },
+            { "specular",        TextureVectorJson(d.specularTexture) },
+            { "metalness",       TextureVectorJson(d.metalnessTexture) },
+            { "normal",          TextureVectorJson(d.normalTexture) },
+            { "alpha",           TextureVectorJson(d.alphaTexture) },
+            { "displacement",    TextureVectorJson(d.displacementTexture) },
+            { "anisotropyAngle", TextureVectorJson(d.anisotropyAngleTexture) },
+            { "occlusion",       TextureVectorJson(d.occlusionTexture) },
+        } },
+
+        // USDZ 등에서 "이름만" 따로 두는 자리(헤더 주석). 벡터 쪽이 원시
+        // 데이터일 때 여기에 원래 파일명이 남아 있을 수 있다 — 갈래 C 의 실마리.
+        { "paths", {
+            { "basecolor",       TextureStringJson(d.basecolorTexturePath) },
+            { "roughness",       TextureStringJson(d.roughnessTexturePath) },
+            { "specular",        TextureStringJson(d.specularTexturePath) },
+            { "metalness",       TextureStringJson(d.metalnessTexturePath) },
+            { "normal",          TextureStringJson(d.normalTexturePath) },
+            { "alpha",           TextureStringJson(d.alphaTexturePath) },
+            { "displacement",    TextureStringJson(d.displacementTexturePath) },
+            { "anisotropyAngle", TextureStringJson(d.anisotropyAngleTexturePath) },
+            { "occlusion",       TextureStringJson(d.occlusionTexturePath) },
+        } },
+    };
+}
+
 // 토폴로지는 프레임 간 고정이므로 최초 1회만 보내면 된다.
 // 프레임마다 필요한 건 positions뿐이다.
 //
@@ -1137,7 +1256,7 @@ json MeshInfo(ZestManager& manager, void* listener)
 // meshData 응답과 구독 중 frame 이벤트의 mesh 필드가 **같은 함수**를 쓴다.
 // zsVector3 재포장(아래)이 두 곳에 복사되면 언젠가 갈라지고, 그때 어긋난
 // 쪽은 화면이 깨져야만 드러난다.
-json MeshData(ZestManager& manager, bool includeTopology)
+json MeshData(ZestManager& manager, bool includeTopology, bool includeTextures = false)
 {
     json patterns = json::array();
 
@@ -1416,6 +1535,9 @@ json MeshData(ZestManager& manager, bool includeTopology)
                 m["colorProfile"] =
                     (d.colorProfile == ztColorProfile::Linear) ? "linear" : "srgb";
 
+                // 조사용(`textures:true`). 옷의 직물 무늬가 어디 있는지 본다.
+                if (includeTextures) m["textures"] = MaterialTextureJson(d);
+
                 p["material"] = std::move(m);
             }
 
@@ -1570,9 +1692,9 @@ json MeshData(ZestManager& manager, bool includeTopology)
 //   머리가 덩어리로 나온다. 통로가 생기면 여기 붙일 자리다.
 
 /** 아바타 파트의 머티리얼. 옷 쪽(`MeshData`)과 같은 다섯 필드 + 색공간이다. */
-json AvatarMaterialJson(const ztDesignMaterialData& d)
+json AvatarMaterialJson(const ztDesignMaterialData& d, bool includeTextures = false)
 {
-    return json{
+    json j{
         { "assetUuid",    ztUuidSaver::Convert(d.assetUuid) },
         { "color",        { d.basecolor.x, d.basecolor.y, d.basecolor.z } },
         { "opacity",      d.alpha },
@@ -1582,6 +1704,12 @@ json AvatarMaterialJson(const ztDesignMaterialData& d)
         // 상수처럼 보여도 빼면 받는 쪽이 추측하게 된다.
         { "colorProfile", (d.colorProfile == ztColorProfile::Linear) ? "linear" : "srgb" },
     };
+
+    // 조사용(`textures:true`). 피부·눈·속눈썹이 스냅샷에서만 제 색으로 나오는
+    // 이유를 여기서 찾는다.
+    if (includeTextures) j["textures"] = MaterialTextureJson(d);
+
+    return j;
 }
 
 /** ztGlobalMutex 를 예외 경로에서도 반드시 놓는다. 이 op 은 try 블록 안이다. */
@@ -1593,7 +1721,8 @@ struct GlobalMutexGuard
     GlobalMutexGuard& operator=(const GlobalMutexGuard&) = delete;
 };
 
-json AvatarMeshData(ZestManager& manager, bool includeTopology, bool includeNormals)
+json AvatarMeshData(ZestManager& manager, bool includeTopology, bool includeNormals,
+                    bool includeTextures = false)
 {
     json avatars = json::array();
 
@@ -1751,12 +1880,13 @@ json AvatarMeshData(ZestManager& manager, bool includeTopology, bool includeNorm
                 if (zeta)
                 {
                     if (i < zetaMaterials.size())
-                        p["material"] = AvatarMaterialJson(zetaMaterials[i]);
+                        p["material"] = AvatarMaterialJson(zetaMaterials[i], includeTextures);
                 }
                 else if (mannequin)
                 {
                     p["material"] =
-                        AvatarMaterialJson(mannequin->GetMaterialData(static_cast<unsigned int>(i)));
+                        AvatarMaterialJson(mannequin->GetMaterialData(static_cast<unsigned int>(i)),
+                                           includeTextures);
                 }
             }
 
@@ -2274,7 +2404,8 @@ int RunProtocolLoop(ZestManager& manager)
             }
             else if (op == "meshData")
             {
-                result = MeshData(manager, req.value("topology", false));
+                result = MeshData(manager, req.value("topology", false),
+                                  req.value("textures", false));
             }
             else if (op == "avatarMesh")
             {
@@ -2288,7 +2419,8 @@ int RunProtocolLoop(ZestManager& manager)
                 {
                     result = AvatarMeshData(manager,
                                             req.value("topology", false),
-                                            req.value("normals",  true));
+                                            req.value("normals",  true),
+                                            req.value("textures", false));
                 }
             }
             else if (op == "export")
