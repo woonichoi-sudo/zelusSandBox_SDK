@@ -455,6 +455,29 @@ export interface AvatarPart {
    * "흰 몸" 과 "색을 모름" 을 구분할 수 있어야 한다.
    */
   material?: AvatarPartMaterial;
+
+  // ── 액세서리 파트만 갖는 필드 (몸 파트에는 아예 없다) ──────
+  //
+  // ★ `accessory` 가 **갈래를 가르는 필드다.** 몸 파트와 액세서리는 같은
+  //   `parts` 배열에 섞여 오고 포장도 완전히 같다 — 접근자만 다르다
+  //   (`GetRenderMeshs` vs `GetRenderAccessoryMeshes`). 구분이 필요하면
+  //   `accessory !== undefined` 로 본다.
+
+  /**
+   * 액세서리 종류. **숫자가 아니라 이름으로 온다** — enum 값은 엔진이
+   * 재배열하면 조용히 뜻이 바뀐다(옷·파라미터 쪽과 같은 판단이다).
+   *
+   * `ztAccessoryType` 5종 전부이고, 엔진이 새 종류를 더하면 `unknown` 이다.
+   */
+  accessory?: 'underwearTop' | 'underwearBottom' | 'sock' | 'shoes' | 'hair' | 'unknown';
+  /** 걸친 에셋의 파일 이름 (실측: `low_top_sneakers.obj`). 비어 있으면 `name` 이 종류 이름이 된다 */
+  assetName?: string;
+  /**
+   * 뒷면을 그려야 하는가. **우리 판단이 아니라 데스크톱의 설정을 옮긴 것이다**
+   * (Renderer3D.cpp:588 `enableTwoSided()`). 머리카락은 얇은 판이라 뒷면을
+   * 버리면 숱이 절반으로 보인다. 실측상 액세서리는 전부 `true` 다.
+   */
+  doubleSided?: boolean;
 }
 
 export interface AvatarMesh {
@@ -519,13 +542,20 @@ export interface AvatarMeshResult {
   /**
    * `joinInSimulation` 이 꺼진 아바타는 오지 않는다 — 데스크톱 3D 뷰와 같은 필터다.
    *
-   * ⚠️ **액세서리(머리카락 등)는 아직 안 온다.** 데스크톱과 glTF 익스포트에는
-   *    들어 있다(실측 씬의 glTF 에 `zeta_accessory12` 노드가 있다). 뺀 이유는
-   *    텍스처다 — 머리카락은 알파 컷아웃 이미지가 없으면 판때기로 보이는데,
-   *    이 프로토콜에 이미지를 실을 통로가 아직 없다.
+   * ★ **액세서리(머리카락·신발·양말·속옷)도 온다.** 몸 파트와 **같은 `parts`
+   *   배열에 섞여** 오고, `AvatarPart.accessory` 가 있는 것이 액세서리다.
+   *   한동안 일부러 뺐던 자리인데(텍스처를 실을 통로가 없어 머리카락이
+   *   판때기로 보였다) 아래 `textures` 표가 생기면서 붙였다.
    *
-   *    ⓘ 이제 통로는 생겼다(아래 `textures`). 다만 액세서리를 **싣는** 경로가
-   *      `AvatarMeshData` 에 아직 없다 — 그건 별개의 일이다.
+   * ⚠️ **파트 인덱스가 몸 뒤로 연속하지 않는다.** 비활성 슬롯도 번호를 먹기
+   *    때문이다 — 실측: 몸 12파트(0–11) 다음의 신발이 **29번**이다(그 사이
+   *    17칸이 빈 슬롯). 인덱스로 갈래를 나누지 말고 `accessory` 필드를 볼 것.
+   *
+   * ⚠️ **액세서리에 텍스처가 붙는 것은 머리카락뿐이다.** 신발·양말의
+   *    `image->path` 에는 엔진이 안 쓰는 기본값(`Default_Base_Color.png`)이
+   *    꽂혀 있고 **그 파일은 설치본에 없다.** 데스크톱 렌더러도 Hair 일 때만
+   *    이미지를 만진다 — 익스포터는 타입을 안 보고 거는데 그쪽이 버그다
+   *    (1회성 CLI 라 아무도 안 밟았을 뿐이다).
    */
   avatars: AvatarMesh[];
   /** 요청한 값이 그대로 온다. 받은 응답에 indices 가 있는지 판정하는 데 쓴다 */

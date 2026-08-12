@@ -4760,6 +4760,100 @@ async function main(): Promise<void> {
         logs.length === before,
         `${before} → ${logs.length}`,
       );
+
+      // ── ★★ 거절의 두 갈래 — 무엇을 기억하고 무엇을 다시 물어야 하는가 ──
+      //
+      // 2026-08-12 에 실제로 밟은 사고다. **거절을 전부 캐시했는데** 사유의
+      // 절반(`파일이 없습니다`·`빈 파일`)은 그 순간의 디스크 상태였다. 씬을
+      // 여는 동안 엔진이 직물을 다시 푸는 창에 등록이 걸리면 4칸이 떨어졌고,
+      // 그 뒤로는 **파일이 멀쩡해져도 이 프로세스가 사는 내내 거절**이라
+      // 게이트웨이 재시작 말고는 복구가 없었다.
+      //
+      // 화면에서는 **옷 색이 통째로 사라진 것**으로 보였다 — 예외도 오류도
+      // 없이. 아래 두 단언이 그 회귀를 막는 전부다.
+      {
+        const l2: string[] = [];
+        const s2 = new TextureStore({ roots: [root], onLog: (x) => l2.push(x) });
+
+        // ① 없는 파일 → 나중에 생긴다 (엔진이 아직 안 풀었을 뿐이었다)
+        const later = path.join(root, 'later.png');
+        check('아직 없는 파일은 거절된다', await s2.register(later) === null, '');
+        await writeFile(later, 'NOWEXISTS', 'utf8');
+        const revived = await s2.register(later);
+        check(
+          '★★★ 파일이 생기면 등록된다 — 상태 거절을 기억하지 않는다 (기억하면 옷 색이 영영 안 돌아온다)',
+          revived !== null && revived.bytes === 9,
+          revived === null ? '거절이 캐시됐다 (회귀)' : JSON.stringify(revived),
+        );
+
+        // ② 0바이트 → 다 써진다. **가장 흔한 일시적 실패다** — 엔진이 파일을
+        //    만들고 아직 다 쓰지 않았으면 그 순간엔 0바이트로 보인다.
+        const half = path.join(root, 'half.png');
+        await writeFile(half, '', 'utf8');
+        check('빈 파일은 거절된다', await s2.register(half) === null, '');
+        await writeFile(half, 'FULLYWRITTEN', 'utf8');
+        const filled = await s2.register(half);
+        check(
+          '★★★ 다 써지면 등록된다 — `빈 파일` 도 상태다 (엔진이 쓰는 중이었을 뿐이다)',
+          filled !== null && filled.bytes === 12,
+          filled === null ? '거절이 캐시됐다 (회귀)' : JSON.stringify(filled),
+        );
+
+        // ③ 대조군. **경로 거절은 여전히 기억해야 한다.** 이것까지 풀어 버리면
+        //    뿌리 설정이 틀렸을 때 체형을 만질 때마다 같은 검사를 다시 돈다 —
+        //    고치려던 것과 반대 방향으로 넘어간 것이다.
+        const outsideNew = path.join(evil, 'appears.png');
+        check('뿌리 밖은 거절된다', await s2.register(outsideNew) === null, '');
+        await writeFile(outsideNew, 'REALFILE', 'utf8');
+        check(
+          '★★ 그런데 뿌리 밖은 파일이 생겨도 계속 거절이다 (경로 거절은 기억한다 — 캐시를 통째로 버린 것이 아니다)',
+          await s2.register(outsideNew) === null,
+          '',
+        );
+        // ⚠️ **여기서 못 보는 것을 적어 둔다.** 위 단언이 재는 것은 *답*이지
+        //    *캐시*가 아니다 — `#rejected` 를 통째로 없애도 경로 검사가 매번
+        //    다시 돌아 같은 `null` 이 나오므로 초록이다. 캐시가 하는 일은
+        //    "같은 답을 싸게 준다" 뿐이라 동작으로 관측되지 않는다. 그 갈래가
+        //    사라지는 회귀는 성능 문제이고, 잘못된 쪽으로 넘어가는 회귀(=상태를
+        //    기억한다)는 위 ①② 가 잡는다.
+        note('단언 밖', '경로 캐시의 단축 자체는 동작으로 안 보인다 — 답이 같아서다');
+
+        // ④ 검사를 매번 하게 만든 대가는 **로그 도배**다. 그래서 검사는 매번,
+        //    경고는 한 번만 — `#rejected` 가 겸하던 두 역할 중 뒤엣것만 뗐다.
+        //    ⚠️ **줄 수를 세지 말고 늘어난 양을 재라.** 경고 문구에는 경로가
+        //       안 들어간다(`[warn] 텍스처를 거절했습니다 (파일이 없습니다)`) —
+        //       사유로 거르면 위 ①의 `later.png` 경고까지 함께 세어진다.
+        //       처음에 그렇게 짰다가 2줄이 나왔다.
+        const missing = path.join(root, 'ghost.png');
+        const n0 = l2.length;
+        for (let i = 0; i < 5; i++) await s2.register(missing);
+        check(
+          '★★ 없는 파일을 5번 물어도 경고는 한 줄만 는다 (검사는 매번, 경고는 한 번)',
+          l2.length - n0 === 1,
+          `${l2.length - n0}줄 (${n0} → ${l2.length})`,
+        );
+
+        // ⑤ 사유가 바뀌면 그건 **새 사실**이라 한 번은 보여야 한다. 경고 키에
+        //    사유를 붙인 이유가 이것이다. 로그를 따로 받는 이유는 위와 같다.
+        const l3: string[] = [];
+        const small2 = new TextureStore({ roots: [root], maxBytes: 8, onLog: (x) => l3.push(x) });
+        const grow = path.join(root, 'grow.png');
+        await writeFile(grow, '', 'utf8');
+        await small2.register(grow);
+        await small2.register(grow);
+        check(
+          '같은 경로·같은 사유는 몇 번을 물어도 한 줄이다',
+          l3.length === 1 && (l3[0] ?? '').includes('빈 파일'),
+          `${l3.length}줄: ${l3.join(' | ')}`,
+        );
+        await writeFile(grow, 'x'.repeat(64), 'utf8');
+        await small2.register(grow);
+        check(
+          '★ 같은 경로라도 사유가 바뀌면 한 번 더 경고한다 (빈 파일 → 상한 초과)',
+          l3.length === 2 && (l3[1] ?? '').includes('상한 초과'),
+          `${l3.length}줄: ${l3.join(' | ')}`,
+        );
+      }
       // ⚠️ 반대로 **성공은 캐시하면 안 된다.** 엔진이 씬을 열 때마다 직물을
       //    다시 풀어서 크기가 달라질 수 있고, 옛 ETag 를 들고 있으면 낡은
       //    이미지를 계속 내준다.

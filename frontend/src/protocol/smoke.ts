@@ -82,6 +82,10 @@ import {
   isSideTabId,
   SIDE_TABS,
   SideTabsPanel,
+  // 좁은 창의 서랍 (§17). 판단만 여기서 오고 그리기는 `ui/` 에서 온다
+  narrowQuery,
+  NARROW_MAX_PX,
+  SideDrawerPanel,
   // I-1 다국어. 배럴로 가져오는 것은 의도적이다 — `panels/index.ts` 의 재export
   // 가 빠지면 `ui/*` 가 사전에 못 닿는데, 그 줄도 같이 지나야 한다.
   DEFAULT_LANG,
@@ -113,7 +117,7 @@ import {
 // L-3c 는 판단(`panels/sideTabs.ts`)과 그리기(`ui/sideTabs.ts`)가 갈려 있고,
 // **둘 다** 여기서 본다. 배럴로 가져오는 것은 의도적이다 — Builder 가 이번에
 // `ui/index.ts` 의 재export 를 건드렸으므로 그 줄도 같이 지난다.
-import { SideTabs } from '../ui/index.ts';
+import { SideDrawer, SideTabs } from '../ui/index.ts';
 // ★ #15-b 부터는 **제품의 `apply2d` 를 그대로 쓴다.** 15-a 때는 스모크가 자기
 //   사본을 들고 열벡터 규약을 못박았는데, 그러면 사본만 지켜지고 제품이 갈라져도
 //   초록이다. 규약을 못박는 절(§8-12 ⑤)이 제품 함수를 부르게 두면 그 틈이 닫힌다.
@@ -8399,6 +8403,8 @@ class FakeEl {
   id = '';
   type = '';
   textContent = '';
+  /** §17-2 가 쓴다 — 서랍 버튼은 툴팁도 언어를 따라야 한다 */
+  title = '';
   hidden = false;
   tabIndex = 0;
   /** 스텁 전용: 이 상자가 보일 때 차지하는 높이 */
@@ -8442,6 +8448,16 @@ class FakeEl {
   }
   getAttribute(n: string): string | null {
     return this.attrs.get(n) ?? null;
+  }
+  /** `inert` 처럼 값 없이 있고 없고만 뜻이 있는 속성 (§17-2) */
+  toggleAttribute(n: string, force?: boolean): boolean {
+    const on = force ?? !this.attrs.has(n);
+    if (on) this.attrs.set(n, '');
+    else this.attrs.delete(n);
+    return on;
+  }
+  hasAttribute(n: string): boolean {
+    return this.attrs.has(n);
   }
   append(...kids: FakeEl[]): void {
     this.children.push(...kids);
@@ -8902,6 +8918,311 @@ function fakeDesign2DShifted(dx: number): Parameters<Design2DLayer['build']>[0] 
       curves: st.curves.map((c) => ({ ...c, cp: shift(c.cp), pts: shift(c.pts) })),
     })),
   };
+}
+
+// ─────────────────────────────────────────────────────────────
+// §17. 좁은 창의 서랍 (panels/sideDrawer.ts · ui/sideDrawer.ts)
+//
+// 이 단위가 조용히 깨지는 방식은 **상태가 남는 것**이다. 서랍을 열어 둔 채
+// 창을 넓히면 칸이 제자리로 돌아오는데 `#open` 이 참으로 남고, 다음에 창을
+// 다시 좁히는 순간 **아무도 누르지 않은 서랍이 열린 채로** 나타난다. 예외도
+// 경고도 없이 화면만 이상하다 — `setNarrow` 가 모드를 바꿀 때 닫는 이유다.
+//
+// ⚠️ **문턱(899px)이 TS 상수 한 곳에만 있다.** CSS 에 미디어 쿼리를 두지 않고
+//    `main.ts` 가 `matchMedia(narrowQuery())` 를 듣고 `<body>` 에 표식을 건다.
+//    두 곳에 적으면 한쪽만 고치는 날 "버튼은 있는데 칸이 그대로" 가 된다 —
+//    §17-1 이 질의 문자열과 상수가 같은 숫자를 말하는지 본다.
+// ─────────────────────────────────────────────────────────────
+
+function sectionSideDrawer(): void {
+  section('§17-1. 좁은 창의 서랍 — 판단 (panels/sideDrawer.ts)');
+
+  // ── ① 첫 상태 ─────────────────────────────────────────────
+  {
+    const p = new SideDrawerPanel();
+    const v = p.view;
+    check(
+      '기본은 고정(docked) — 내용은 보이고 여닫기 버튼은 없다',
+      p.mode === 'docked' && v.open && !v.toggleVisible && !v.expanded && !p.overlaying,
+      JSON.stringify({ mode: v.mode, open: v.open, toggle: v.toggleVisible }),
+    );
+  }
+
+  // ── ② 문턱이 한 곳뿐이다 ──────────────────────────────────
+  //
+  // ★ 이 단언이 CSS 와 TS 가 갈라지는 것을 막는 유일한 자리다. 질의 문자열을
+  //   손으로 적어 두면 상수를 고쳐도 질의가 안 따라오고, 그때 화면은 "버튼은
+  //   나오는데 칸은 그대로" 가 된다.
+  check(
+    '★★ `narrowQuery()` 가 `NARROW_MAX_PX` 를 그대로 쓴다 (문턱의 주인이 하나다)',
+    narrowQuery() === `(max-width: ${NARROW_MAX_PX}px)`,
+    `${narrowQuery()} · 상수 ${NARROW_MAX_PX}`,
+  );
+  check(
+    '문턱이 3분할 하한(320 + 280×2 = 880)보다 크고 상식적인 범위다',
+    Number.isInteger(NARROW_MAX_PX) && NARROW_MAX_PX >= 880 && NARROW_MAX_PX < 1200,
+    String(NARROW_MAX_PX),
+  );
+
+  // ── ③ 모드 전환 ───────────────────────────────────────────
+  {
+    const p = new SideDrawerPanel();
+    check(
+      '`setNarrow` 는 실제로 바뀔 때만 참을 준다 (같은 값을 다시 줘도 다시 안 그린다)',
+      p.setNarrow(true) && !p.setNarrow(true) && p.setNarrow(false) && !p.setNarrow(false),
+      '',
+    );
+  }
+
+  // ★★ 이 단위에서 가장 조용한 결함이다. 둘 다 "사용자가 시킨 적 없는 일" 이
+  //    화면에 나타나는 모양이라 예외도 로그도 안 남는다.
+  {
+    const p = new SideDrawerPanel();
+    p.setNarrow(true);
+    p.open();
+    check('서랍을 열면 화면을 덮는다', p.overlaying && p.view.expanded, '');
+    p.setNarrow(false);
+    check(
+      '★★ 열어 둔 채 창을 넓히면 서랍이 닫힌다 (안 닫으면 다음에 좁힐 때 저절로 열린다)',
+      !p.overlaying && p.view.open && !p.view.toggleVisible,
+      JSON.stringify(p.view),
+    );
+    p.setNarrow(true);
+    check(
+      '★★ 그래서 다시 좁혀도 닫힌 채로 나타난다',
+      !p.overlaying && !p.view.open && !p.view.expanded,
+      JSON.stringify(p.view),
+    );
+  }
+
+  // ── ④ 고정 모드에서는 아무 일도 하지 않는다 ───────────────
+  //
+  // 던지지 않는 것이 요점이다 — 버튼이 안 보이는 상태에서 Escape 가 들어오는
+  // 경로가 있고, 그때 배선이 죽는 것보다 무시하는 편이 낫다.
+  {
+    const p = new SideDrawerPanel();
+    check(
+      '★ 고정 모드에서 toggle·open·close 가 전부 거짓이고 던지지 않는다',
+      !p.toggle() && !p.open() && !p.close() && p.mode === 'docked' && !p.overlaying,
+      '',
+    );
+    check(
+      '★ 그래도 `view.open` 은 참이다 (넓은 창에는 접는 개념이 없다 — 그리는 쪽이 갈래를 안 나눈다)',
+      p.view.open,
+      '',
+    );
+  }
+
+  // ── ⑤ 서랍 모드의 여닫기 ──────────────────────────────────
+  {
+    const p = new SideDrawerPanel();
+    p.setNarrow(true);
+    check('처음엔 닫혀 있다 (좁혔다고 설정 칸이 뷰포트를 덮지 않는다)', !p.view.open && !p.overlaying, '');
+    check('toggle 로 열린다', p.toggle() && p.overlaying, '');
+    check('이미 열렸으면 open 은 거짓', !p.open() && p.overlaying, '');
+    check('close 로 닫힌다', p.close() && !p.overlaying, '');
+    check('이미 닫혔으면 close 는 거짓', !p.close(), '');
+  }
+
+  // ── ⑥ 버튼 글자 (I-1 과 만나는 자리) ──────────────────────
+  //
+  // ★★ 라벨이 **함수인 것이 배선이다.** 상수로 두면 모듈 로드 시점의 언어로
+  //    굳어 이 버튼 하나만 한국어로 남는다 — 사전이 아무리 맞아도 안 잡히는
+  //    종류라 §16 이 못 보는 자리다.
+  {
+    const before = getLang();
+    try {
+      const p = new SideDrawerPanel();
+      p.setNarrow(true);
+      setLang('ko', null);
+      const koOpen = p.view.toggleLabel;
+      p.open();
+      const koClose = p.view.toggleLabel;
+      check(
+        '버튼 글자가 여는 동작인지 닫는 동작인지를 말한다',
+        koOpen === MESSAGES.ko['side.drawer.open'] && koClose === MESSAGES.ko['side.drawer.close']
+        && koOpen !== koClose,
+        `닫힘 '${koOpen}' → 열림 '${koClose}'`,
+      );
+      setLang('en', null);
+      check(
+        '★★ 언어를 바꾸면 버튼 글자가 따라온다 (라벨이 상수면 여기서 굳는다)',
+        p.view.toggleLabel === MESSAGES.en['side.drawer.close'] && p.view.toggleLabel !== koClose,
+        `${koClose} → ${p.view.toggleLabel}`,
+      );
+    } finally {
+      setLang(before, null);
+    }
+  }
+}
+
+/**
+ * 서랍용 가짜 DOM. `withFakeDom` 과 갈라 둔 이유는 필요한 것이 다르기 때문이다 —
+ * 여기서는 `document.addEventListener('keydown')` 을 잡아 Escape 를 쏴야 한다.
+ */
+function withDrawerDom<T>(
+  fn: (dom: { body: FakeEl; panel: FakeEl; bar: FakeEl; esc: () => void; key: (k: string) => void }) => T,
+): T {
+  const body = new FakeEl('body');
+  const panel = new FakeEl('div');
+  panel.id = 'sidePanel';
+  const bar = new FakeEl('div');
+  const keydown: Array<(e: { key: string }) => void> = [];
+
+  const g = globalThis as unknown as Record<string, unknown>;
+  const had = 'document' in g;
+  const prev = g['document'];
+  g['document'] = {
+    createElement: (tag: string): FakeEl => new FakeEl(tag),
+    addEventListener: (type: string, h: (e: { key: string }) => void): void => {
+      if (type === 'keydown') keydown.push(h);
+    },
+  };
+  const key = (k: string): void => {
+    for (const h of [...keydown]) h({ key: k });
+  };
+  try {
+    return fn({ body, panel, bar, esc: () => key('Escape'), key });
+  } finally {
+    if (had) g['document'] = prev;
+    else delete g['document'];
+  }
+}
+
+function sectionSideDrawerDom(): void {
+  section('§17-2. 좁은 창의 서랍 — 표식·버튼·Escape (ui/sideDrawer.ts)');
+
+  withDrawerDom((dom) => {
+    const seen: boolean[] = [];
+    const state = new SideDrawerPanel();
+    const drawer = new SideDrawer({
+      body: dom.body as unknown as HTMLElement,
+      panel: dom.panel as unknown as HTMLElement,
+      bar: dom.bar as unknown as HTMLElement,
+      state,
+      onChange: (open) => seen.push(open),
+    });
+
+    const btn = dom.bar.children[0];
+    check(
+      '여닫기 버튼이 상단 바에 붙고 칸을 가리킨다',
+      dom.bar.children.length === 1 && btn?.id === 'sideToggle'
+      && btn.getAttribute('aria-controls') === 'sidePanel' && btn.type === 'button',
+      `${btn?.id ?? '없음'} → ${btn?.getAttribute('aria-controls') ?? '없음'}`,
+    );
+
+    // ── ① 고정 모드 ────────────────────────────────────────
+    check(
+      '★ 고정 모드에서는 버튼이 숨는다 (넓은 창에 여닫기가 없다)',
+      btn?.hidden === true,
+      '',
+    );
+    check(
+      '★ 표식이 둘 다 없고 칸은 읽는 기계에도 열려 있다',
+      !dom.body.classList.contains('narrow') && !dom.body.classList.contains('sideOpen')
+      && dom.panel.getAttribute('aria-hidden') === 'false' && !dom.panel.hasAttribute('inert'),
+      `body='${dom.body.className}' aria-hidden=${dom.panel.getAttribute('aria-hidden') ?? ''}`,
+    );
+
+    // ── ② 좁아진다 ─────────────────────────────────────────
+    drawer.setNarrow(true);
+    check(
+      '★★ 좁아지면 `narrow` 표식이 걸리고 버튼이 나온다 (CSS 가 보는 유일한 신호다)',
+      dom.body.classList.contains('narrow') && btn?.hidden === false,
+      `body='${dom.body.className}'`,
+    );
+    check(
+      '★★ 닫힌 칸은 `aria-hidden` + `inert` 다 (안 보이는데 Tab 이 훑으면 안 된다)',
+      dom.panel.getAttribute('aria-hidden') === 'true' && dom.panel.hasAttribute('inert'),
+      `aria-hidden=${dom.panel.getAttribute('aria-hidden') ?? ''} inert=${String(dom.panel.hasAttribute('inert'))}`,
+    );
+    // ★ `hidden` 으로 지우면 안쪽 패널이 크기 0 이 되고, 다시 열 때 sideTabs 가
+    //   기억해 둔 스크롤 위치가 0 으로 잘려 들어간다 (ui/sideTabs.ts 의 함정).
+    check(
+      '★★ 칸을 `hidden` 으로 지우지 않는다 (지우면 다시 열 때 스크롤 위치가 0 으로 잘린다)',
+      dom.panel.hidden === false,
+      `hidden=${String(dom.panel.hidden)}`,
+    );
+    check(
+      '모드만 바뀐 것으로는 `onChange` 가 안 불린다 (열고 닫은 것이 아니다)',
+      seen.length === 0,
+      `${seen.length}회`,
+    );
+
+    // ── ③ 버튼으로 연다 ────────────────────────────────────
+    btn?.click();
+    check(
+      '★ 버튼을 누르면 열리고 `sideOpen` 표식과 `aria-expanded` 가 함께 선다',
+      dom.body.classList.contains('sideOpen') && btn?.getAttribute('aria-expanded') === 'true'
+      && dom.panel.getAttribute('aria-hidden') === 'false' && !dom.panel.hasAttribute('inert'),
+      `body='${dom.body.className}' expanded=${btn?.getAttribute('aria-expanded') ?? ''}`,
+    );
+    check('열림이 `onChange(true)` 로 한 번 나간다', seen.join(',') === 'true', seen.join(','));
+
+    // ── ④ Escape ───────────────────────────────────────────
+    seen.length = 0;
+    dom.key('a');
+    check('★ 다른 키는 서랍을 안 닫는다', dom.body.classList.contains('sideOpen') && seen.length === 0, '');
+    dom.esc();
+    check(
+      '★★ Escape 가 서랍을 닫는다 (닫는 길이 버튼 말고도 있다)',
+      !dom.body.classList.contains('sideOpen') && btn?.getAttribute('aria-expanded') === 'false'
+      && dom.panel.hasAttribute('inert'),
+      `body='${dom.body.className}'`,
+    );
+    check('닫힘이 `onChange(false)` 로 한 번 나간다', seen.join(',') === 'false', seen.join(','));
+
+    // 이미 닫혀 있으면 아무 일도 안 한다 — 안 그러면 Escape 를 누를 때마다
+    // 뷰포트 크기 갱신이 헛돌고, 3D 칸이 이유 없이 다시 그려진다.
+    seen.length = 0;
+    dom.esc();
+    check('★ 닫힌 서랍에 Escape 를 다시 눌러도 아무 일도 없다', seen.length === 0, `${seen.length}회`);
+
+    // ── ⑤ 열어 둔 채 넓힌다 ────────────────────────────────
+    //
+    // ★★ §17-1 ③ 이 판단 쪽에서 본 것을 **화면 쪽에서도** 못박는다. 표식이
+    //    남으면 CSS 는 여전히 서랍으로 그린다 — 판단만 맞고 화면이 틀린다.
+    btn?.click();
+    check('다시 연다', dom.body.classList.contains('sideOpen'), '');
+    seen.length = 0;
+    drawer.setNarrow(false);
+    check(
+      '★★ 넓히면 표식이 둘 다 걷힌다 (`sideOpen` 이 남으면 넓은 창이 서랍처럼 그려진다)',
+      !dom.body.classList.contains('narrow') && !dom.body.classList.contains('sideOpen')
+      && btn?.hidden === true && dom.panel.getAttribute('aria-hidden') === 'false'
+      && !dom.panel.hasAttribute('inert'),
+      `body='${dom.body.className}'`,
+    );
+
+    // ── ⑥ 고정 모드의 Escape ───────────────────────────────
+    seen.length = 0;
+    dom.esc();
+    check(
+      '★ 고정 모드에서 Escape 는 아무 일도 안 한다 (칸을 없애 버리면 안 된다)',
+      dom.panel.getAttribute('aria-hidden') === 'false' && seen.length === 0
+      && !dom.body.classList.contains('narrow'),
+      `aria-hidden=${dom.panel.getAttribute('aria-hidden') ?? ''}`,
+    );
+
+    // ── ⑦ 툴팁도 언어를 따른다 (I-1) ───────────────────────
+    const before = getLang();
+    try {
+      setLang('ko', null);
+      drawer.render();
+      const ko = btn?.title ?? '';
+      setLang('en', null);
+      drawer.render();
+      check(
+        '★ 버튼 툴팁이 다시 쓰인다 (생성자에서 한 번 찍으면 언어를 바꿔도 안 바뀐다)',
+        ko === MESSAGES.ko['side.drawer.title'] && btn?.title === MESSAGES.en['side.drawer.title']
+        && ko !== btn?.title,
+        `'${ko}' → '${btn?.title ?? ''}'`,
+      );
+    } finally {
+      setLang(before, null);
+      drawer.render();
+    }
+  });
 }
 
 async function sectionRestageSplit(): Promise<void> {
@@ -9869,6 +10190,10 @@ async function main(): Promise<void> {
   // 그리기(§13-2)뿐이라 즉시 끝난다.
   sectionSideTabs();
   sectionSideTabsDom();
+  // 좁은 창의 서랍. 같은 층위라 탭 바로 뒤에 둔다 — 판단(§17-1)과 스텁 DOM
+  // 위의 그리기(§17-2)뿐이라 즉시 끝난다.
+  sectionSideDrawer();
+  sectionSideDrawerDom();
   // D2-e 재단 도면의 표시 스위치. DOM 도 워커도 안 쓴다 — 깨지면 조용한
   // 두 가지(접두사 우선순위 · 재로드 후 상태 유지)만 좁게 본다.
   sectionDesignLayers();

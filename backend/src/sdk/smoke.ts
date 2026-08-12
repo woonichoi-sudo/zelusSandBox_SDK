@@ -11,7 +11,9 @@ import { createReadStream, existsSync, readdirSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import { SessionPool } from './pool.ts';
-import type { MeshDataResult, PatternData, PatternTransform2D } from './protocol.ts';
+import type {
+  AvatarMeshResult, MeshDataResult, PatternData, PatternTransform2D,
+} from './protocol.ts';
 import { decodePatterns, Session } from './session.ts';
 import { Worker } from './worker.ts';
 
@@ -35,6 +37,46 @@ function note(label: string, detail: string): void {
 
 function ms(t: number): string {
   return `${Math.round(t)}ms`;
+}
+
+/** §5.11 이 뒤진 씬 수. 건너뛸 때 **무엇을 안 봤는지** 화면에 남기려고 센다 */
+let accessoryScenesTried = 0;
+
+/**
+ * 액세서리를 걸친 아바타가 있는 씬을 찾는다 (§5.11).
+ *
+ * `findRotatedScene` · `findMultiColorScene` 과 같은 자리다 — 저장소에 없는
+ * 사용자 데이터(`backend/data/` 는 .gitignore)라 **있으면 태우고 없으면 넘어간다.**
+ *
+ * ⚠️ 씬 하나가 100~140MB 라 로드가 싸지 않다. 그래서 **첫 히트에서 멈추고**,
+ *    `SCENE_DIRS` 의 순서가 곧 비용이다(`incoming` 이 앞이라 사용자 씬이 먼저
+ *    걸린다). 같은 파일이 두 디렉토리에 중복돼 있어도 첫 번째에서 끝난다.
+ */
+async function findAccessoryScene(
+  session: Session,
+): Promise<{ path: string; result: AvatarMeshResult } | null> {
+  const seen = new Set<string>();
+  for (const dir of SCENE_DIRS) {
+    if (!existsSync(dir)) continue;
+    for (const name of readdirSync(dir)) {
+      if (!name.toLowerCase().endsWith('.zls')) continue;
+      const p = resolve(dir, name);
+      // 크기가 같은 파일은 같은 씬일 가능성이 높다 — 138MB 를 두 번 열지 않는다.
+      const key = String(statSync(p).size);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      accessoryScenesTried += 1;
+      if (session.loadedPath !== p) {
+        await session.clear();
+        await session.load(p);
+      }
+      const result = await session.avatarMesh(true, false);
+      if (result.avatars.some((a) => a.parts.some((q) => q.accessory !== undefined))) {
+        return { path: p, result };
+      }
+    }
+  }
+  return null;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1330,6 +1372,155 @@ async function main(): Promise<void> {
           note(
             '§5.10 실측 색',
             [...tally.entries()].map(([c, n]) => `[${c}]×${n}`).join(' '),
+          );
+        }
+      }
+    }
+
+    // ── 5.11 아바타 액세서리 (신발·머리카락) ───────────────
+    //
+    // 액세서리는 몸 파트와 **같은 `parts` 배열에 섞여** 온다. 접근자만 다르고
+    // (`GetRenderMeshs` vs `GetRenderAccessoryMeshes`) 포장은 완전히 같아서,
+    // 여기서 재는 것은 "따로 왔는가" 가 아니라 **갈래를 가르는 필드가
+    // 제대로 서 있는가**다.
+    //
+    // ★★ 이 단위에서 가장 조용한 결함은 **신발에 텍스처가 붙는 것**이다.
+    //    엔진이 안 쓰는 슬롯에 기본값(`Default_Base_Color.png`)을 꽂아 두는데
+    //    그 파일이 설치본에 없다. 붙여 보내면 게이트웨이가 "파일이 없습니다"
+    //    로 거절하고 화면에 `⚠ 거절 1칸` 이 뜬다 — 기능은 멀쩡한데 경고만
+    //    나는, 제일 나쁜 종류의 잡음이다. 실제로 밟았고 처음엔 엔진이 준
+    //    값인 줄 알았다.
+    {
+      // ── 대조군. **항상 돈다** ─────────────────────────────
+      //
+      // sample.zls 는 zeta 인데 액세서리가 0개다 — 슬롯은 있고 아무것도 안
+      // 걸친 상태라 `IsEnableMesh()` 가 전부 거른다. 즉 이 씬은 "액세서리
+      // 경로가 돌면서 아무것도 안 싣는" 것을 보는 자리다. 그 경로가 통째로
+      // 사라져도 아래 조건부 절은 씬이 없으면 안 도는데, 이건 언제나 돈다.
+      if (session.loadedPath !== ZLS) {
+        await session.clear();
+        await session.load(ZLS);
+      }
+      const base = await session.avatarMesh(true, false);
+      const baseParts = base.avatars.flatMap((a) => a.parts);
+      const baseTextures = base.textures?.length ?? 0;
+
+      check(
+        '전제: sample.zls 의 아바타가 zeta 다 (액세서리 경로가 도는 씬이다)',
+        base.avatars.length === 1 && base.avatars[0]?.subType === 'zeta' && baseParts.length > 0,
+        `${base.avatars.length}개 · subType=${base.avatars[0]?.subType ?? '없음'} · 파트 ${baseParts.length}`,
+      );
+      // ★ 갈래를 가르는 필드가 몸 파트로 새면, 화면이 몸을 액세서리로 취급해
+      //   양면 렌더링을 걸거나 종류별 처리를 태운다. 조용히 이상해지는 쪽이다.
+      const leaked = baseParts.filter(
+        (p) => p.accessory !== undefined || p.assetName !== undefined || p.doubleSided !== undefined,
+      );
+      check(
+        '★★ 몸 파트는 액세서리 필드를 하나도 갖지 않는다 (`accessory` 가 갈래를 가른다)',
+        leaked.length === 0,
+        leaked.length === 0 ? `몸 ${baseParts.length}파트 전부 깨끗하다` : leaked.map((p) => p.name).join(', '),
+      );
+      check(
+        '이 씬은 액세서리가 0개다 (슬롯은 있으나 아무것도 안 걸쳤다 — IsEnableMesh 가 거른다)',
+        baseParts.every((p) => p.accessory === undefined),
+        `파트 ${baseParts.length}개`,
+      );
+
+      // ── 실제 액세서리가 있는 씬 (있으면) ──────────────────
+      const found = await findAccessoryScene(session);
+      if (!found) {
+        note(
+          '§5.11 생략',
+          '액세서리가 있는 씬을 찾지 못했다 — 종류 이름 · 텍스처 규칙 · 인덱스 · 양면은 이번 실행에서 미검증'
+          + ` (뒤진 씬 ${accessoryScenesTried}개)`,
+        );
+      } else {
+        const file = found.path.split(/[\\/]/).pop() ?? found.path;
+        const parts = found.result.avatars.flatMap((a) => a.parts);
+        const acc = parts.filter((p) => p.accessory !== undefined);
+        const body = parts.filter((p) => p.accessory === undefined);
+        note('§5.11 씬', `${file} — 몸 ${body.length}파트 · 액세서리 ${acc.length}개 [${acc.map((p) => p.accessory).join(', ')}]`);
+
+        // 전제. 0개면 아래 단언이 전부 공짜로 통과한다.
+        check('★ 전제: 이 씬에 액세서리가 실제로 있다 (아래 단언에 이빨이 있다)', acc.length > 0, `${acc.length}개`);
+
+        const NAMES = ['underwearTop', 'underwearBottom', 'sock', 'shoes', 'hair', 'unknown'];
+        check(
+          '★★ 종류가 엔진의 이름으로 온다 (숫자가 아니다 — enum 값은 재배열되면 조용히 뜻이 바뀐다)',
+          acc.every((p) => NAMES.includes(p.accessory ?? '')),
+          acc.map((p) => p.accessory).join(', '),
+        );
+        check(
+          '`unknown` 이 없다 (엔진이 종류를 늘렸으면 이름 표를 따라가야 한다)',
+          acc.every((p) => p.accessory !== 'unknown'),
+          acc.map((p) => `${p.name}=${p.accessory ?? ''}`).join(', '),
+        );
+
+        // ★★★ 이 절의 핵심.
+        const hair = acc.filter((p) => p.accessory === 'hair');
+        const notHair = acc.filter((p) => p.accessory !== 'hair');
+        const texturedNotHair = notHair.filter((p) => p.material?.textures !== undefined);
+        check(
+          '★★★ 머리카락이 아닌 액세서리에는 텍스처가 없다 (엔진의 기본값은 없는 파일을 가리킨다)',
+          texturedNotHair.length === 0,
+          texturedNotHair.length === 0
+            ? `${notHair.length}개 확인 (${notHair.map((p) => p.accessory).join(', ')})`
+            : texturedNotHair.map((p) => `${p.name}: ${JSON.stringify(p.material?.textures)}`).join(' / '),
+        );
+        // 대조군 둘. 위 단언은 **머티리얼 자체가 안 왔어도** 통과한다 —
+        // 색까지 사라진 회귀가 초록으로 보이면 안 된다.
+        check(
+          '★ 대조군: 그래도 머티리얼(색)은 온다 (텍스처만 없는 것이지 재질이 없는 것이 아니다)',
+          acc.every((p) => p.material !== undefined),
+          acc.map((p) => `${p.accessory ?? ''}:${p.material === undefined ? '없음' : '있음'}`).join(' '),
+        );
+        check(
+          '★★ 그래서 텍스처 표가 몸만 쓰던 것과 같은 크기다 (액세서리가 표를 늘리지 않았다)',
+          hair.length > 0 || (found.result.textures?.length ?? 0) === baseTextures,
+          `이 씬 ${found.result.textures?.length ?? 0}칸 · 대조군 ${baseTextures}칸`
+          + (hair.length > 0 ? ' (머리카락이 있어 늘어날 수 있다 — 판정 제외)' : ''),
+        );
+
+        // ⚠️ **연속이라고 단언하지 않는다.** 비활성 슬롯도 번호를 먹어서
+        //    실측으로 몸 12파트(0–11) 다음의 신발이 **29번**이었다. 연속을
+        //    기대하는 테스트를 쓰면 씬을 바꾸는 순간 빨개진다.
+        const maxBody = Math.max(...body.map((p) => p.index));
+        check(
+          '★ 액세서리 인덱스가 몸 뒤에 오고 서로 겹치지 않는다 (연속은 아니다 — 빈 슬롯도 번호를 먹는다)',
+          acc.every((p) => p.index > maxBody)
+          && new Set(parts.map((p) => p.index)).size === parts.length,
+          `몸 최대 ${maxBody} · 액세서리 [${acc.map((p) => p.index).join(', ')}]`,
+        );
+
+        check(
+          '양면으로 온다 (데스크톱의 `enableTwoSided` 를 옮긴 값이다)',
+          acc.every((p) => p.doubleSided === true),
+          acc.map((p) => `${p.accessory ?? ''}:${String(p.doubleSided)}`).join(' '),
+        );
+        check(
+          '에셋 이름이 실려 있다 (워커 로그·데스크톱과 대조할 유일한 이름이다)',
+          acc.every((p) => typeof p.assetName === 'string' && p.assetName !== ''),
+          acc.map((p) => p.assetName ?? '(없음)').join(', '),
+        );
+
+        // ★ 몸과 **같은 포장**을 쓴다는 것이 이 구현의 요점이다. 갈라 두면
+        //   쓰레기 정점 AABB 규칙이나 법선 규약을 한쪽에만 고치는 사고가 난다.
+        check(
+          '★★ 액세서리도 몸과 같은 포장이다 (positions · indices · uvs 가 다 있다)',
+          acc.every((p) => typeof p.positions === 'string' && p.positions !== ''
+            && typeof p.indices === 'string' && p.indices !== ''
+            && typeof p.uvs === 'string' && p.uvs !== ''
+            && p.vertices > 0 && p.triangles > 0),
+          acc.map((p) => `${p.accessory ?? ''} v=${p.vertices} t=${p.triangles}`).join(' · '),
+        );
+
+        // `vertices` 가 요청값의 메아리가 아니라 **실제로 실은 값**인지.
+        for (const av of found.result.avatars) {
+          const sum = av.parts.reduce((s, p) => s + p.vertices, 0);
+          check(
+            '아바타의 정점 합계가 파트 합과 같다 (액세서리를 더하고 합계를 안 고치는 사고가 흔하다)',
+            av.vertices === sum,
+            `${av.vertices} === ${sum}`,
           );
         }
       }
