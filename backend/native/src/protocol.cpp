@@ -774,18 +774,51 @@ json ReadSurfaces(ZestManager& manager)
 {
     json items = json::array();
 
+    // 서피스 → 지금 입고 있는 직물. 서피스 자신은 재질을 모르고 **패턴이 안다**
+    // (`ztDesignClothPattern::GetFrontMaterial`), 그래서 한 번 훑어 표를 만든다.
+    //
+    // ★ 화면이 "이 조각은 지금 어느 원단인가" 를 말하려면 이 값이 필요하다
+    //   (UI #50). 없으면 직물 콤보가 **현재값 없이** 서고, 사용자는 뭘 고르고
+    //   있는지 모른 채 눌러야 한다.
+    //
+    // ⚠️ 키가 `meshData` 의 `material.fabricUuid` · `fabrics` 의 `id` 와 **같은
+    //    문자열**이어야 셋이 서로 짝지어진다. 실측으로 확인했다 — 셋 다
+    //    `ztUuidSaver::Convert` 형식이다(`356925116857200/1500000`).
+    //    ⛔ 서피스 uuid 는 이것과 **형식이 다르다**(`GetString()`). 섞지 말 것.
+    std::map<std::string, std::string> fabricOf;
+    if (ztSceneQueryInterface* qi = QueryInterface(manager))
+    {
+        for (const auto& entry : qi->GetClothPatterns())
+        {
+            const ztDesignClothPattern* pattern = entry.second.get();
+            if (!pattern) continue;
+            const ztDesignSurface* surface = pattern->GetSurface();
+            if (!surface) continue;
+            const ztDesignMaterial* m = pattern->GetFrontMaterial();
+            if (!m) continue;
+            fabricOf[surface->GetUuid().GetString()] =
+                ztUuidSaver::Convert(m->GetMaterialData().assetUuid);
+        }
+    }
+
     for (const auto& entry : manager.GetSurfaceInfos())
     {
         const ztDesignSurface* surface = entry.second.get();
         if (!surface) continue;
 
         const zsVector2 size = manager.GetSurfaceSize(entry.first);
-        items.push_back(json{
+        json item{
             { "uuid",   entry.first.GetString() },
             { "name",   Utf8(surface->GetData().name) },
             { "width",  size.x },
             { "height", size.y },
-        });
+        };
+        // 없으면 키를 안 싣는다 — 옷과 같은 규약이다. 빈 문자열을 실으면 받는
+        // 쪽이 "직물이 없다" 와 "모른다" 를 구분할 수 없다.
+        const auto found = fabricOf.find(entry.first.GetString());
+        if (found != fabricOf.end()) item["fabricUuid"] = found->second;
+
+        items.push_back(std::move(item));
     }
 
     return json{ { "surfaces", items } };

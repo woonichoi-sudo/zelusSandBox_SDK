@@ -50,6 +50,7 @@ import {
   SideTabsPanel,
   SideDrawerPanel,
   narrowQuery,
+  FabricsPanel,
   SurfaceSizePanel,
   PlaybackController,
   shortcutFor,
@@ -769,6 +770,9 @@ function applyTextures(): void {
 // 서피스 하나를 받으므로 [적용]도 행마다다(`panels/surfaceSize.ts`).
 const surfaceSize = new SurfaceSizePanel();
 
+/** 직물 갈아입히기 (UI #50). 같은 행 위에 얹힌다 — `panels/fabrics.ts` 머리말 */
+const fabrics = new FabricsPanel();
+
 const surfacePanel = new SurfacePanel({
   root: ui.surfacePanel,
   panel: surfaceSize,
@@ -781,23 +785,66 @@ const surfacePanel = new SurfacePanel({
     surfaceSize.revert(uuid);
     surfacePanel.render();
   },
+  fabrics,
+  onFabric: (surfaceUuid, fabricId) => void applyFabric(surfaceUuid, fabricId),
 });
 
 async function refreshSurfaces(): Promise<void> {
   if (!currentScene || !client.connected) {
     surfaceSize.clear();
+    fabrics.setScene(false);
     surfacePanel.render();
     return;
   }
   try {
-    surfaceSize.setFromWorker((await client.surfaces()).surfaces);
+    // ★ **둘을 한 번에 받는다.** 행이 무엇을 입고 있는지는 `SurfaceInfo.
+    //   fabricUuid` 가 답하고, 그것이 목록의 어느 항목인지는 직물 목록이
+    //   답한다. 따로 받으면 한쪽만 새것인 순간이 생기고 그때 콤보가 빈 채로 선다.
+    const [surfaceRes, fabricRes] = await Promise.all([client.surfaces(), client.fabrics()]);
+    surfaceSize.setFromWorker(surfaceRes.surfaces);
+    fabrics.setScene(true);
+    fabrics.setFromWorker(fabricRes.fabrics, surfaceRes.surfaces);
   } catch (err: unknown) {
     // 못 읽었으면 옛 목록을 남기지 않는다 — 남기면 화면이 지금 씬에 없는
     // 패턴의 크기를 "현재 크기" 라고 말한다.
     surfaceSize.clear();
+    fabrics.setScene(false);
     log(`패턴 크기를 읽지 못했습니다: ${message(err)}`);
   }
   surfacePanel.render();
+}
+
+/**
+ * 조각 하나에 직물을 입힌다 (UI #50).
+ *
+ * ★★ **`restageTopology` 를 부르는 것이 이 함수의 핵심이다.** 옷 색은
+ *   `meshData` 의 topology 페이로드 안에 있고 화면은 그것을 최초 1회만 받았다
+ *   — 안 부르면 워커는 바꿨는데 화면은 옛 색 그대로이고, 증상이 **"적용 버튼이
+ *   안 먹는다"** 로 보인다. `setSurfaceSize` 가 밟았던 것과 같은 함정이고
+ *   (L-3d), 같은 갈래로 푼다. 씬을 다시 열지 않는다.
+ */
+async function applyFabric(surfaceUuid: string, fabricId: string): Promise<void> {
+  if (!currentScene || !client.connected) return;
+  fabrics.begin(surfaceUuid);
+  surfacePanel.render();
+
+  let applied: string | undefined;
+  try {
+    const res = await client.setFabric(surfaceUuid, fabricId);
+    // ⚠️ **되읽은 값을 쓴다.** 요청한 `fabricId` 를 그대로 믿으면 엔진이 다른
+    //    것을 물렸을 때 화면만 새 이름을 말하게 된다.
+    const echo = res.applied as { fabricUuid?: string };
+    applied = echo.fabricUuid ?? fabricId;
+    log(t('fabric.applied', { name: res.name }));
+  } catch (err: unknown) {
+    statusT('status.fabric.failed', { why: message(err) }, true);
+  }
+  fabrics.settle(surfaceUuid, applied);
+  surfacePanel.render();
+
+  // 실패했으면 옷은 안 바뀌었으므로 다시 세울 것이 없다.
+  if (applied === undefined) return;
+  await restageTopology('원단');
 }
 
 /**

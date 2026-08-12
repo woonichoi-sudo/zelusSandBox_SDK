@@ -89,6 +89,8 @@ import {
   // 치수 표의 낡음 (§18, ISSUE-021)
   AvatarMeasureController,
   type AvatarMeasurePort,
+  // 직물 (§19, UI #50)
+  FabricsPanel,
   // I-1 다국어. 배럴로 가져오는 것은 의도적이다 — `panels/index.ts` 의 재export
   // 가 빠지면 `ui/*` 가 사전에 못 닿는데, 그 줄도 같이 지나야 한다.
   DEFAULT_LANG,
@@ -188,7 +190,8 @@ import {
 // 변환 타입 둘. ISSUE-018 부터는 배럴(`index.ts`)도 이 둘을 재export 하지만,
 // 정의가 사는 곳은 `types.ts`(→ `sdk/protocol.ts`)이므로 여기서 직접 꺼낸다.
 import type {
-  AvatarBodyResult, PatternMaterial, PatternTransform, PatternTransform2D,
+  AvatarBodyResult, FabricInfo, PatternMaterial, PatternTransform, PatternTransform2D,
+  SurfaceInfo,
 } from './types.ts';
 
 // ── 하네스 ───────────────────────────────────────────────────
@@ -9364,6 +9367,138 @@ function sectionMeasureStale(): void {
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+// §19. 직물 갈아입히기 — 판단 (UI #50, panels/fabrics.ts)
+//
+// 이 단위가 조용히 거짓말하는 자리는 **콤보의 현재값**이다. 씬이 준
+// `fabricUuid` 가 목록에 없는 값이면(우리가 모르는 직물), 그대로 `<select>` 에
+// 넣었을 때 브라우저는 **첫 항목을 대신 보여준다.** 그러면 화면이 "이 조각은
+// A 를 입고 있다" 고 말하는데 사실이 아니다 — 그리고 사용자가 A 를 고르려
+// 하면 이미 A 로 보이니 아무 일도 안 일어난다.
+// ─────────────────────────────────────────────────────────────
+
+function fab(id: string, name: string, opts: Partial<FabricInfo> = {}): FabricInfo {
+  return {
+    id, name, source: 'inFile', custom: false,
+    hasTexture: true, textureExists: true, ...opts,
+  };
+}
+function surf(uuid: string, fabricUuid?: string): SurfaceInfo {
+  return { uuid, name: `pattern ${uuid}`, width: 10, height: 20, ...(fabricUuid === undefined ? {} : { fabricUuid }) };
+}
+
+function sectionFabrics(): void {
+  section('§19. 직물 갈아입히기 — 판단 (UI #50)');
+
+  const ready = (): FabricsPanel => {
+    const p = new FabricsPanel();
+    p.setScene(true);
+    p.setFromWorker([fab('f1', 'CS-00120_1'), fab('f2', 'TOP_Mesh')], [surf('s1', 'f1'), surf('s2', 'f2')]);
+    return p;
+  };
+
+  // ── ① 못 쓰는 상태 ────────────────────────────────────────
+  {
+    const p = new FabricsPanel();
+    check('씬이 없으면 noScene 이고 이유가 글자로 있다',
+      p.view.phase === 'noScene' && (p.view.reason ?? '') !== '', JSON.stringify(p.view.phase));
+    p.setScene(true);
+    p.setFromWorker([], [surf('s1')]);
+    check('직물이 하나도 없으면 empty 다',
+      p.view.phase === 'empty' && (p.view.reason ?? '') !== '', p.view.phase);
+  }
+
+  // ── ② 콤보가 무엇을 보여야 하는가 ─────────────────────────
+  {
+    const v = ready().view;
+    check('★ 조각마다 지금 입은 직물이 채워진다',
+      v.rows.get('s1')?.current === 'f1' && v.rows.get('s2')?.current === 'f2',
+      `s1=${v.rows.get('s1')?.current ?? ''} s2=${v.rows.get('s2')?.current ?? ''}`);
+    check('항목 글자는 엔진 이름 그대로다 (번역하지 않는다)',
+      v.options.map((o) => o.label).join(',') === 'CS-00120_1,TOP_Mesh',
+      v.options.map((o) => o.label).join(','));
+  }
+
+  // ★★★ 이 절의 핵심.
+  {
+    const p = new FabricsPanel();
+    p.setScene(true);
+    p.setFromWorker([fab('f1', 'A'), fab('f2', 'B')], [surf('s1', 'f-모르는-것'), surf('s2')]);
+    const v = p.view;
+    check(
+      '★★★ 목록에 없는 직물은 빈 값으로 떨어진다 (안 그러면 콤보가 첫 항목을 "현재" 라고 거짓말한다)',
+      v.rows.get('s1')?.current === '' && v.rows.get('s2')?.current === '',
+      `s1='${v.rows.get('s1')?.current ?? ''}' s2='${v.rows.get('s2')?.current ?? ''}'`,
+    );
+  }
+
+  // ── ③ 무늬 파일이 없는 직물 ───────────────────────────────
+  //
+  // 고른 **뒤에** 알면 늦다 — 게이트웨이가 거절해 `⚠ 거절` 만 뜨고 그 원인이
+  // 직물 선택이라는 것이 화면 어디에도 안 보인다.
+  {
+    const p = new FabricsPanel();
+    p.setScene(true);
+    p.setFromWorker([fab('f1', 'A'), fab('f2', 'B', { textureExists: false })], [surf('s1', 'f1')]);
+    const o = p.view.options;
+    check('★★ 무늬 파일이 없는 직물이 표시된다 (고르기 전에 알아야 한다)',
+      o[0]?.missingTexture === false && o[1]?.missingTexture === true,
+      o.map((x) => `${x.label}:${String(x.missingTexture)}`).join(' '));
+    check('텍스처가 아예 없는 직물은 경고 대상이 아니다 (색만 있는 원단이다)',
+      new FabricsPanel() !== null
+      && (() => {
+        const q = new FabricsPanel();
+        q.setScene(true);
+        q.setFromWorker([fab('f3', 'C', { hasTexture: false, textureExists: false })], [surf('s1')]);
+        return q.view.options[0]?.missingTexture === false;
+      })(), '');
+  }
+
+  // ── ④ 선택지가 좁다는 안내 ────────────────────────────────
+  //
+  // ⚠️ **프리셋이 있으면 사라져야 한다.** 원단이 깔린 환경에서까지 "선택지가
+  //    좁다" 고 말하면 그게 거짓말이다.
+  {
+    check('★ 프리셋이 없으면 안내가 뜬다', (ready().view.notice ?? '') !== '', '');
+    const p = new FabricsPanel();
+    p.setScene(true);
+    p.setFromWorker([fab('f1', 'A'), fab('p1', 'Denim', { source: 'preset' })], [surf('s1', 'f1')]);
+    check('★★ 프리셋이 하나라도 있으면 안내가 사라진다 (원단이 깔린 환경에서 거짓말이 된다)',
+      p.view.notice === null, String(p.view.notice));
+  }
+
+  // ── ⑤ 왕복 잠금 ───────────────────────────────────────────
+  {
+    const p = ready();
+    p.begin('s1');
+    check('왕복 중인 행만 잠긴다',
+      p.view.rows.get('s1')?.busy === true && p.view.rows.get('s2')?.busy === false, '');
+
+    p.settle('s1', 'f2');
+    const v = p.view;
+    check('★ 성공하면 잠금이 풀리고 되읽은 값으로 갱신된다',
+      v.rows.get('s1')?.busy === false && v.rows.get('s1')?.current === 'f2',
+      `busy=${String(v.rows.get('s1')?.busy)} current=${v.rows.get('s1')?.current ?? ''}`);
+
+    // ★★ 실패해도 풀어야 한다. 잠긴 채로 남으면 다시 시도할 방법이 없다.
+    p.begin('s2');
+    p.settle('s2');
+    const v2 = p.view;
+    check('★★ 실패해도 잠금이 풀리고 값은 안 건드린다 (안 풀면 다시 시도할 방법이 없다)',
+      v2.rows.get('s2')?.busy === false && v2.rows.get('s2')?.current === 'f2',
+      `busy=${String(v2.rows.get('s2')?.busy)} current=${v2.rows.get('s2')?.current ?? ''}`);
+  }
+
+  // ── ⑥ 씬을 내리면 잊는다 ──────────────────────────────────
+  {
+    const p = ready();
+    p.begin('s1');
+    p.setScene(false);
+    check('씬을 내리면 목록도 잠금도 사라진다',
+      p.view.phase === 'noScene' && p.view.rows.size === 0 && p.view.options.length === 0, '');
+  }
+}
+
 async function sectionRestageSplit(): Promise<void> {
   section('§15-1. L-3d — 왕복과 화면 반영이 갈라져 있다 (loader.ts, 가짜 클라이언트)');
 
@@ -9766,6 +9901,32 @@ function sectionRestageWiring(): void {
     /if\s*\(!applied\)\s*return;/.test(applySize)
     && applySize.indexOf('if (!applied) return;') < applySize.indexOf('restageTopology('),
     `applied 가드 ${/if\s*\(!applied\)\s*return;/.test(applySize) ? '있음' : '없음'}`,
+  );
+
+  // ── ①-2 직물도 같은 갈래를 타야 한다 (UI #50) ──────────────
+  //
+  // ★★★ `material` 은 `meshData` 의 topology 페이로드 안이라 화면이 최초 1회만
+  //   받는다. `setFabric` 이 그 값을 바꾸므로 **다시 안 받으면 워커는 바꿨는데
+  //   화면은 옛 색 그대로**다 — 증상이 "적용이 안 먹는다" 로 보여 UI 배선
+  //   문제로 오진하기 딱 좋다. SDK 스모크 §5.9 가 이 순간을 예고해 뒀고,
+  //   §5.13 이 "워커는 실제로 다른 색을 준다" 까지 봤다. **화면이 그것을 받으러
+  //   가는지는 여기서만 볼 수 있다.**
+  const applyFabric = tsBody(src, 'async function applyFabric(surfaceUuid: string, fabricId: string): Promise<void>');
+  check(
+    '★★★ 직물을 바꾸면 `restageTopology` 를 부른다 (안 부르면 색이 그대로다 — "적용이 안 먹는다"로 보인다)',
+    applyFabric.includes('restageTopology('),
+    applyFabric === '' ? 'applyFabric 을 못 찾았다' : (applyFabric.includes('restageTopology(') ? '' : '아무도 안 부른다'),
+  );
+  check(
+    '★★ 실패하면 안 부른다 (옷이 안 바뀌었다)',
+    /if\s*\(applied === undefined\)\s*return;/.test(applyFabric)
+    && applyFabric.indexOf('if (applied === undefined) return;') < applyFabric.indexOf('restageTopology('),
+    `가드 ${/if\s*\(applied === undefined\)\s*return;/.test(applyFabric) ? '있음' : '없음'}`,
+  );
+  check(
+    '★★ 되읽은 `fabricUuid` 를 쓴다 (요청값을 그대로 믿으면 엔진이 다른 것을 물렸을 때 화면만 새 이름을 말한다)',
+    applyFabric.includes('echo.fabricUuid'),
+    applyFabric.includes('echo.fabricUuid') ? '' : '요청값을 그대로 쓴다',
   );
 
   // ── ④ 도면 커브. 왕복이 **1회** ────────────────────────────
@@ -10333,6 +10494,8 @@ async function main(): Promise<void> {
   // 위의 그리기(§17-2)뿐이라 즉시 끝난다.
   sectionSideDrawer();
   sectionSideDrawerDom();
+  // UI #50 직물. DOM 도 워커도 안 쓴다 — 콤보가 무엇을 보여야 하는가만 본다.
+  sectionFabrics();
   // ISSUE-021 이 뒤집은 갈래. 워커도 DOM 도 안 쓴다 — 가짜 `avatarBody` 응답을
   // 넣어 "무엇을 보고 낡음을 가르는가" 만 본다.
   sectionMeasureStale();

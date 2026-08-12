@@ -749,6 +749,15 @@ export interface SurfaceInfo {
   name: string;
   width: number;
   height: number;
+  /**
+   * 이 조각이 **지금 입고 있는 직물** (UI #50). 없으면 키가 아예 없다 —
+   * "직물이 없다" 와 "모른다" 를 구분할 수 있어야 한다.
+   *
+   * ★ `FabricInfo.id` · `PatternMaterial.fabricUuid` 와 **같은 문자열**이라
+   *   셋이 서로 짝지어진다. ⛔ 위 `uuid`(서피스)와는 **형식이 다르다** —
+   *   섞으면 "서피스를 찾을 수 없습니다" 로 조용히 실패한다.
+   */
+  fabricUuid?: string;
 }
 
 export interface SurfacesResult {

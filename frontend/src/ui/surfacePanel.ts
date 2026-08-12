@@ -17,7 +17,11 @@
  * 표현해야 한다. 행마다 보내면 그 상태가 아예 생기지 않는다.
  */
 
-import { t, type SurfaceSizePanel, type SurfaceSizeView } from '../panels/index.ts';
+import {
+  t,
+  type FabricsPanel, type FabricsView,
+  type SurfaceSizePanel, type SurfaceSizeView,
+} from '../panels/index.ts';
 
 export interface SurfacePanelOptions {
   root: HTMLElement;
@@ -26,6 +30,13 @@ export interface SurfacePanelOptions {
   /** 행 하나를 워커로 보낸다 */
   onApply: (uuid: string) => void;
   onRevert: (uuid: string) => void;
+  /**
+   * 직물 (UI #50). **행마다 콤보 하나**다 — 조각을 식별할 수 있는 자리가
+   * 여기뿐이라 크기와 같은 행에 붙인다(`panels/fabrics.ts` 머리말).
+   */
+  fabrics: FabricsPanel;
+  /** 콤보를 바꾸는 순간 바로 보낸다 — [적용] 버튼을 따로 두지 않는다 */
+  onFabric: (surfaceUuid: string, fabricId: string) => void;
 }
 
 export class SurfacePanel {
@@ -40,12 +51,18 @@ export class SurfacePanel {
     apply: HTMLButtonElement;
     revert: HTMLButtonElement;
     why: HTMLElement;
+    fabric: HTMLSelectElement;
+    fabricLabel: HTMLElement;
   }>();
 
   #head: HTMLElement;
   #banner: HTMLElement;
   #body: HTMLElement;
   #builtFor = '';
+  /** 직물 콤보의 항목이 무엇으로 서 있는가. 바뀔 때만 다시 만든다 */
+  #fabricOptionsFor = '';
+  /** 프리셋이 없다는 안내 (`panels/fabrics.ts` 의 `notice`) */
+  #notice: HTMLElement;
 
   constructor(opts: SurfacePanelOptions) {
     this.#root = opts.root;
@@ -61,13 +78,20 @@ export class SurfacePanel {
 
     this.#body = document.createElement('div');
 
-    this.#root.append(this.#head, this.#banner, this.#body);
+    // 프리셋이 없다는 안내. 배너와 달리 **`ready` 일 때도 뜬다** — 기능은
+    // 멀쩡한데 선택지가 좁다는 사실이라, 못 쓰는 이유가 아니라 조건이다.
+    this.#notice = document.createElement('div');
+    this.#notice.className = 'pbanner';
+    this.#notice.hidden = true;
+
+    this.#root.append(this.#head, this.#banner, this.#notice, this.#body);
     this.render();
   }
 
-  render(view: SurfaceSizeView = this.#panel.view): void {
+  render(view: SurfaceSizeView = this.#panel.view, fabrics: FabricsView = this.#opts.fabrics.view): void {
     this.#head.textContent = t('side.surface.title');
     if (view.phase !== 'ready') {
+      this.#notice.hidden = true;
       this.#builtFor = '';
       this.#rows.clear();
       this.#body.textContent = '';
@@ -100,6 +124,53 @@ export class SurfacePanel {
       // 잘못된 값은 회색만 되지 않는다 — 이유가 글자로 남는다.
       w.why.textContent = r.invalid ?? '';
       w.why.hidden = r.invalid === undefined;
+    }
+
+    this.#renderFabrics(fabrics);
+  }
+
+  /**
+   * 직물 콤보 (UI #50). **항목은 목록이 바뀔 때만 다시 만든다** — 매번 새로
+   * 만들면 사용자가 콤보를 연 채로 갱신이 돌 때 목록이 닫힌다.
+   */
+  #renderFabrics(view: FabricsView): void {
+    this.#notice.textContent = view.notice ?? '';
+    this.#notice.hidden = view.notice === null;
+
+    // 항목의 정체성 = id + 글자. 글자가 바뀌는 경우는 언어 전환뿐이다.
+    const shape = view.options.map((o) => `${o.id}:${o.label}:${String(o.missingTexture)}`).join('|')
+      + `|${t('fabric.missingTexture')}`;
+    const rebuild = shape !== this.#fabricOptionsFor;
+    if (rebuild) this.#fabricOptionsFor = shape;
+
+    for (const [uuid, w] of this.#rows) {
+      const row = view.rows.get(uuid);
+      w.fabricLabel.textContent = t('fabric.label');
+
+      // 직물을 못 쓰는 상태면 콤보를 감춘다. 회색으로 두면 "왜 안 되는지" 를
+      // 행마다 스물넷 번 말해야 하는데, 이유는 패널 위 배너가 한 번 말한다.
+      const usable = view.phase === 'ready' && row !== undefined;
+      w.fabric.hidden = !usable;
+      w.fabricLabel.hidden = !usable;
+      if (!usable) continue;
+
+      if (rebuild) {
+        w.fabric.textContent = '';
+        for (const o of view.options) {
+          const opt = document.createElement('option');
+          opt.value = o.id;
+          // ⚠️ 이름은 엔진이 준 값이라 **번역하지 않는다.** 뒤에 붙는 경고만
+          //    사전을 탄다 — 고르기 전에 알아야 하는 사실이다.
+          opt.textContent = o.label + (o.missingTexture ? t('fabric.missingTexture') : '');
+          w.fabric.append(opt);
+        }
+      }
+
+      // 왕복 중에는 잠근다. 연타하면 워커가 같은 서피스를 두 번 고쳐 쓴다.
+      w.fabric.disabled = row.busy;
+      // ⚠️ 사용자가 콤보를 **연 채로** 있으면 덮지 않는다 — 브라우저가 열린
+      //    목록을 닫아 버려서, 고르는 도중에 선택이 튄다.
+      if (document.activeElement !== w.fabric) w.fabric.value = row.current;
     }
   }
 
@@ -152,9 +223,23 @@ export class SurfacePanel {
       why.className = 'pwhy';
       why.hidden = true;
 
-      row.append(head, inputs, why);
+      // ── 직물 콤보 (UI #50) ─────────────────────────────────
+      //
+      // ★ **바꾸는 순간 보낸다.** [적용] 버튼을 따로 두지 않는 이유는
+      //   `panels/fabrics.ts` 머리말에 있다 — 고르는 행위 자체가 결정이다.
+      const fabricWrap = document.createElement('div');
+      fabricWrap.className = 'pinputs';
+      const fabricLabel = document.createElement('span');
+      fabricLabel.className = 'phelp';
+      const fabric = document.createElement('select');
+      fabric.addEventListener('change', () => {
+        this.#opts.onFabric(r.uuid, fabric.value);
+      });
+      fabricWrap.append(fabricLabel, fabric);
+
+      row.append(head, inputs, fabricWrap, why);
       this.#body.append(row);
-      this.#rows.set(r.uuid, { row, w, h, apply, revert, why });
+      this.#rows.set(r.uuid, { row, w, h, apply, revert, why, fabric, fabricLabel });
     }
   }
 }

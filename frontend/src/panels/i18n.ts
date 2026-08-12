@@ -174,6 +174,18 @@ const KO: Dict = {
   'surface.noScene': '씬을 로드하면 패턴 크기를 조절할 수 있습니다',
   'surface.empty': '이 씬에는 패턴이 없습니다',
 
+  // ── 직물 (UI #50) ───────────────────────────────────────
+  'fabric.label': '원단',
+  'fabric.noScene': '씬을 로드하면 원단을 바꿀 수 있습니다',
+  'fabric.empty': '이 씬에는 원단이 없습니다',
+  // ⚠️ 선택지가 둘뿐인 것을 "목록이 안 불러와졌다" 로 읽지 않게 하는 글자다.
+  //    프리셋이 하나라도 있으면 안 뜬다.
+  'fabric.inFileOnly': '이 설치본에는 프리셋 원단이 없습니다 — 이 옷에 든 {n}개끼리만 바꿀 수 있습니다',
+  'fabric.missingTexture': ' (무늬 파일 없음)',
+  'fabric.applying': '원단을 입히는 중…',
+  'fabric.applied': '원단 — {name}',
+  'status.fabric.failed': '원단 적용 실패: {why}',
+
   // ── 아바타 체형 (L-3a) ──────────────────────────────────
   //
   // ⛔ 왼쪽의 엔진 키(`fatness` …)는 번역하지 않는다. 여기 있는 것은 **우리가
@@ -542,6 +554,16 @@ const EN: Dict = {
   'side.surface.revert.title': 'Discards the edits on this row',
   'surface.noScene': 'Load a scene to adjust pattern sizes',
   'surface.empty': 'This scene has no patterns',
+
+  // ── 직물 (UI #50) ───────────────────────────────────────
+  'fabric.label': 'Fabric',
+  'fabric.noScene': 'Load a scene to change fabrics',
+  'fabric.empty': 'This scene has no fabrics',
+  'fabric.inFileOnly': 'This installation ships no preset fabrics — you can only swap between the {n} that came with this garment',
+  'fabric.missingTexture': ' (texture file missing)',
+  'fabric.applying': 'Applying the fabric…',
+  'fabric.applied': 'Fabric — {name}',
+  'status.fabric.failed': 'Applying the fabric failed: {why}',
 
   // ── 아바타 체형 (L-3a) ──────────────────────────────────
   'side.body.title': 'Body shape (normalized 0–1)',

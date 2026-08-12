@@ -166,6 +166,18 @@ export {
   type SurfaceSizeView,
 } from './surfaceSize.ts';
 
+/**
+ * 직물 갈아입히기 (UI #50). 옷 사이즈와 **같은 행 위에 얹힌다** —
+ * 조각을 식별할 수 있는 자리가 거기뿐이라 콤보를 그 행에 붙인다.
+ */
+export {
+  FabricsPanel,
+  type FabricOption,
+  type FabricPhase,
+  type FabricRow,
+  type FabricsView,
+} from './fabrics.ts';
+
 export {
   DEFAULT_SIDE_TAB,
   isSideTabId,
