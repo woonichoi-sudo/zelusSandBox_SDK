@@ -243,7 +243,7 @@
         "key": "scene",
         "title": "B. 씬 인벤토리 & 편집 — 새 op 6개",
         "cost": "중간. ZestManager에 전부 있고 프로토콜에 노출만 안 돼 있다",
-        "status": "절반 완료 (2026-08-12에 실측으로 갱신). 5항목 중 2개가 다른 단위를 하다가 들어갔고, 1개는 좁은 형태로 들어갔다. ⚠️ 이 그룹은 2026-08-12까지 '전부 미착수'로 남아 있었다 — 남은 일 목록이 실제와 어긋나 있었으므로, 다른 그룹도 착수 전에 게이트웨이 OPS 테이블과 대조할 것(`backend/src/server/bridge.ts` 의 `OPS`가 현재 op의 정본이다)",
+        "status": "5항목 중 **3 done · 1 partial · 1 todo** (2026-08-13). `surfaces`·`setSurfaceSize` 는 L-3b/L-3d 를 하다가 들어갔고, `setFabric` 은 2026-08-13 에 정면으로 했다(`772f128`·`74ae463`). 드레이프는 적용만 들어간 좁은 형태다. **남은 것은 `setEndPose` 하나와 드레이프 목록 조회다.** ⚠️ 이 그룹은 2026-08-12까지 '전부 미착수'로 남아 있었다 — 남은 일 목록이 실제와 어긋나 있었으므로, 다른 그룹도 착수 전에 게이트웨이 OPS 테이블과 대조할 것(`backend/src/server/bridge.ts` 의 `OPS`가 현재 op의 정본이다)",
         "items": [
           {
             "ui": [45, 46, 47], "op": "drapingItems / loadDrapingItem", "zest": "GetDrapingItems / LoadDrapingItem",
