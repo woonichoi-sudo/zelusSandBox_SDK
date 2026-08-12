@@ -29,16 +29,19 @@
  *
  * L-3a 의 그것은 *"체형을 한 번이라도 보낸 뒤로 참"* 이었고 **푸는 방법이
  * 없었다** — 화면은 "낡았다" 고 말만 하고 진짜 값을 보여줄 길이 없었다.
- * 이제 `measured` 라는 정본이 생겼으므로:
+ * `measured` 라는 정본이 생기면서 한 번 좁혔고, **ISSUE-021 이 닫히면서
+ * 한 번 더 좁혀졌다**(2026-08-12):
  *
- *   - `setAvatarBody` 를 보내면 참 (셰이퍼가 몸을 바꿨는데 우리가 읽던 숫자는
- *     씬 데이터 사본이라 안 움직인다)
+ *   - `setAvatarBody` 를 보내면 → **응답의 `measurementSource` 가 가른다.**
+ *     `live` 면 되읽은 값으로 표를 갱신하고 **거짓**, 아니면 참
  *   - `setAvatarMeasurements` 응답의 `measured` 를 받으면 **거짓** (25개 전부
  *     다시 잰 값이다)
  *   - 씬을 새로 읽으면 거짓 (로드 시점의 스냅샷이 곧 지금 몸이다)
  *
- * 즉 플래그를 지우지 않고 **의미를 좁혔다.** 지우면 "체형 슬라이더를 민 뒤의
- * 치수" 라는 진짜 거짓말이 화면에 그대로 남는다 — 그 경로는 아직 되읽기가 없다.
+ * ⚠️ **플래그를 지우지 않는 이유가 남아 있다.** 제타가 아닌 아바타에는
+ *    `GetMeasurement()` 경로가 없어 여전히 씬 데이터로 떨어지고, 그때는 체형을
+ *    바꿔도 숫자가 안 움직인다. 옛 워커(필드를 안 보냄)도 같은 자리로 온다.
+ *    **"안 움직일 수 있다" 를 기본으로 두는 편이 조심스러운 쪽이다.**
  *
  * ── ⚠️ `notSupported` 는 눌러 봐야 안다 ─────────────────────
  *
@@ -164,8 +167,9 @@ export interface AvatarMeasureRow {
   /** 엔진 이름 그대로. **한국어 사전을 두지 않는다** — 아래 주석 참고 */
   key: string;
   /**
-   * 지금 몸의 치수. 정본은 마지막 `measured` 이고, 아직 한 번도 안 걸었으면
-   * `avatarBody` 가 준 로드 시점 스냅샷이다(그때는 `view.stale` 이 답한다).
+   * 지금 몸의 치수. 정본은 마지막 `measured` 이고, 안 걸었으면 `avatarBody` 가
+   * 준 값이다 — **ISSUE-021 이후 그쪽도 살아 있는 값이라** 둘이 같은 곳에서
+   * 온다. 제타가 아닌 아바타에서만 로드 시점 값이고, 그때는 `view.stale` 이 답한다.
    */
   current: number;
   /** 화면이 들고 있는 값. `current` 와 다르면 아직 안 보낸 편집이다 */
@@ -427,15 +431,47 @@ export class AvatarMeasureController {
   }
 
   /**
-   * **체형 슬라이더(`setAvatarBody`)를 보냈다.**
+   * **체형 슬라이더(`setAvatarBody`)를 보냈다.** 워커가 되읽어 준 아바타를
+   * 함께 넘긴다(`setAvatarBody` 응답의 `avatar`).
    *
-   * 그쪽 경로에는 되읽기가 없다 — 셰이퍼가 몸을 바꿔도 우리가 읽던 숫자
-   * (`measurements[*].real`)는 씬 데이터 사본이라 안 움직인다. 그래서 이
-   * 표는 그 순간부터 낡은 것이고, **화면이 그 사실을 글자로 말해야 한다.**
+   * ── ★ ISSUE-021 이 닫히면서 이 자리의 답이 뒤집혔다 ─────────
+   *
+   * 예전에는 **무조건 낡음**이었다. 셰이퍼가 몸을 바꿔도 우리가 읽던 숫자가
+   * 씬 데이터 사본이라 안 움직였기 때문이다. 이제 `avatarBody` 가 살아 있는
+   * `ztDesignZeta` 에서 직접 재므로(`measurementSource: 'live'`) **되읽은 값이
+   * 곧 지금 몸이다** — 실측: `height` 0.5 → 0.9 에 25개 중 19개가 따라 움직인다.
+   *
+   * 그래서 갈래가 둘이다:
+   *   · `live`      → 표를 새 값으로 갱신하고 낡음을 **푼다**
+   *   · 그 외/없음  → 옛 동작 그대로 낡음을 **건다** (제타가 아닌 아바타,
+   *                   그리고 이 필드를 안 보내는 옛 워커)
+   *
+   * ⚠️ **`setFromWorker` 를 부르지 않는다.** 저쪽은 편집·목표치까지 지우는
+   *    "새 아바타를 읽었다" 용이라, 슬라이더를 미는 동안 사용자가 쳐 둔 cm
+   *    입력이 사라진다. 여기서는 **현재값과 메타만** 덮는다.
    */
-  noteBodyParamsApplied(): void {
+  noteBodyParamsApplied(res?: AvatarBodyResult | null): void {
     if (!this.#hasAvatar) return;
-    this.#stale = true;
+
+    const live = res?.hasAvatar === true && res.measurementSource === 'live';
+    if (!live) {
+      this.#stale = true;
+      this.#emit();
+      return;
+    }
+
+    for (const [k, m] of Object.entries(res?.measurements ?? {})) {
+      this.#current[k] = m.real;
+      // ★ 기준선도 함께 옮긴다. 워커가 단계 수를 이 값으로 세기 때문이다 —
+      //   안 옮기면 "허리를 63 으로 만든 뒤 70 을 걸면 70−61.6 으로 잡힌다" 는
+      //   ISSUE-021 의 누적 실패가 화면 쪽에 그대로 남는다.
+      this.#baseline[k] = m.real;
+      this.#meta[k] = {
+        ...(m.expected === undefined ? {} : { expected: m.expected }),
+        locked: m.locked,
+      };
+    }
+    this.#stale = false;
     this.#emit();
   }
 

@@ -27,14 +27,16 @@ import type {
 } from '../../../backend/src/sdk/protocol.ts';
 
 export type {
-  // 아바타 체형 (L-3a). ⚠️ `AvatarMeasurement.real` 은 로드 시점 값이고
-  // 체형을 바꿔도 갱신되지 않는다 — 원본 주석 참고.
+  // 아바타 체형 (L-3a). ★ `AvatarMeasurement.real` 은 **지금 몸을 방금 잰 값**
+  // 이다 (ISSUE-021, 2026-08-12). 제타가 아닌 아바타에서만 로드 시점 값으로
+  // 떨어지고, 어느 쪽인지는 `AvatarBodyResult.measurementSource` 가 말한다 —
+  // **그 필드를 보지 않고 숫자만 믿으면 안 된다.**
   AvatarBodyResult,
   AvatarMeasurement,
   SetAvatarBodyResult,
-  // 치수로 몸 만들기 (W-1). ⚠️ 되읽기의 정본은 `SetAvatarMeasurementsResult.
-  // measured` 다 — `avatar.measurements[*].real` 은 이 op 으로 **안 움직인다**
-  // (씬 데이터의 사본이라 쓰기가 닿지 않는다. 원본 주석에 실측이 있다).
+  // 치수로 몸 만들기 (W-1). 되읽기의 정본은 `SetAvatarMeasurementsResult.
+  // measured` 이고, `avatar.measurements[*].real` 도 이제 같은 곳에서 온다
+  // (ISSUE-021 전에는 이 둘이 서로 다른 값을 답했다).
   AvatarMeasurementTargets,
   SetAvatarMeasurementsResult,
   // 아바타 메시 (AM-1). ★ 정점이 **월드 좌표**다 — 옷과 달리 변환을 곱하면

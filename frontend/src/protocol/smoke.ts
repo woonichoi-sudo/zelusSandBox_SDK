@@ -86,6 +86,9 @@ import {
   narrowQuery,
   NARROW_MAX_PX,
   SideDrawerPanel,
+  // 치수 표의 낡음 (§18, ISSUE-021)
+  AvatarMeasureController,
+  type AvatarMeasurePort,
   // I-1 다국어. 배럴로 가져오는 것은 의도적이다 — `panels/index.ts` 의 재export
   // 가 빠지면 `ui/*` 가 사전에 못 닿는데, 그 줄도 같이 지나야 한다.
   DEFAULT_LANG,
@@ -184,7 +187,9 @@ import {
 } from './index.ts';
 // 변환 타입 둘. ISSUE-018 부터는 배럴(`index.ts`)도 이 둘을 재export 하지만,
 // 정의가 사는 곳은 `types.ts`(→ `sdk/protocol.ts`)이므로 여기서 직접 꺼낸다.
-import type { PatternMaterial, PatternTransform, PatternTransform2D } from './types.ts';
+import type {
+  AvatarBodyResult, PatternMaterial, PatternTransform, PatternTransform2D,
+} from './types.ts';
 
 // ── 하네스 ───────────────────────────────────────────────────
 
@@ -9225,6 +9230,140 @@ function sectionSideDrawerDom(): void {
   });
 }
 
+// ─────────────────────────────────────────────────────────────
+// §18. 체형을 보낸 뒤 치수 표가 낡았는가 (ISSUE-021, panels/avatarMeasure.ts)
+//
+// 이 갈래의 답이 2026-08-12에 **뒤집혔다.** 예전에는 `setAvatarBody` 를 보내면
+// 무조건 낡음이었다 — 워커의 `avatarBody` 가 `.zls` 의 씬 데이터를 읽어서
+// 셰이퍼가 몸을 바꿔도 숫자가 안 움직였기 때문이다. 이제 살아 있는
+// `ztDesignZeta` 에서 재므로(`measurementSource: 'live'`) 되읽은 값이 곧 지금
+// 몸이고, 낡음을 **걸면 그것이 거짓말이 된다.**
+//
+// ⚠️ 그런데 **무조건 푸는 것도 틀렸다.** 제타가 아닌 아바타에는 그 경로가
+//    없어 여전히 안 움직이고, 옛 워커는 필드를 아예 안 보낸다. 그래서 이 절이
+//    보는 것은 "푼다/건다" 가 아니라 **무엇을 보고 가르는가** 다.
+// ─────────────────────────────────────────────────────────────
+
+/** 왕복을 안 쓰는 절이라 포트는 껍데기면 된다 */
+function idleMeasurePort(): AvatarMeasurePort {
+  return {
+    connected: true,
+    setAvatarMeasurements: () => Promise.reject(new Error('이 절은 왕복을 쓰지 않는다')),
+  };
+}
+
+/** 치수 `n` 개를 든 `avatarBody` 응답 한 벌 */
+function bodyResult(
+  measurements: Record<string, number>,
+  source?: 'live' | 'sceneData',
+): AvatarBodyResult {
+  const m: Record<string, { real: number; locked: boolean }> = {};
+  for (const [k, v] of Object.entries(measurements)) m[k] = { real: v, locked: false };
+  return {
+    hasAvatar: true,
+    uuid: 'avatar-1',
+    bodyParams: { height: 0.5 },
+    measurements: m,
+    ...(source === undefined ? {} : { measurementSource: source }),
+  };
+}
+
+function sectionMeasureStale(): void {
+  section('§18. 체형을 보낸 뒤 치수 표가 낡았는가 (ISSUE-021)');
+
+  const load = (): AvatarMeasureController => {
+    const c = new AvatarMeasureController({ port: idleMeasurePort() });
+    c.setScene(true);
+    c.setFromWorker(bodyResult({ Height: 175.739, WaistCircum: 61.647 }, 'live'));
+    return c;
+  };
+
+  // ── ① live — 표가 갱신되고 낡음이 풀린다 ──────────────────
+  {
+    const c = load();
+    check('로드 직후에는 낡지 않았다', !c.view.stale, `stale=${String(c.view.stale)}`);
+
+    c.noteBodyParamsApplied(bodyResult({ Height: 196.503, WaistCircum: 61.654 }, 'live'));
+    const v = c.view;
+    const height = v.rows.find((r) => r.key === 'Height');
+    check(
+      '★★★ `live` 되읽기를 받으면 낡음이 **풀린다** (걸면 화면이 거짓말을 한다)',
+      !v.stale,
+      `stale=${String(v.stale)}`,
+    );
+    check(
+      '★★ 그리고 표의 숫자가 새 몸으로 갱신된다 (풀기만 하고 옛 값을 두면 더 나쁘다)',
+      Math.abs((height?.current ?? 0) - 196.503) < 1e-6,
+      `Height current=${height?.current ?? 0}`,
+    );
+  }
+
+  // ── ② sceneData — 옛 동작 그대로 낡음이 걸린다 ────────────
+  //
+  // 제타가 아닌 아바타다. 몸은 바뀌었는데 숫자는 안 움직이므로 화면이 그
+  // 사실을 글자로 말해야 한다.
+  {
+    const c = load();
+    c.noteBodyParamsApplied(bodyResult({ Height: 175.739, WaistCircum: 61.647 }, 'sceneData'));
+    check(
+      '★★ `sceneData` 면 낡음이 걸린다 (그 경로는 여전히 안 움직인다)',
+      c.view.stale,
+      `stale=${String(c.view.stale)}`,
+    );
+  }
+
+  // ── ③ 필드가 없으면 조심스러운 쪽으로 ─────────────────────
+  //
+  // 옛 워커는 `measurementSource` 를 안 보낸다. 없는 것을 `live` 로 읽으면
+  // **화면이 낡은 숫자를 지금 몸이라고 말하게 된다** — 반대 방향의 거짓말이라
+  // 기본값은 "안 움직일 수 있다" 여야 한다.
+  {
+    const c = load();
+    c.noteBodyParamsApplied(bodyResult({ Height: 175.739 }));
+    check(
+      '★★ `measurementSource` 가 없으면(옛 워커) 낡음이 걸린다 — 없는 것을 `live` 로 읽지 않는다',
+      c.view.stale,
+      `stale=${String(c.view.stale)}`,
+    );
+    const c2 = load();
+    c2.noteBodyParamsApplied(null);
+    check('되읽기를 아예 안 넘겨도 낡음이 걸린다', c2.view.stale, `stale=${String(c2.view.stale)}`);
+  }
+
+  // ── ④ 편집을 지우지 않는다 ────────────────────────────────
+  //
+  // ★★ `setFromWorker` 를 부르지 않은 이유가 이것이다. 저쪽은 "새 아바타를
+  //    읽었다" 용이라 편집·목표치까지 지운다 — 슬라이더를 미는 동안 쳐 둔 cm
+  //    입력이 사라지면, 사용자는 자기가 친 숫자가 왜 없어졌는지 알 수 없다.
+  {
+    const c = load();
+    c.edit('WaistCircum', 70);
+    check('전제: 편집이 하나 있다', c.view.dirty === 1, `dirty=${c.view.dirty}`);
+
+    c.noteBodyParamsApplied(bodyResult({ Height: 196.503, WaistCircum: 61.654 }, 'live'));
+    const row = c.view.rows.find((r) => r.key === 'WaistCircum');
+    check(
+      '★★★ 되읽기가 와도 사용자가 치던 값은 남는다 (`setFromWorker` 를 부르면 사라진다)',
+      c.view.dirty === 1 && row?.dirty === true && Math.abs((row?.value ?? 0) - 70) < 1e-6,
+      `dirty=${c.view.dirty} value=${row?.value ?? 0}`,
+    );
+    check(
+      '그래도 그 행의 `current` 는 새 몸으로 갱신된다 (편집과 현재값은 다른 칸이다)',
+      Math.abs((row?.current ?? 0) - 61.654) < 1e-6,
+      `current=${row?.current ?? 0}`,
+    );
+  }
+
+  // ── ⑤ 아바타가 없으면 아무 일도 안 한다 ───────────────────
+  {
+    const c = new AvatarMeasureController({ port: idleMeasurePort() });
+    c.setScene(true);
+    c.setFromWorker(null);
+    c.noteBodyParamsApplied(bodyResult({ Height: 1 }, 'sceneData'));
+    check('아바타가 없으면 낡음을 걸지 않는다 (걸 표가 없다)', !c.view.stale, `stale=${String(c.view.stale)}`);
+  }
+}
+
 async function sectionRestageSplit(): Promise<void> {
   section('§15-1. L-3d — 왕복과 화면 반영이 갈라져 있다 (loader.ts, 가짜 클라이언트)');
 
@@ -10194,6 +10333,9 @@ async function main(): Promise<void> {
   // 위의 그리기(§17-2)뿐이라 즉시 끝난다.
   sectionSideDrawer();
   sectionSideDrawerDom();
+  // ISSUE-021 이 뒤집은 갈래. 워커도 DOM 도 안 쓴다 — 가짜 `avatarBody` 응답을
+  // 넣어 "무엇을 보고 낡음을 가르는가" 만 본다.
+  sectionMeasureStale();
   // D2-e 재단 도면의 표시 스위치. DOM 도 워커도 안 쓴다 — 깨지면 조용한
   // 두 가지(접두사 우선순위 · 재로드 후 상태 유지)만 좁게 본다.
   sectionDesignLayers();

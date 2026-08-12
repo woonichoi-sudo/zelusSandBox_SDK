@@ -231,12 +231,40 @@ json ReadAvatarBody(ZestManager& manager)
         params[ztAvatarBodyParamUtils::GetParamName((ztAvatarBodyParam)i)] = z.bodyParams[i];
     }
 
+    // ── 치수는 **살아 있는 객체에서 잰다** (ISSUE-021) ──────────
+    //
+    // ★ `zetaData.measurementRealValues` 는 `.zls` 에 저장되는 **씬 데이터**이고,
+    //   `SetMeasurementParam` 의 쓰기는 살아 있는 `ztDesignZeta` 로 간다.
+    //   **둘은 동기화되지 않는다.** 씬 데이터만 읽으면 체형·치수를 아무리
+    //   바꿔도 이 값이 로드 시점 그대로다 — 실측: Δ15cm 를 걸어 몸이 실제로
+    //   변했는데(glTF 해시 상이) `WaistCircum` 은 61.647 에 붙박여 있었다.
+    //
+    //   정본은 `ztDesignZeta::GetMeasurement()->GetMeasuredLength(part)` 이고,
+    //   `setAvatarMeasurements` 응답의 `measured` 가 이미 이 경로를 쓴다.
+    //   같은 값을 두 op 이 서로 다르게 답하고 있었다.
+    //
+    // ⚠️ **제타가 아니면 이 경로가 없다.** 마네킹은 `dynamic_cast` 가 실패하고
+    //    `GetMeasurement()` 도 없다 — 그때는 씬 데이터로 떨어진다. 어느 쪽으로
+    //    읽었는지를 `measurementSource` 로 **말해 준다**: 화면이 "지금 몸" 과
+    //    "로드 시점 값" 을 구분할 수 있어야 낡음 배너를 옳게 걸 수 있다.
+    std::shared_ptr<ztAvatarMeasurement> live;
+    {
+        const ztDesignAvatarStorage& avatars = qi->GetAvatars();
+        const auto found = avatars.find(uuid);
+        if (found != avatars.end())
+        {
+            if (ztDesignZeta* zeta = dynamic_cast<ztDesignZeta*>(found->second.get()))
+                live = zeta->GetMeasurement();
+        }
+    }
+
     json measures = json::object();
     for (int i = 0; i < (int)ztAvatarMeasurePart::Count; ++i)
     {
         const auto& want = z.measurementExpectedValues[i];
         json m = json{
-            { "real",   z.measurementRealValues[i] },
+            { "real",   live ? live->GetMeasuredLength((ztAvatarMeasurePart)i)
+                             : z.measurementRealValues[i] },
             { "locked", want.isLock },
         };
         // FLT_MIN 이 "목표 없음" 의 표시다(MeasurementInfo 의 기본값). 그대로
@@ -252,6 +280,9 @@ json ReadAvatarBody(ZestManager& manager)
         { "uuid",         uuid.GetString() },
         { "bodyParams",   params },
         { "measurements", measures },
+        // `live` = 살아 있는 제타에서 방금 잰 값. `sceneData` = `.zls` 에 저장된
+        // 로드 시점 값(제타가 아닌 아바타). **화면이 이 둘을 구분해야 한다.**
+        { "measurementSource", live ? "live" : "sceneData" },
     };
 }
 

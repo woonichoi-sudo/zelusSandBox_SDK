@@ -570,11 +570,12 @@ async function applyAvatarBody(): Promise<void> {
   try {
     const res = await client.setAvatarBody(payload);
     avatarBody.applied(res.avatar);
-    // ★ **이 경로에는 치수 되읽기가 없다** — 셰이퍼가 몸을 바꿨는데
-    //   `measurements[*].real` 은 씬 데이터 사본이라 안 움직인다. 그 사실을
-    //   치수 패널에 알려 화면이 "이 숫자는 그 전에 잰 값" 이라고 말하게
-    //   한다. 이 한 줄이 없으면 화면이 조용히 거짓말을 한다.
-    avatarMeasure.noteBodyParamsApplied();
+    // ★ **이제 이 경로에도 치수 되읽기가 있다** (ISSUE-021). `res.avatar` 의
+    //   `measurements` 는 살아 있는 제타에서 방금 잰 값이라, 넘겨 주면 치수
+    //   표가 새 몸으로 갱신되고 낡음 배너가 풀린다. 제타가 아닌 아바타에서는
+    //   여전히 안 움직이므로 그때는 배너가 그대로 선다 — **어느 쪽인지는
+    //   `measurementSource` 가 말하고, 판단은 패널이 한다.**
+    avatarMeasure.noteBodyParamsApplied(res.avatar);
     // ★ 몸이 실제로 다시 만들어졌다 (AM-1). 슬라이더 29개는 정규화 값이라
     //   숫자만 봐서는 몸이 어떻게 변했는지 알 수 없다 — 이 한 줄이 그 결과를
     //   화면에 세운다. `refreshPose` 를 안 쓰는 이유는 **옷은 안 움직이기

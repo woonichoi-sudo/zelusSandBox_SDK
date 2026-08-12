@@ -612,8 +612,26 @@ export interface AvatarBodyResult {
    * cm 단위의 몸을 보려면 `measurements` 쪽이다.
    */
   bodyParams?: Record<string, number>;
-  /** 치수 25개. 키는 `ztAvatarMeasureUtils::GetMeasurePartName` */
+  /**
+   * 치수 25개. 키는 `ztAvatarMeasureUtils::GetMeasurePartName`.
+   *
+   * ★ **`measurementSource` 를 함께 보라** — `live` 면 지금 몸을 방금 잰 값이고,
+   *   `sceneData` 면 `.zls` 에 저장된 **로드 시점 값**이라 체형을 바꿔도 안 움직인다.
+   */
   measurements?: Record<string, AvatarMeasurement>;
+  /**
+   * `measurements[].real` 을 어디서 읽었는가 (ISSUE-021).
+   *
+   * - `live` — 살아 있는 `ztDesignZeta::GetMeasurement()` 에서 방금 쟀다.
+   *   **제타 아바타면 언제나 이쪽이다.** 실측: `height` 를 0.5 → 0.9 로 올리면
+   *   25개 중 19개가 따라 움직인다(`Height` 175.739 → 196.503).
+   * - `sceneData` — 제타가 아니라 그 경로가 없어 `.zls` 의 저장값으로 떨어졌다.
+   *   **체형을 바꿔도 이 값은 안 움직인다** — 화면이 그렇게 말해야 한다.
+   *
+   * ⚠️ 옛 워커는 이 필드를 안 보낸다. 없으면 `sceneData` 로 취급하는 편이
+   *    안전하다 — "안 움직일 수 있다" 가 더 조심스러운 쪽이다.
+   */
+  measurementSource?: 'live' | 'sceneData';
 }
 
 // ── 치수로 몸 만들기 (W-1) ──────────────────────────────────

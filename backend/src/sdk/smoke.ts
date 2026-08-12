@@ -1526,6 +1526,108 @@ async function main(): Promise<void> {
       }
     }
 
+    // ── 5.12 아바타 치수가 지금 몸을 말한다 (ISSUE-021) ────
+    //
+    // **이 op 에 단언이 하나도 없었다.** 그동안 `avatarBody` 는 `.zls` 에
+    // 저장된 씬 데이터(`zetaData.measurementRealValues`)를 읽었는데, 쓰기는
+    // 살아 있는 `ztDesignZeta` 로 가서 **둘이 동기화되지 않았다.** 결과는
+    // 조용한 거짓말이었다 — 몸은 실제로 커지는데(glTF 해시 상이) 치수 숫자만
+    // 로드 시점에 붙박여 있었다. 실측에서 `height` 를 0.5 → 0.8 로 올렸을 때
+    // **25개 중 한 개도 안 움직였다.**
+    //
+    // 아래 ②가 정확히 그 회귀를 막는다. ①③은 그 단언이 헛돌지 않게 하는
+    // 전제와 대조군이다.
+    {
+      if (session.loadedPath !== ZLS) {
+        await session.clear();
+        await session.load(ZLS);
+      }
+      const before = await session.avatarBody();
+
+      check(
+        '전제: 씬에 아바타가 있고 치수 25개가 온다',
+        before.hasAvatar && Object.keys(before.measurements ?? {}).length === 25,
+        `hasAvatar=${before.hasAvatar} 치수 ${Object.keys(before.measurements ?? {}).length}개`,
+      );
+      // ★ 제타면 살아 있는 경로가 있어야 한다. `sceneData` 로 떨어졌다면
+      //   `dynamic_cast` 나 `GetMeasurement()` 가 실패한 것이고, 그때는 아래
+      //   ②가 **원리상 통과할 수 없다** — 어느 쪽이 깨졌는지 여기서 갈린다.
+      check(
+        '★ 치수를 살아 있는 제타에서 읽는다 (`measurementSource: live`)',
+        before.measurementSource === 'live',
+        String(before.measurementSource),
+      );
+      const height0 = before.measurements?.['Height']?.real ?? 0;
+      check(
+        '로드 직후 값이 사람 몸의 범위다 (경로가 있는데 0 을 주는 것과 구분한다)',
+        height0 > 100 && height0 < 250,
+        `Height=${height0.toFixed(3)}cm`,
+      );
+
+      // ── ② 체형을 바꾸면 치수가 따라 움직인다 ──────────────
+      const now = before.bodyParams?.['height'] ?? 0.5;
+      const next = now > 0.5 ? 0.2 : 0.9;
+      const applied = await session.setAvatarBody({ height: next });
+      check(
+        '전제: `height` 가 실제로 적용됐다',
+        applied.applied.includes('height') && applied.unknown.length === 0,
+        `applied=[${applied.applied.join(',')}] unknown=[${applied.unknown.join(',')}]`,
+      );
+
+      const after = await session.avatarBody();
+      const moved = Object.keys(before.measurements ?? {}).filter((k) => {
+        const a = before.measurements?.[k]?.real ?? 0;
+        const b = after.measurements?.[k]?.real ?? 0;
+        return Math.abs(a - b) > 1e-4;
+      });
+      check(
+        '★★★ 체형을 바꾸면 치수가 따라 움직인다 (ISSUE-021 의 정확한 모양 — 예전에는 25개 중 0개였다)',
+        moved.length > 0,
+        moved.length > 0
+          ? `25개 중 ${moved.length}개 변화 · Height ${height0.toFixed(3)} → ${(after.measurements?.['Height']?.real ?? 0).toFixed(3)}`
+          : '한 개도 안 움직였다 (씬 데이터를 읽고 있다)',
+      );
+      // 키를 올렸으면 **키가** 움직여야 한다. "뭐라도 움직였다" 로는
+      // 엉뚱한 값이 흔들리는 경우와 구분되지 않는다.
+      const h1 = after.measurements?.['Height']?.real ?? 0;
+      check(
+        '★★ 그중 `Height` 가 올린 방향으로 움직였다 (아무거나 흔들린 것이 아니다)',
+        next > now ? h1 > height0 + 1 : h1 < height0 - 1,
+        `${height0.toFixed(3)} → ${h1.toFixed(3)} (height ${now} → ${next})`,
+      );
+
+      // ── ③ 대조군 — 안 바꾸면 안 움직인다 ─────────────────
+      //
+      // 없으면 위 ②는 "다시 읽을 때마다 숫자가 흔들린다" 로도 통과한다.
+      const again = await session.avatarBody();
+      const drift = Object.keys(after.measurements ?? {}).filter((k) => {
+        const a = after.measurements?.[k]?.real ?? 0;
+        const b = again.measurements?.[k]?.real ?? 0;
+        return Math.abs(a - b) > 1e-4;
+      });
+      check(
+        '★ 대조군: 아무것도 안 바꾸고 다시 읽으면 25개가 그대로다 (재는 값이 흔들리는 것이 아니다)',
+        drift.length === 0,
+        drift.length === 0 ? '0개 변화' : `${drift.join(', ')} 가 저절로 움직였다`,
+      );
+
+      // ── ④ 쓰기 응답의 되읽기도 같은 값이다 ───────────────
+      //
+      // 화면(`main.ts`)은 `setAvatarBody` 응답의 `avatar` 를 그대로 치수 표에
+      // 붓는다. 그것이 `avatarBody` 와 다른 값이면 화면과 op 이 갈라진다.
+      check(
+        '★★ `setAvatarBody` 응답의 `avatar` 도 살아 있는 값이다 (화면이 그것을 쓴다)',
+        applied.avatar.measurementSource === 'live'
+        && Math.abs((applied.avatar.measurements?.['Height']?.real ?? 0) - h1) < 1e-3,
+        `source=${String(applied.avatar.measurementSource)} Height=${(applied.avatar.measurements?.['Height']?.real ?? 0).toFixed(3)} vs ${h1.toFixed(3)}`,
+      );
+
+      // 다음 절이 깨끗한 몸에서 시작하도록 되돌린다. 값이 아니라 **씬을**
+      // 다시 읽는다 — 셰이퍼는 되돌리는 연산이 따로 없다.
+      await session.clear();
+      await session.load(ZLS);
+    }
+
     // ── 6. 세션 재사용 ────────────────────────────────────
     await session.clear();
     check('clear', session.loadedPath === null);
