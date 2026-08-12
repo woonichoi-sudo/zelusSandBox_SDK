@@ -39,6 +39,7 @@
  */
 
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
@@ -113,7 +114,9 @@ import {
   type PositionSink,
   type TopologyMismatch,
 } from '../viewer3d/frameStream.ts';
-import { showScene } from '../viewer3d/loader.ts';
+// L-3d 로 갈래가 셋이 됐다. **셋 다 여기서 본다** — `showScene` 만 보면 새로
+// 갈라 낸 두 갈래가 스모크 밖에 남는다.
+import { fetchTopology, installTopology, showScene } from '../viewer3d/loader.ts';
 import {
   SnapshotLoader,
   SnapshotStaleError,
@@ -8714,6 +8717,700 @@ function sectionSideTabsDom(): void {
 }
 
 // ─────────────────────────────────────────────────────────────
+// §15. L-3d — 옷 사이즈가 화면에 반영된다 (씬을 다시 열지 않고)
+//
+// 실측으로 잡힌 결함 둘이 뿌리가 하나였다: **"씬을 다시 열지 않고 토폴로지만
+// 다시 받는" 갈래가 없었다.**
+//
+//   A. `setSurfaceSize` 가 성공해도 아무도 토폴로지를 다시 안 받는다 →
+//      화면 셋(3D 옷 · 2D 흰 천 · 2D 도면 커브)이 전부 옛것. 실측에서
+//      **패턴 24 와 정점 13398 은 그대로였고 바뀌는 것은 좌표뿐**이었다 —
+//      그래서 "개수가 같다" 로는 이 결함을 절대 못 잡는다.
+//   B. `onMismatch` 복구가 `show()` 였고, 그 안의 `client.load` 가 `.zls` 를
+//      디스크에서 다시 열어 워커의 편집을 통째로 버렸다 (재로드 3.2초 뒤 값이
+//      원래대로 돌아옴, 2/2 재현).
+//
+// ── 이 절이 무엇을 덮고 무엇을 못 덮는가 ────────────────────
+//
+// **덮는다(§15-1, 실제로 돌린다)**: 갈래 자체 — `fetchTopology` 가 `load` 를
+// 안 부른다 · 왕복이 도는 동안 화면이 안 변한다 · `installTopology` 가 동기다 ·
+// 두 칸이 같은 디코딩에서 선다 · 기본값으로 카메라를 안 맞춘다 · 다시 세우면
+// **좌표가 실제로 바뀐다**(three 버퍼를 바이트로 비교).
+//
+// **못 덮는다**: 그 갈래를 **부르는 자리**가 `main.ts` 에 있고, 그 파일은 DOM
+// 을 잡고 있어 Node 가 import 조차 못 한다. 그래서 §15-2 는 `main.ts` 를
+// **소스로 읽어 배선을 대조한다** — §11 이 `protocol.cpp` 를 읽는 것과 같은
+// 방법이다. 소스 대조는 "이 이름을 부른다/안 부른다" 까지고 실행 순서는 못
+// 본다. 그 나머지는 사람이 브라우저에서 본다.
+//
+// ⚠️ 실제 워커를 안 쓴다. 이 단위는 프론트의 배선이고, 워커는 실측에서 이미
+//    **정확히 바뀐 값을 주고 있었다**(pattern 4 를 10.447 → 30.000). 결함은
+//    전부 받은 뒤에 있다.
+// ─────────────────────────────────────────────────────────────
+
+/** `topology:true` 응답 한 벌. `frameMeshOf` 와 달리 indices·uvs 까지 싣는다 */
+function topoMeshOf(patterns: readonly DecodedPattern[]): FrameMesh {
+  return {
+    topology: true,
+    patterns: patterns.map((p) => ({
+      uuid: p.uuid,
+      vertices: p.vertices,
+      triangles: p.triangles,
+      positions: bytesToBase64(
+        new Uint8Array(p.positions.buffer, p.positions.byteOffset, p.positions.byteLength),
+      ),
+      ...(p.indices ? { indices: i32Base64(Array.from(p.indices)) } : {}),
+      ...(p.uvs ? { uvs: f32Base64(Array.from(p.uvs)) } : {}),
+    })),
+  };
+}
+
+/**
+ * 크기를 바꾼 옷 한 벌. **개수는 그대로고 좌표만 달라진다** — 실측이 말한
+ * 결함의 모양 그대로다. 여기서 정점 수까지 바꿔 버리면 "개수가 같다" 로도
+ * 통과하는 단언이 만들어져 이 절이 겨냥하는 것을 놓친다.
+ *
+ * `uvs`(cm 단위 2D 패턴 좌표)도 같이 움직인다 — 가운데 칸의 흰 천은 3D 좌표가
+ * 아니라 이쪽에서 나오기 때문이다(`viewer2d/viewer2d.ts` 머리말).
+ */
+function surfaceTopology(seed: number): DecodedPattern[] {
+  const one = (uuid: string, vertices: number, triangles: number, k: number): DecodedPattern => {
+    const positions = new Float32Array(vertices * 3);
+    for (let i = 0; i < positions.length; i++) positions[i] = k * seed + i * 0.5;
+    const indices = new Int32Array(triangles * 3);
+    for (let i = 0; i < indices.length; i++) indices[i] = (i * 7 + k) % vertices;
+    const uvs = new Float32Array(vertices * 2);
+    for (let i = 0; i < uvs.length; i++) uvs[i] = (i + 1) * 0.25 * seed;
+    return { uuid, positions, indices, uvs, vertices, triangles };
+  };
+  return [one('p0', 6, 4, 100), one('p1', 5, 3, 200)];
+}
+
+/**
+ * 왕복을 손으로 풀 수 있는 가짜 클라이언트. **무엇을 몇 번 불렀는지**가 이
+ * 절의 핵심 판정이라(② load 0회 / meshData(true) 1회) 진짜 게이트웨이로는
+ * 셀 수 없다 — 워커가 부르지도 않은 `load` 를 대신 해 줄 리는 없지만, 반대로
+ * 우리가 부른 것을 놓치지 않고 세려면 여기가 유일한 자리다.
+ */
+function topologySpy(): {
+  client: GatewayClient;
+  ops: string[];
+  meshArgs: boolean[];
+  serve: (patterns: readonly DecodedPattern[]) => void;
+  fail: (err: Error) => void;
+  pending: () => number;
+} {
+  const ops: string[] = [];
+  const meshArgs: boolean[] = [];
+  const queue: { res: (m: FrameMesh) => void; rej: (e: Error) => void }[] = [];
+  const client = {
+    load(scene?: string): Promise<{ loaded: boolean; scene: string }> {
+      ops.push('load');
+      return Promise.resolve({ loaded: true, scene: scene ?? 'scene-1' });
+    },
+    meshData(topology = false): Promise<FrameMesh> {
+      ops.push('meshData');
+      meshArgs.push(topology);
+      return new Promise<FrameMesh>((res, rej) => queue.push({ res, rej }));
+    },
+  } as unknown as GatewayClient;
+  return {
+    client,
+    ops,
+    meshArgs,
+    serve: (patterns) => queue.shift()?.res(topoMeshOf(patterns)),
+    fail: (err) => queue.shift()?.rej(err),
+    pending: () => queue.length,
+  };
+}
+
+/**
+ * 왕복 하나가 끝나기를 기다리되 **절대 매달리지 않는다** (못 끝났으면 `null`).
+ *
+ * ★ 이 절의 가짜 클라이언트는 응답을 손으로 푼다. 그래서 누가 `fetchTopology`
+ *   앞에 `await` 을 하나 더 끼워 넣으면(= 이 절이 겨냥하는 돌연변이 m1 이
+ *   정확히 그것이다) 큐에 아직 아무것도 없는 순간에 풀게 되고, 그대로
+ *   `await` 하면 **테스트가 빨개지는 대신 멎는다.** 멎은 테스트는 실패가
+ *   아니라 사고라, 검증하려던 것이 무엇이었는지도 안 남는다.
+ */
+async function settled<T>(p: Promise<T>): Promise<T | Error | null> {
+  return Promise.race<T | Error | null>([
+    p.then((v) => v, (e: unknown) => (e instanceof Error ? e : new Error(String(e)))),
+    sleep(2_000).then(() => null),
+  ]);
+}
+
+/** 옷의 정점 버퍼 전체를 바이트로 지문 낸다. 값 비교가 아니라 **바이트**다 */
+function clothFingerprint(cloth: ClothObject): string {
+  const h = createHash('sha1');
+  for (const p of cloth.patterns) {
+    h.update(p.uuid);
+    const a = p.position.array as Float32Array;
+    h.update(Buffer.from(a.buffer, a.byteOffset, a.byteLength));
+  }
+  return h.digest('hex').slice(0, 8);
+}
+
+/** 도면 커브의 정점 전체를 지문 낸다 (①(c) 의 판정 방법) */
+function designFingerprint(layer: Design2DLayer): string {
+  const h = createHash('sha1');
+  for (const child of layer.group.children) {
+    const geo = (child as unknown as { geometry?: THREE.BufferGeometry }).geometry;
+    const pos = geo?.getAttribute('position');
+    if (!pos) continue;
+    h.update(child.name);
+    const a = pos.array as Float32Array;
+    h.update(Buffer.from(a.buffer, a.byteOffset, a.byteLength));
+  }
+  return h.digest('hex').slice(0, 8);
+}
+
+/** `fakeDesign2D()` 의 커브를 통째로 밀어 놓은 것. 같은 모양, 다른 좌표 */
+function fakeDesign2DShifted(dx: number): Parameters<Design2DLayer['build']>[0] {
+  const base = fakeDesign2D();
+  const shift = (v: readonly number[]): number[] => v.map((n, i) => (i % 2 === 0 ? n + dx : n));
+  return {
+    surfaces: base.surfaces.map((s) => ({
+      ...s,
+      curves: s.curves.map((c) => ({ ...c, cp: shift(c.cp), pts: shift(c.pts) })),
+    })),
+    seams: base.seams.map((sm) => ({
+      ...sm,
+      sides: sm.sides.map((side) => side.map((p) => ({ ...p, pts: shift(p.pts) }))) as typeof sm.sides,
+    })),
+    stitches: base.stitches.map((st) => ({
+      ...st,
+      curves: st.curves.map((c) => ({ ...c, cp: shift(c.cp), pts: shift(c.pts) })),
+    })),
+  };
+}
+
+async function sectionRestageSplit(): Promise<void> {
+  section('§15-1. L-3d — 왕복과 화면 반영이 갈라져 있다 (loader.ts, 가짜 클라이언트)');
+
+  // ── ② 핵심. 새 갈래는 씬을 다시 열지 않는다 ─────────────────
+  //
+  // ★★★ B 의 회귀를 막는 유일한 이빨이다. 여기가 초록인 한 `.zls` 가 디스크에서
+  //     다시 열려 워커의 편집이 사라지는 일은 일어나지 않는다.
+  {
+    const spy = topologySpy();
+    const { cloth } = stubViewer();
+    const before = clothFingerprint(cloth);
+    const p = fetchTopology(spy.client);
+    const arrived = await until(() => spy.pending() === 1, 1_000);
+    check(
+      '★★★ 갱신 갈래가 `client.load` 를 부르지 않는다 — meshData 1회뿐 (결함 B)',
+      spy.ops.join(',') === 'meshData',
+      `호출: [${spy.ops.join(', ')}]`,
+    );
+    check(
+      '★★ 그 한 번이 `topology:true` 다 (여기서 못 받으면 indices·uvs 를 영영 못 받는다)',
+      spy.meshArgs.join(',') === 'true',
+      `meshData(${spy.meshArgs.join(', ')})`,
+    );
+    check(
+      '★★ `fetchTopology` 는 화면을 한 곳도 안 만진다 (겹쳐도 안전한 이유)',
+      clothFingerprint(cloth) === before && cloth.patternCount === 0,
+      `지문 ${before} → ${clothFingerprint(cloth)}, 패턴 ${cloth.patternCount}`,
+    );
+    if (arrived) spy.serve(surfaceTopology(1));
+    const decoded = await settled(p);
+    check(
+      '받아 온 것은 패턴 2벌 + 텍스처 표다',
+      decoded !== null && !(decoded instanceof Error)
+      && decoded.patterns.length === 2 && Array.isArray(decoded.textures),
+      decoded === null ? '왕복이 안 끝났다' : decoded instanceof Error ? messageOf(decoded) : `패턴 ${decoded.patterns.length}`,
+    );
+    cloth.clear();
+  }
+
+  // ── 대조군. 세는 장치가 실제로 `load` 를 잡는가 ──────────────
+  //
+  // 위 단언은 "아무것도 안 불렀다" 로도 초록이다. 씬을 처음 여는 갈래에서
+  // `load` 가 **실제로 잡히는지** 봐야 그 초록이 의미를 갖는다.
+  {
+    const spy = topologySpy();
+    const { viewer, cloth, framed } = stubViewer();
+    const p = showScene(spy.client, viewer, 'scene-1');
+    if (await until(() => spy.pending() === 1, 1_000)) spy.serve(surfaceTopology(1));
+    await settled(p);
+    check(
+      '★ 대조군: 씬을 처음 여는 `showScene` 은 load 를 부른다 (세는 장치가 살아 있다)',
+      spy.ops.join(',') === 'load,meshData',
+      `호출: [${spy.ops.join(', ')}]`,
+    );
+    check(
+      '대조군: 처음 여는 자리는 화각을 맞춘다 (기본값이 반대다)',
+      framed() === 1,
+      String(framed()),
+    );
+    cloth.clear();
+  }
+
+  // ── ① 다시 세우면 좌표가 **실제로** 바뀐다 ──────────────────
+  //
+  // 실측에서 바뀌지 않은 것이 좌표였다. 개수로 판정하면 결함 상태도 통과한다.
+  {
+    const { viewer, cloth, framed } = stubViewer();
+    const mirror = new ClothObject(); // 가운데 칸의 흰 천 (L-2a)
+    const spy = topologySpy();
+
+    // 왕복 한 벌을 받아 세운다. 응답을 손으로 푸는 자리라 **큐에 실제로 들어온
+    // 뒤에** 푼다 — 앞에 `await` 이 하나 끼어들면 여기서 멎지 않고 위 ② 가 빨개진다.
+    const stage = async (seed: number): Promise<ReturnType<typeof installTopology> | null> => {
+      const p = fetchTopology(spy.client);
+      if (await until(() => spy.pending() === 1, 1_000)) spy.serve(surfaceTopology(seed));
+      const d = await settled(p);
+      if (d === null || d instanceof Error) return null;
+      return installTopology(viewer, d, { mirror });
+    };
+
+    const before = await stage(1);
+    const cloth0 = clothFingerprint(cloth);
+    const mirror0 = clothFingerprint(mirror);
+
+    // 옷 사이즈 [적용] 뒤에 워커가 주는 것 — 개수는 같고 좌표만 다르다.
+    const after = await stage(3);
+    check(
+      '★ 대조군: 두 벌 다 실제로 화면에 섰다 (아래 비교가 빈손끼리의 비교가 아니다)',
+      before !== null && after !== null,
+      `${before === null ? '1차 실패' : ''}${after === null ? ' 2차 실패' : ''}` || 'OK',
+    );
+    if (before === null || after === null) return;
+
+    check(
+      '★★★ (a) 3D 옷 메시의 **정점 좌표**가 달라진다 (개수가 아니라 좌표다)',
+      clothFingerprint(cloth) !== cloth0,
+      `${cloth0} → ${clothFingerprint(cloth)}`,
+    );
+    check(
+      '★★★ (b) 2D 흰 천 메시도 같이 달라진다 (가운데 칸이 옛 좌표로 남지 않는다)',
+      clothFingerprint(mirror) !== mirror0,
+      `${mirror0} → ${clothFingerprint(mirror)}`,
+    );
+    check(
+      '★★★ 그런데 패턴 수·정점 수는 그대로다 — 결함 상태와 **구분되지 않는 지표**임을 못박는다',
+      before.patterns === after.patterns && before.vertices === after.vertices
+      && after.patterns === 2 && after.vertices === 11,
+      `패턴 ${before.patterns}→${after.patterns} · 정점 ${before.vertices}→${after.vertices}`,
+    );
+    check(
+      '★ 대조군: 같은 응답을 다시 세우면 지문이 그대로다 (지문이 아무 때나 바뀌지 않는다)',
+      (() => {
+        const f = clothFingerprint(cloth);
+        installTopology(viewer, { patterns: surfaceTopology(3), textures: [] }, { mirror });
+        return clothFingerprint(cloth) === f;
+      })(),
+      clothFingerprint(cloth),
+    );
+    check(
+      '★★ 두 칸이 **같은 디코딩 결과**에서 선다 (서로 다른 순간의 토폴로지를 못 든다)',
+      clothFingerprint(cloth) === clothFingerprint(mirror),
+      `${clothFingerprint(cloth)} vs ${clothFingerprint(mirror)}`,
+    );
+    // ── ⑤ 카메라 ─────────────────────────────────────────────
+    check(
+      '★★★ ⑤ 다시 세워도 카메라를 안 맞춘다 (사용자가 조각을 보려고 잡아 둔 시점을 안 뺏는다)',
+      framed() === 0,
+      `frameCamera ${framed()}회`,
+    );
+    check(
+      '★ 대조군: `frameCamera:true` 면 맞춘다 (안 맞춘 것이 우연이 아니다)',
+      (() => {
+        installTopology(viewer, { patterns: surfaceTopology(3), textures: [] }, { frameCamera: true });
+        return framed() === 1;
+      })(),
+      `frameCamera ${framed()}회`,
+    );
+    cloth.clear();
+    mirror.clear();
+  }
+
+  // ── `installTopology` 가 동기라는 것 자체가 계약이다 ─────────
+  //
+  // 호출자(`main.ts` 의 `restageTopology`)의 순번 검사가 **하나로** 충분한
+  // 근거가 이것이다 — 검사와 반영 사이에 `await` 이 없으면 아무것도 못 끼어든다.
+  {
+    const { viewer, cloth } = stubViewer();
+    const r: unknown = installTopology(viewer, { patterns: surfaceTopology(2), textures: [] });
+    check(
+      '★★ `installTopology` 는 동기다 (Promise 가 아니다) — 순번 검사 하나로 뒤를 다 지키는 근거',
+      !(r instanceof Promise) && typeof (r as { patterns: number }).patterns === 'number',
+      r instanceof Promise ? 'Promise 를 돌려줬다' : 'StagedTopology',
+    );
+    cloth.clear();
+  }
+
+  // ── 빈 패턴 / 왕복 실패는 화면을 안 건드린 채로 던진다 ───────
+  {
+    const spy = topologySpy();
+    const { cloth } = stubViewer();
+    installTopology({ cloth } as unknown as Viewer3D, { patterns: surfaceTopology(1), textures: [] });
+    const standing = clothFingerprint(cloth);
+
+    const p = fetchTopology(spy.client);
+    if (await until(() => spy.pending() === 1, 1_000)) spy.serve([]);
+    const err = await settled(p);
+    check(
+      '패턴이 하나도 없으면 던진다 (빈 화면을 조용히 세우지 않는다)',
+      err instanceof Error && messageOf(err).includes('패턴'),
+      messageOf(err),
+    );
+    check(
+      '★ 그때도 서 있던 옷은 그대로다 (실패가 화면을 지우지 않는다)',
+      clothFingerprint(cloth) === standing,
+      `${standing} → ${clothFingerprint(cloth)}`,
+    );
+
+    const p2 = fetchTopology(spy.client);
+    if (await until(() => spy.pending() === 1, 1_000)) spy.fail(new Error('소켓이 끊겼습니다'));
+    const err2 = await settled(p2);
+    check(
+      '왕복이 실패하면 거부가 그대로 올라온다 (호출자가 stream.resume() 을 판단할 수 있게)',
+      err2 instanceof Error && messageOf(err2).includes('소켓'),
+      messageOf(err2),
+    );
+    check(
+      '★ 그때도 화면은 그대로다',
+      clothFingerprint(cloth) === standing,
+      `${standing} → ${clothFingerprint(cloth)}`,
+    );
+    cloth.clear();
+  }
+
+  // ── ①(c) 도면 커브. 다시 그리면 좌표가 바뀌고 옛 선이 안 남는다 ──
+  {
+    const layer = new Design2DLayer();
+    layer.build(fakeDesign2D());
+    const f0 = designFingerprint(layer);
+    const n0 = layer.group.children.length;
+
+    layer.build(fakeDesign2DShifted(17));
+    check(
+      '★★★ (c) 도면 커브를 다시 받으면 **정점 지문이 바뀐다** (실측 결함: 320d3ebb 로 비트 동일이었다)',
+      designFingerprint(layer) !== f0,
+      `${f0} → ${designFingerprint(layer)}`,
+    );
+    check(
+      '★★ 옛 커브가 겹쳐 남지 않는다 (새 패턴 위에 옛 봉제선이 그려지면 원인을 못 읽는다)',
+      layer.group.children.length === n0,
+      `${n0} → ${layer.group.children.length}`,
+    );
+    check(
+      '★ 대조군: 같은 것을 다시 받으면 지문이 그대로다',
+      (() => {
+        layer.build(fakeDesign2DShifted(17));
+        return designFingerprint(layer) === designFingerprint(layer);
+      })() && (() => {
+        const a = designFingerprint(layer);
+        layer.build(fakeDesign2DShifted(17));
+        return designFingerprint(layer) === a;
+      })(),
+      designFingerprint(layer),
+    );
+    layer.clear();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// §15-2. L-3d — 그 갈래를 **부르는 자리** (main.ts 소스 대조)
+//
+// `main.ts` 는 DOM 을 잡고 있어 Node 가 import 조차 못 한다. 그런데 이 단위의
+// 결함 둘은 전부 그 파일의 **호출 한 줄**이었다(복구가 `show()` 였다 / 적용
+// 뒤에 아무도 안 불렀다). 실행할 수 없다고 안 보면, 정확히 결함이 났던 자리에
+// 자동 단언이 하나도 없는 상태로 돌아간다.
+//
+// 그래서 §11 이 `protocol.cpp` 를 읽어 키 이름을 대조하는 것과 같은 방법을
+// 쓴다 — **소스를 읽어 배선을 대조한다.**
+//
+// ⚠️ **한계를 분명히 해 둔다.** 이것은 "이 이름을 부른다/안 부른다" 까지고,
+//    실행 순서·조건·실제 화면은 못 본다. 예: `restageTopology` 를 부르지만 그
+//    앞에서 던지는 코드가 생기면 여기서는 안 걸린다. 그건 사람이 브라우저에서
+//    본다. 반대로 여기서 잡히는 것(호출이 통째로 사라짐, `show()` 로 되돌림,
+//    `frameCamera` 가 붙음)은 **전부 실제로 났던 결함의 모양**이다.
+// ─────────────────────────────────────────────────────────────
+
+const MAIN_TS = path.resolve(FRONTEND, 'src/main.ts');
+const LOADER_TS = path.resolve(FRONTEND, 'src/viewer3d/loader.ts');
+const VIEWER3D_BARREL = path.resolve(FRONTEND, 'src/viewer3d/index.ts');
+
+/**
+ * 주석만 지운다 — 문자열·템플릿 안의 `//` 는 살린다.
+ *
+ * 왜 필요한가: 이 절이 보는 것 중에 **"순번 검사 뒤로 `await` 이 없다"** 가
+ * 있는데, 바로 그 자리의 주석이 `await` 이라는 낱말을 쓰고 있다. 주석을 안
+ * 지우면 그 단언이 영원히 빨갛다.
+ */
+function stripComments(src: string): string {
+  let out = '';
+  let mode: 'code' | 'line' | 'block' | '"' | "'" | '`' = 'code';
+  for (let i = 0; i < src.length;) {
+    const c = src[i] ?? '';
+    const d = src[i + 1] ?? '';
+    if (mode === 'code') {
+      if (c === '/' && d === '/') { mode = 'line'; i += 2; continue; }
+      if (c === '/' && d === '*') { mode = 'block'; i += 2; continue; }
+      if (c === '"' || c === "'" || c === '`') mode = c;
+      out += c; i++; continue;
+    }
+    if (mode === 'line') {
+      if (c === '\n') { mode = 'code'; out += c; }
+      i++; continue;
+    }
+    if (mode === 'block') {
+      if (c === '*' && d === '/') { mode = 'code'; i += 2; } else i++;
+      continue;
+    }
+    if (c === '\\') { out += c + d; i += 2; continue; }
+    if (c === mode) mode = 'code';
+    out += c; i++;
+  }
+  return out;
+}
+
+/** TS 함수 본문을 중괄호 깊이로 잘라 낸다 (§11 의 `cppBody` 와 같은 정신) */
+function tsBody(src: string, signature: string): string {
+  const at = src.indexOf(signature);
+  if (at < 0) return '';
+  const open = src.indexOf('{', at + signature.length);
+  if (open < 0) return '';
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') {
+      depth--;
+      if (depth === 0) return src.slice(open + 1, i);
+    }
+  }
+  return '';
+}
+
+function countOf(hay: string, needle: string): number {
+  let n = 0;
+  for (let i = hay.indexOf(needle); i >= 0; i = hay.indexOf(needle, i + needle.length)) n++;
+  return n;
+}
+
+function sectionRestageWiring(): void {
+  section('§15-2. L-3d — 갱신을 부르는 자리 (main.ts 소스 대조, DOM 없이)');
+
+  if (!existsSync(MAIN_TS)) {
+    check('main.ts 를 찾았다', false, MAIN_TS);
+    return;
+  }
+  const src = stripComments(readFileSync(MAIN_TS, 'utf8'));
+
+  const restage = tsBody(src, "async function restageTopology(cause: string): Promise<RestageOutcome>");
+  const show = tsBody(src, 'async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<void>');
+  const clear = tsBody(src, 'function clearScene(): void');
+  const mismatch = tsBody(src, 'onMismatch: ({ frame, incoming, current }) =>');
+  const applySize = tsBody(src, 'async function applySurfaceSize(uuid: string): Promise<void>');
+
+  // ── 대조군 ①. 추출기가 실제로 그 함수를 잘랐는가 ────────────
+  //
+  // 이게 없으면 이름을 오타 낸 순간 본문이 빈 문자열이 되고, "`load` 를 안
+  // 부른다" 같은 **부정 단언이 전부 공짜로 초록**이 된다. 이 절에서 제일
+  // 위험한 실패 방식이라 먼저 못박는다.
+  const cut: [string, string, string][] = [
+    ['restageTopology', restage, "return 'staged';"],
+    ['show', show, 'refreshParams();'],
+    ['clearScene', clear, 'setBusy(false);'],
+    ['onMismatch', mismatch, 'MAX_TOPOLOGY_RECOVERIES'],
+    ['applySurfaceSize', applySize, 'client.setSurfaceSize('],
+  ];
+  for (const [name, body, marker] of cut) {
+    check(
+      `★ 대조군: \`${name}\` 본문을 잘라 냈다 (부정 단언이 공짜로 초록이 되지 않는다)`,
+      body.length > 0 && body.includes(marker),
+      body.length === 0 ? '못 잘랐다' : `${body.length}자, 표지 ${body.includes(marker) ? '있음' : '없음'}`,
+    );
+  }
+  // 대조군 ②. 옆 함수를 먹지 않았다 — 먹으면 긍정 단언이 남의 코드로 통과한다.
+  check(
+    '★ 대조군: `restageTopology` 가 옆 함수(`show`)를 먹지 않았다',
+    !restage.includes('playback.sceneLoading()') && !restage.includes('setBusy(true)'),
+    `${restage.length}자`,
+  );
+
+  // ── ② 결함 B. 갱신 갈래가 씬을 다시 열지 않는다 ─────────────
+  check(
+    '★★★ ② `restageTopology` 안에 `client.load` 도 `showScene` 도 없다 (결함 B 의 정확한 모양)',
+    !restage.includes('client.load') && !restage.includes('showScene'),
+    restage.includes('client.load') ? 'client.load 가 있다' : restage.includes('showScene') ? 'showScene 이 있다' : '없음',
+  );
+  check(
+    '★★ 그 자리가 `fetchTopology` + `installTopology` 다',
+    restage.includes('fetchTopology(client)') && restage.includes('installTopology(viewer,'),
+    `fetch=${restage.includes('fetchTopology(client)')} install=${restage.includes('installTopology(viewer,')}`,
+  );
+
+  // ── ③ onMismatch 복구 ──────────────────────────────────────
+  check(
+    '★★★ ③ `onMismatch` 복구가 `restageTopology` 다 — `show(` 로 되돌아가 있지 않다',
+    mismatch.includes('restageTopology(') && !mismatch.includes('show(currentScene')
+    && !/\bshow\(/.test(mismatch),
+    mismatch.includes('restageTopology(') ? '' : 'restageTopology 를 안 부른다',
+  );
+  check(
+    '★★ 복구 예산(MAX_TOPOLOGY_RECOVERIES)과 초과 시 중단이 그대로 산다',
+    mismatch.includes('topologyRecoveries >= MAX_TOPOLOGY_RECOVERIES')
+    && mismatch.includes('topologyRecoveries += 1')
+    && mismatch.includes('복구를 중단합니다'),
+    mismatch.replace(/\s+/g, ' ').slice(0, 60),
+  );
+
+  // ── ① 적용 뒤 갱신을 부른다 ────────────────────────────────
+  check(
+    '★★★ ① 옷 사이즈 [적용] 이 성공하면 `restageTopology` 를 부른다 (결함 A 의 정확한 모양)',
+    applySize.includes('restageTopology('),
+    applySize.includes('restageTopology(') ? '' : '아무도 안 부른다',
+  );
+  check(
+    '★★ 실패하면 안 부른다 (옷이 안 바뀌었으므로 다시 세울 것이 없다)',
+    /if\s*\(!applied\)\s*return;/.test(applySize)
+    && applySize.indexOf('if (!applied) return;') < applySize.indexOf('restageTopology('),
+    `applied 가드 ${/if\s*\(!applied\)\s*return;/.test(applySize) ? '있음' : '없음'}`,
+  );
+
+  // ── ④ 도면 커브. 왕복이 **1회** ────────────────────────────
+  check(
+    '★★★ ④ `restageTopology` 가 `refreshDesign2d` 를 부른다 (도면이 옛 좌표로 남지 않는다)',
+    countOf(restage, 'refreshDesign2d(') === 1,
+    `${countOf(restage, 'refreshDesign2d(')}회`,
+  );
+  check(
+    '★★ 적용 갈래는 `refreshDesign2d` 를 **따로** 안 부른다 (왕복이 겹치면 어느 쪽이 마지막인지 다시 알 수 없다)',
+    !applySize.includes('refreshDesign2d'),
+    applySize.includes('refreshDesign2d') ? '두 번 부른다' : '1회',
+  );
+  check(
+    '★★ 그 왕복도 순번을 물려받는다 (늦게 온 커브가 새 도면 위에 그려지지 않는다)',
+    restage.includes('refreshDesign2d(() => seq === restageSeq)'),
+    restage.includes('refreshDesign2d(() => seq === restageSeq)') ? '' : '순번을 안 넘긴다',
+  );
+  // 늦게 온 **실패**도 버린다. `catch` 안에 같은 검사가 있어야 지나간 왕복의
+  // 실패가 방금 선 커브를 `design.clear()` 로 지우지 않는다.
+  const design2d = tsBody(src, 'async function refreshDesign2d(stillWanted: () => boolean = () => true): Promise<void>');
+  check(
+    '★ 대조군: `refreshDesign2d` 본문을 잘라 냈다',
+    design2d.length > 0 && design2d.includes('client.design2d()'),
+    `${design2d.length}자`,
+  );
+  check(
+    '★★ 성공·실패 **양쪽** 모두 `stillWanted()` 로 거른다 (지나간 실패가 방금 선 커브를 지우지 않는다)',
+    countOf(design2d, 'if (!stillWanted()) return;') === 2,
+    `${countOf(design2d, 'if (!stillWanted()) return;')}곳`,
+  );
+
+  // ── ⑤ 카메라 ───────────────────────────────────────────────
+  check(
+    '★★★ ⑤ `restageTopology` 는 화각을 한 마디도 안 건드린다 (`frameCamera` 가 안 나온다)',
+    !restage.includes('frameCamera'),
+    restage.includes('frameCamera') ? 'frameCamera 가 있다' : '없음',
+  );
+  check(
+    '★ 대조군: 씬을 처음 여는 `show()` 에는 `frameCamera` 가 있다 (없는 것이 우연이 아니다)',
+    show.includes('frameCamera'),
+    show.includes('frameCamera') ? '' : 'show 에도 없다',
+  );
+
+  // ── 순번 토큰. 늦게 온 응답이 옛 토폴로지를 세우지 못한다 ────
+  const guard = "if (seq !== restageSeq) return 'superseded';";
+  check(
+    '★★★ `meshData` 왕복 **직후** 순번 검사가 있다 (늦게 온 응답이 옛 옷을 세우지 못한다)',
+    countOf(restage, guard) >= 2,
+    `${countOf(restage, guard)}곳 (왕복 성공 + catch)`,
+  );
+  // ★★★ 이 절에서 제일 얇은 얼음. "검사 하나로 뒤 전체를 지킨다" 는 근거가
+  //     **그 아래에 await 이 없다** 뿐이라, 누가 나중에 한 줄 끼워 넣으면
+  //     조용히 깨진다. 그 한 줄을 여기서 잡는다.
+  const lastGuard = restage.lastIndexOf(guard);
+  const tail = lastGuard >= 0 ? restage.slice(lastGuard + guard.length) : '';
+  check(
+    '★★★ 그 검사 **뒤로 `await` 이 하나도 없다** — 검사 하나가 후속 작업 전체를 지키는 근거',
+    lastGuard >= 0 && !/\bawait\b/.test(tail),
+    lastGuard < 0 ? '검사를 못 찾았다' : `뒤쪽 ${tail.length}자에 await ${(tail.match(/\bawait\b/g) ?? []).length}개`,
+  );
+  check(
+    '★ 대조군: 검사 **앞**에는 `await` 이 있다 (뒤가 비어서 통과한 것이 아니다)',
+    lastGuard > 0 && /\bawait\b/.test(restage.slice(0, lastGuard)),
+    `앞쪽 ${lastGuard}자`,
+  );
+  check(
+    '★★★ 씬을 통째로 갈아 끼우는 `show()` 도 순번을 올린다 (날고 있던 왕복을 무효로 만든다)',
+    show.includes('restageSeq += 1'),
+    show.includes('restageSeq += 1') ? '' : '안 올린다 — 로드 뒤에 옛 토폴로지가 설 수 있다',
+  );
+  check(
+    '★★★ 씬을 내리는 `clearScene()` 도 순번을 올린다 (빈 화면에 옛 옷이 서지 않는다)',
+    clear.includes('restageSeq += 1'),
+    clear.includes('restageSeq += 1') ? '' : '안 올린다',
+  );
+  check(
+    '★★ `busy` 인 동안은 물러난다 (로드가 어차피 통째로 다시 세운다)',
+    /if\s*\(busy\)\s*return 'superseded';/.test(restage),
+    '',
+  );
+
+  // ── stream.resume() 의 세 갈래 ─────────────────────────────
+  //
+  // 규칙: `superseded` 는 **절대** 재개 안 함 / `staged` 는 세운 뒤 / 왕복
+  // 실패는 **재개함**. 마지막 것이 중요하다 — `onMismatch` 로 들어오면
+  // 스트림이 멈춘 채인데, 안 풀면 다시 어긋날 계기조차 없어 재생이 영영 멎는다.
+  // ⚠️ `return 'failed';` 는 두 곳이다(맨 위 가드 + catch). `lastIndexOf` 여야
+  //    catch 갈래를 집는다 — `indexOf` 면 범위가 뒤집혀 빈 문자열이 되고, 그러면
+  //    아래 단언이 **본문을 못 읽은 채로** 판정하게 된다.
+  const catchBody = restage.slice(restage.indexOf('} catch'), restage.lastIndexOf("return 'failed';"));
+  const fetchAt = restage.indexOf('await fetchTopology(client)');
+  const resumeAt: number[] = [];
+  for (let i = restage.indexOf('stream.resume();'); i >= 0; i = restage.indexOf('stream.resume();', i + 1)) {
+    resumeAt.push(i);
+  }
+  check(
+    '★ 대조군: `catch` 갈래를 잘라 냈다',
+    catchBody.length > 0 && catchBody.includes('토폴로지를 다시 받지 못했습니다'),
+    `${catchBody.length}자`,
+  );
+  check(
+    '★★★ 왕복이 실패하면 `stream.resume()` 을 부른다 (안 풀면 `onMismatch` 로 들어온 정지가 영영 안 풀린다)',
+    catchBody.includes('stream.resume();'),
+    catchBody.includes('stream.resume();') ? '' : '안 푼다',
+  );
+  check(
+    '★★ `stream.resume()` 은 딱 두 곳이고 **둘 다 왕복 뒤다** (앞에서 미리 풀면 복구 예산만 태운다)',
+    fetchAt > 0 && resumeAt.length === 2 && resumeAt.every((i) => i > fetchAt),
+    `resume ${resumeAt.length}곳, 왕복 위치 ${fetchAt}, 자리 [${resumeAt.join(', ')}]`,
+  );
+  check(
+    '★★★ `staged` 로 서는 갈래는 **순번 검사 뒤에** 푼다 (`superseded` 로 물러나는 자리에는 resume 이 없다)',
+    lastGuard >= 0 && tail.includes('stream.resume();')
+    && resumeAt.filter((i) => i > lastGuard).length === 1,
+    `검사 뒤 resume ${resumeAt.filter((i) => i > lastGuard).length}곳`,
+  );
+
+  // ── 갈래가 배럴 밖으로 나가 있다 ───────────────────────────
+  {
+    const barrel = existsSync(VIEWER3D_BARREL) ? readFileSync(VIEWER3D_BARREL, 'utf8') : '';
+    check(
+      '`viewer3d/index.ts` 가 세 갈래를 전부 내보낸다 (한 곳이라도 빠지면 배럴만 쓰는 쪽이 못 부른다)',
+      barrel.includes('fetchTopology') && barrel.includes('installTopology') && barrel.includes('showScene'),
+      barrel === '' ? '배럴을 못 읽었다' : '',
+    );
+    const loader = existsSync(LOADER_TS) ? stripComments(readFileSync(LOADER_TS, 'utf8')) : '';
+    check(
+      '★★ `fetchTopology` 안에 `client.load` 가 없다 (갈래를 만들어 놓고 그 안에서 여는 것을 막는다)',
+      loader.length > 0 && !tsBody(loader, 'export async function fetchTopology(client: GatewayClient): Promise<DecodedTopology>').includes('load('),
+      loader.length === 0 ? '로더를 못 읽었다' : '',
+    );
+    check(
+      '★★ `installTopology` 는 `async` 가 아니다 (동기라는 계약이 시그니처에 박혀 있다)',
+      loader.includes('export function installTopology(') && !loader.includes('export async function installTopology('),
+      '',
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
 // §9. 좀비 프로세스
 // ─────────────────────────────────────────────────────────────
 
@@ -8809,6 +9506,10 @@ async function main(): Promise<void> {
   // D2-e 재단 도면의 표시 스위치. DOM 도 워커도 안 쓴다 — 깨지면 조용한
   // 두 가지(접두사 우선순위 · 재로드 후 상태 유지)만 좁게 본다.
   sectionDesignLayers();
+  // L-3d 옷 사이즈가 화면에 반영된다. 워커를 안 쓴다 — 갈래 자체(§15-1)는 가짜
+  // 클라이언트로 돌고, 그 갈래를 부르는 자리(§15-2)는 `main.ts` 를 소스로 읽는다.
+  await sectionRestageSplit();
+  sectionRestageWiring();
   await sectionZombies();
 
   clearInterval(keepAlive);

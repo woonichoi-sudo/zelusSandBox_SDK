@@ -84,11 +84,14 @@ import {
 } from './ui/index.ts';
 import { Unfolder, UnfoldController, Viewer2D } from './viewer2d/index.ts';
 import {
+  fetchTopology,
   FrameStream,
+  installTopology,
   showScene,
   SnapshotLoader,
   SnapshotStaleError,
   Viewer3D,
+  type DecodedTopology,
   type FrameStreamStats,
   type ParsedSnapshot,
   type SnapshotLoaderStats,
@@ -293,20 +296,48 @@ client.on('error', ({ error }) => log(`[오류] ${error.message}`));
 const MAX_TOPOLOGY_RECOVERIES = 3;
 let topologyRecoveries = 0;
 
+/**
+ * 화면을 다시 세운 결과 셋 (`restageTopology`).
+ *
+ * `superseded` 를 `failed` 와 **가른 것이 요점이다** — 더 새로운 재구성에
+ * 자리를 내준 것은 정상 동작이고, 실패로 취급해 로그를 찍으면 없는 고장이
+ * 화면에 뜬다.
+ */
+type RestageOutcome = 'staged' | 'superseded' | 'failed';
+
+/**
+ * 마지막으로 **시작한** 재구성의 번호. 늦게 온 응답을 버리는 유일한 장치다.
+ *
+ * ★ **"마지막에 시작한 것이 마지막에 도착한다" 는 거짓이다.** A 가 먼저
+ *   시작하고 B 가 뒤에 시작해도 A 의 `meshData` 왕복이 더 오래 걸리면 A 가
+ *   마지막에 화면을 세운다. 그러면 **옛 지오메트리가 서고 다시 고칠 계기가
+ *   없다** — 재생 중이 아니면 `onMismatch` 조차 안 오기 때문이다. 낭비가
+ *   아니라 결함이라 검사가 필요하다.
+ *
+ * `restageTopology` 만 올리는 것이 아니다. 씬을 통째로 갈아 끼우는
+ * `show()`·`clearScene()` 도 올린다 — 그쪽이 더 새로운 진실이기 때문이다.
+ */
+let restageSeq = 0;
+
 const stream = new FrameStream({
   // frame 이벤트의 mesh 에는 indices·uvs 가 없어서 스트림 혼자서는 토폴로지를
-  // 다시 세울 수 없다. `meshData(true)` 를 다시 받는 것 = showScene() 이고,
-  // 그건 프로토콜을 아는 이쪽의 일이다.
+  // 다시 세울 수 없다. `meshData(true)` 를 다시 받는 것이 복구이고, 그건
+  // 프로토콜을 아는 이쪽의 일이다.
+  //
+  // ★ **씬을 다시 열지 않는다** (L-3d). 예전에는 여기가 `show()` 였는데 그
+  //   안의 `client.load()` 가 `.zls` 를 디스크에서 다시 열어, 어긋남의 원인이
+  //   된 워커 쪽 편집(옷 사이즈 등)을 통째로 되돌렸다 — 실측 2/2 재현.
+  //   `restageTopology` 는 `load` 없이 `meshData(true)` 부터 한다.
   onMismatch: ({ frame, incoming, current }) => {
     log(`프레임 ${frame} 의 토폴로지가 화면과 다릅니다 (패턴 ${incoming} vs ${current})`);
     if (!currentScene) return;
     if (topologyRecoveries >= MAX_TOPOLOGY_RECOVERIES) {
-      status('토폴로지를 다시 세워도 계속 어긋납니다 — 재로드를 중단합니다', true);
+      status('토폴로지를 다시 세워도 계속 어긋납니다 — 복구를 중단합니다', true);
       return;
     }
     topologyRecoveries += 1;
     status(`토폴로지를 다시 받습니다 (${topologyRecoveries}/${MAX_TOPOLOGY_RECOVERIES})`);
-    void show(currentScene, { refit: false });
+    void restageTopology('토폴로지 복구');
   },
 });
 
@@ -702,20 +733,31 @@ async function refreshSurfaces(): Promise<void> {
  * 화각(`fit`)은 **손대지 않는다.** 도면 범위는 이미 `unfolder2d` 가 옷 메시의
  * 점에서 정했고, 커브는 그 안에 있다. 여기서 다시 맞추면 사용자가 맞춰 둔
  * 확대가 로드마다 튄다.
+ *
+ * @param stillWanted 왕복이 돌아온 **뒤에** 물어보는 것. `false` 면 화면을
+ *   한 곳도 만지지 않고 조용히 빠진다. 이 왕복도 `meshData` 와 똑같이 늦게
+ *   도착할 수 있어서, 겹쳤을 때 **새 도면 위에 옛 봉제선**이 그려지는 것을
+ *   막는 유일한 장치다 (`restageTopology` 의 순번을 그대로 물려받는다).
+ *   기본값은 "항상 원한다" — 로드 경로(`show()`)는 `busy` 로 이미 겹치지 않는다.
  */
-async function refreshDesign2d(): Promise<void> {
+async function refreshDesign2d(stillWanted: () => boolean = () => true): Promise<void> {
   if (!currentScene || !client.connected) {
     viewer2d.design.clear();
     return;
   }
   try {
-    viewer2d.design.build(await client.design2d());
+    const design = await client.design2d();
+    if (!stillWanted()) return;
+    viewer2d.design.build(design);
     const v = viewer2d.design.view;
     log(
       `2D 디자인 — 커브 ${v.curves} · 제어점 ${v.vertices} · 봉제선 ${v.seams}`
       + ` (대응선 ${v.links}) · 스티치 ${v.stitches}`,
     );
   } catch (err: unknown) {
+    // 실패도 늦게 도착하면 버린다 — 지나간 왕복의 실패로 방금 선 커브를
+    // 지우면, 화면만 보고는 무엇이 실패했는지 알 길이 없다.
+    if (!stillWanted()) return;
     // 옛 씬의 커브를 남기지 않는다. 남기면 새 패턴 위에 옛 봉제선이 겹쳐서,
     // 화면만 보면 "도면이 이상하게 그려졌다" 로 보인다.
     viewer2d.design.clear();
@@ -729,10 +771,18 @@ async function refreshDesign2d(): Promise<void> {
  * ★ 응답이 **바꾼 뒤의 전체 목록**이라 그대로 부으면 된다. 엔진이 값을
  *   조정했으면(실측: 폭을 +30% 하면 높이가 0.03% 흔들린다) 그 사실이 화면에
  *   그대로 드러난다 — 요청값을 화면에 남기면 그 조정이 가려진다.
+ *
+ * ★ **성공하면 화면을 다시 세운다** (L-3d). 이게 없으면 워커는 정확히 바뀐
+ *   값을 주는데 화면 셋(3D 옷 · 2D 흰 천 · 2D 도면 커브)이 전부 옛것이다 —
+ *   실측: 적용 전후로 정점 해시가 비트 단위로 같았다. "숫자만 바뀌고 그림은
+ *   안 바뀐다" 는 원인이 화면 어디에도 안 남는 실패다.
+ *   도면 커브까지 `restageTopology` 가 맡는다 — 여기서 따로 부르면 왕복이
+ *   겹치고, 어느 쪽 응답이 마지막인지 다시 알 수 없게 된다.
  */
 async function applySurfaceSize(uuid: string): Promise<void> {
   const size = surfaceSize.payload(uuid);
   if (!size) return;
+  let applied = false;
   try {
     const res = await client.setSurfaceSize(uuid, size);
     surfaceSize.setFromWorker(res.surfaces);
@@ -741,10 +791,17 @@ async function applySurfaceSize(uuid: string): Promise<void> {
       `옷 사이즈 — ${now?.name ?? uuid}`
       + (now ? ` → ${now.width.toFixed(2)} × ${now.height.toFixed(2)}cm` : ''),
     );
+    applied = true;
   } catch (err: unknown) {
     status(`옷 사이즈 적용 실패: ${message(err)}`, true);
   }
+  // 값을 먼저 그린다. 아래 왕복이 도는 동안에도 패널의 숫자는 새것이어야 한다.
   surfacePanel.render();
+  // 실패했으면 화면을 건드리지 않는다 — 옷은 안 바뀌었으므로 다시 세울 것이 없다.
+  if (!applied) return;
+  // 옷 메시와 도면 커브. **씬을 다시 열지 않는다** — 열면 방금 보낸 편집이
+  // 사라진다. 커브는 `restageTopology` 가 자기 순번과 함께 부른다.
+  await restageTopology('옷 사이즈');
 }
 
 // ── 재단 도면의 표시 스위치 (D2-e) ──────────────────────────
@@ -923,6 +980,9 @@ async function refreshPose(cause: AvatarCause = '리셋'): Promise<void> {
  * 번이면 돌아온다. 상태줄이 그 방법을 말해 주는 이유가 그것이다.
  */
 function clearScene(): void {
+  // 씬이 내려간다. 날고 있는 재구성이 뒤늦게 도착해 빈 화면에 옛 옷을
+  // 세우지 못하도록 번호부터 올린다 (`show()` 와 같은 판단이다).
+  restageSeq += 1;
   viewer.cloth.clear();
   // 몸도 씬에 딸려 있다 (AM-1). 옷만 지우면 **몸만 남아 서 있어서** 씬이 아직
   // 있는 것처럼 보인다 — 가운데 칸에서 커브만 남던 것과 같은 계열의 사고다.
@@ -1274,8 +1334,109 @@ function setBusy(on: boolean): void {
   paintUnfold();
 }
 
+/**
+ * **씬을 다시 열지 않고** 토폴로지만 다시 받아 화면 셋을 맞춘다 (L-3d).
+ *
+ * 워커에서 옷이 바뀌었는데(옷 사이즈 [적용], 프레임 토폴로지 어긋남) 화면이
+ * 옛것인 자리를 전부 여기로 모은다. 예전에는 이 자리가 `show()` 였고, 그래서
+ * `.zls` 를 디스크에서 다시 열어 **워커의 편집을 통째로 버렸다** — 실측으로
+ * 재로드 3.2초 뒤 방금 바꾼 크기가 원래 값으로 돌아왔다.
+ *
+ * ★ **화각을 건드리지 않는다.** `installTopology` 의 `frameCamera` 기본값이
+ *   그래서 반대다 — 크기를 한 칸 바꿀 때마다 사용자가 조각을 보려고 잡아 둔
+ *   시점을 빼앗으면 정작 바뀐 것을 볼 수 없다.
+ *
+ * ★ **순번 검사는 딱 한 곳, `meshData` 가 돌아온 직후다.** 그 아래는 전부
+ *   동기라 검사와 반영 사이에 아무것도 끼어들 수 없고, 그래서 `setTopology`
+ *   뿐 아니라 **후속 작업 전체가 같은 보호를 받는다.** 늦게 온 응답이
+ *   `setTopology` 만 건너뛰고 `unfolder.build` 나 `#stat` 을 실행하면 화면과
+ *   글자가 서로 다른 순간을 말하는, 더 진단하기 어려운 상태가 된다.
+ *   유일한 예외가 도면 커브인데(왕복이 하나 더 있다) 그쪽은 같은 순번을
+ *   `stillWanted` 로 물려준다.
+ *
+ * ★ **`stream.resume()` 을 앞에서 부르지 않는다.** `show()` 는 로드 전후로 두
+ *   번 부르지만(아래), 여기서 앞의 한 번은 **해롭다**: 이 함수의 주 호출자
+ *   중 하나가 `onMismatch` 이고 그쪽은 스트림이 방금 **정지된** 상태로
+ *   들어온다. 앞에서 풀어 버리면 왕복이 도는 동안 새 토폴로지 프레임이 옛
+ *   지오메트리에 다시 적용을 시도해 또 어긋나고, 복구 예산만 태운다. 정지된
+ *   채로 두면 `drain` 이 조용히 버린다.
+ *   버려지는 호출(`superseded`)은 **절대 재개시키지 않는다** — 아직 서지도
+ *   않은 토폴로지에 프레임을 흘려보내는 셈이고, 어차피 자리를 물려받은 쪽이
+ *   자기 차례에 푼다.
+ */
+async function restageTopology(cause: string): Promise<RestageOutcome> {
+  // 씬이 없거나 소켓이 없으면 받아 올 곳이 없다.
+  if (!currentScene || !client.connected) return 'failed';
+  // 로드가 도는 중이면 물러난다. `show()` 가 어차피 토폴로지를 통째로 다시
+  // 세우고 `stream.resume()` 까지 부른다 — 우리가 나중에 도착해 옛것을
+  // 세우면 안 되므로, 이건 실패가 아니라 자리를 내준 것이다.
+  if (busy) return 'superseded';
+  const seq = (restageSeq += 1);
+  let decoded: DecodedTopology;
+  try {
+    decoded = await fetchTopology(client);
+  } catch (err: unknown) {
+    if (seq !== restageSeq) return 'superseded';
+    log(`${cause} — 토폴로지를 다시 받지 못했습니다: ${message(err)}`);
+    // 여기서만 정지를 푼다. `onMismatch` 로 들어온 경우 스트림이 멈춘 채인데,
+    // 안 풀면 **다시 어긋날 계기조차 없어** 재생이 영영 멎는다. 풀어 두면
+    // 다음 프레임이 또 어긋나며 재시도가 걸리고, 그 횟수는 복구 예산이 막는다.
+    stream.resume();
+    return 'failed';
+  }
+  // ★ 순번 검사. 여기부터 끝까지 `await` 이 없다 — 그게 이 검사 하나로
+  //   아래 전부를 지킬 수 있는 이유다.
+  if (seq !== restageSeq) return 'superseded';
+
+  const staged = installTopology(viewer, decoded, {
+    // 가운데 칸의 옷도 **같은 디코딩 결과**에서 세운다 (L-2a). 따로 받으면
+    // 두 칸이 서로 다른 순간의 토폴로지를 들 수 있다.
+    mirror: viewer2d.cloth,
+  });
+  // 재질이 새로 만들어졌다. 표를 안 바꾸면 화면 글자가 이미 없는 텍스처를
+  // 센다 (`showScene` 뒤에서 하는 것과 같은 일이다).
+  clothTextures = staged.textures;
+  syncTextureStats();
+  // 새 토폴로지가 섰다. 칸에 남아 있던 옛 프레임을 버리고 정지 상태를 푼다.
+  stream.resume();
+  // ★ 토폴로지가 갈릴 때마다 다시 불러야 하는 것들. **`show()` 와 같은 순서가
+  //   정본이다** — 빠뜨리면 도면이 옛 좌표로 남거나 면이 흰 종이가 아니게 된다.
+  unfolder.build(viewer.cloth.patterns);
+  unfoldControl.setScene(true);
+  unfoldControl.setStats(unfolder.stats);
+  unfolder2d.build(viewer2d.cloth.patterns);
+  unfolder2d.apply(viewer2d.cloth.patterns, 1);
+  viewer2d.paperize();
+  paintDraft2d();
+  // 도면 범위가 바뀌었으므로 슬라이더의 글자와 정사영 화각도 따라가야 한다.
+  // `show()` 는 `setBusy(false)` 를 지나며 이걸 하는데, 이 갈래는 `busy` 를
+  // 건드리지 않으므로 직접 부른다.
+  paintUnfold();
+  // 정점·삼각형 수가 바뀐다(패턴을 키우면 다시 삼각형이 잘린다). 옛 숫자를
+  // 남겨 두면 상태줄이 화면에 없는 메시를 말한다.
+  ui.stat.textContent = `패턴 ${staged.patterns} · 정점 ${staged.vertices} · 삼각형 ${staged.triangles}`;
+  log(`${cause} — 토폴로지를 다시 받았습니다 (패턴 ${staged.patterns} · 정점 ${staged.vertices})`);
+
+  // ★ 도면 커브·봉제선 (D2-c). **규칙을 하나로 둔다 — 토폴로지가 갈리면
+  //   커브도 다시 받는다.** "누가 바꿨는지" 로 생략을 정하면, 서피스를
+  //   건드리는 경로가 하나만 늘어도 조용히 깨진다. 그 깨진 모습이 "도면
+  //   선만 옛 좌표" 라서 눈에 거의 안 띈다.
+  //
+  //   **성패에 묶지 않는다** — `show()` 와 같은 판단이다(아래 주석). 커브가
+  //   없어도 옷은 서야 하므로 여기서 기다리지 않고, 이 함수는 이미 `staged` 다.
+  //   대신 순번을 물려줘서, 늦게 도착한 커브가 새 도면 위에 그려지는 것은
+  //   막는다.
+  void refreshDesign2d(() => seq === restageSeq);
+  return 'staged';
+}
+
 async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<void> {
   if (busy) return;
+  // ★ 이 로드가 **가장 새로운 재구성**이다. 번호를 올려 아직 날고 있는
+  //   `restageTopology` 를 전부 무효로 만든다 — 안 그러면 로드가 끝난 뒤에
+  //   도착한 옛 왕복이 방금 연 씬 위에 이전 씬의 토폴로지를 세운다.
+  //   `busy` 가드는 **앞으로의** 겹침만 막지, 이미 날고 있는 것은 못 막는다.
+  restageSeq += 1;
   // ★ 다른 씬이면 스냅샷을 버린다. 이전 씬의 아바타가 새 씬 위에 남아 있으면
   //   화면만 봐서는 절대 못 알아챈다 — 아바타는 씬이 달라도 거의 같아 보인다.
   //   재연결로 **같은 씬**을 다시 로드하는 경우(refit:false)에는 유지한다.
