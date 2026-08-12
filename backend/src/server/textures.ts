@@ -368,7 +368,11 @@ export function createTextureRoutes(store: TextureStore): RouteRegistrar {
         // 상대경로였다면 root 가 필요하지만, 우리 것은 언제나 절대경로다.
       }, (err?: Error) => {
         if (!err) {
-          store.countServed();
+          // ⚠️ **304 는 세지 않는다.** 이 콜백은 조건부 GET 이 304 로 끝나도
+          //    에러 없이 불린다. 그대로 세면 "내보낸 횟수" 가 재검증까지
+          //    포함하게 되는데, 이 단위의 값어치가 정확히 "304 라서 안
+          //    내보냈다" 이므로 카운터가 그 반대를 말하게 된다.
+          if (res.statusCode !== 304) store.countServed();
           return;
         }
         // 전송 도중 끊겼으면 헤더가 이미 나갔다. next() 로 넘기면 에러 JSON 이

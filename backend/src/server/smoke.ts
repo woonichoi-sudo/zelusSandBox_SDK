@@ -54,6 +54,7 @@ import {
   type SessionLike,
   type SessionSource,
 } from './sessions.ts';
+import { defaultTextureRoots, TextureStore } from './textures.ts';
 
 let failures = 0;
 
@@ -2643,11 +2644,20 @@ async function main(): Promise<void> {
         // 아바타 체형 (L-3a). 읽기는 무해하고, 쓰기는 buildSetAvatarBody 가
         // 타입만 거른 뒤 워커에 닿는다.
         ['avatarBody', true], ['setAvatarBody', true],
+        // 치수로 몸 만들기 (W-1). build 가 measurements 를 요구한다 — extra 참고.
+        // ★ 이 표에서 유일하게 세션을 10초 이상 붙잡는 op 이지만, 가짜 릴레이는
+        //   즉시 답하므로 여기서 재는 것은 "문이 열려 있는가" 뿐이다.
+        ['setAvatarMeasurements', true],
+        // 드레이프 (W-1). 인자가 없다 — 씬 존재 확인은 워커가 한다.
+        ['loadDraping', true],
         // 옷 사이즈 (L-3b). uuid 검증은 워커가 한다 — 게이트웨이는 타입만 본다.
         ['surfaces', true], ['setSurfaceSize', true],
         // 디자인 2D (D2-a). 읽기 전용이라 build 가 없다 — 인자가 없는 op 이다.
         ['design2d', true],
-        ['meshInfo', true], ['meshData', true], ['subscribe', true], ['unsubscribe', true],
+        ['meshInfo', true], ['meshData', true],
+        // 아바타 메시 (AM-1). 이 표에서 가장 큰 응답이고 build 가 불린 3개를 거른다.
+        ['avatarMesh', true],
+        ['subscribe', true], ['unsubscribe', true],
         ['export', true], ['quit', false],
       ];
       const extra: Record<string, Record<string, unknown>> = {
@@ -2659,6 +2669,9 @@ async function main(): Promise<void> {
         // build 가 uuid 와 크기 하나를 요구한다. 없으면 차단이 아니라 **거절**로
         // 떨어져서 "화이트리스트가 막았다"와 구분되지 않는다.
         setSurfaceSize: { uuid: 'x', width: 10 },
+        // build 가 비어 있지 않은 measurements 를 요구한다. 없으면(또는 `{}` 면)
+        // 차단이 아니라 **거절**로 떨어져서 화이트리스트 판정이 무의미해진다.
+        setAvatarMeasurements: { measurements: { Waist: 70 } },
       };
 
       let id = 100;
@@ -2674,9 +2687,14 @@ async function main(): Promise<void> {
         );
       }
 
-      check('표가 프로토콜 op 23개를 전부 덮는다', TABLE.length === 23, `${TABLE.length}개`);
+      // ★ 이 숫자는 **의식적인 인벤토리**다. op 을 더하고 여기를 안 고치면
+      //   빨간불이 난다 — "문이 하나 늘었다"를 사람이 한 번은 보게 하는 장치이고,
+      //   실제로 W-1/AM-1 의 op 3개(setAvatarMeasurements·loadDraping·avatarMesh)를
+      //   이 단언이 잡아냈다. 아래 집합 비교와 짝이라 하나만으로는 부족하다:
+      //   집합 비교는 **허용된 것**만 보므로 차단 op 이 늘어도 안 걸린다.
+      check('표가 프로토콜 op 26개를 전부 덮는다', TABLE.length === 26, `${TABLE.length}개`);
       check(
-        'allowedOps()가 허용 22개와 정확히 일치 (거부 문구에 실리는 목록)',
+        'allowedOps()가 허용 25개와 정확히 일치 (거부 문구에 실리는 목록)',
         allowedOps().slice().sort().join(',')
           === TABLE.filter(([, a]) => a).map(([o]) => o).sort().join(','),
         allowedOps().join(','),
@@ -2898,32 +2916,146 @@ async function main(): Promise<void> {
         `${paramBlocked}/${badParams.length} — 하나라도 새면 시뮬이 부분 적용된 상태가 된다`,
       );
 
-      // ⑦ meshData topology 강제
+      // ⑦ meshData — 불린 두 개를 **언제나 채워** 보낸다
+      //
+      // ★ `textures` 는 materials-c 에서 늘어난 칸이고 **기본이 true 다.**
+      //   이 단언을 새 사실에 맞춘 근거(회귀가 아니라는 판단):
+      //     · 재질을 싣는 응답에서 그 재질의 텍스처만 빼는 조합이 무의미하다
+      //     · 프레임 경로(`topology:false`)에는 재질이 자체가 없어 응답이 한
+      //       글자도 안 는다 — 대역폭 회귀가 성립하지 않는다
+      //     · 기본이 false 였다면 화면 쪽이 `textures:true` 를 한 곳에서만
+      //       빠뜨려도 흰 옷이 되고 크래시가 없어 원인을 못 읽는다
+      //   지키려는 성질은 **"기본값이 무엇인지 여기 적혀 있다"** 이다.
+      //   기본이 조용히 뒤집히면 아래 두 줄이 잡는다.
       relay.reset();
       await ask(ws, { id: 600, op: 'meshData' });
       check(
-        'meshData — topology 없으면 false로 채워 보낸다',
-        JSON.stringify(relay.last()?.payload) === '{"topology":false}',
+        'meshData — 아무것도 안 주면 topology:false · textures:true 로 채워 보낸다',
+        JSON.stringify(relay.last()?.payload) === '{"topology":false,"textures":true}',
         JSON.stringify(relay.last()?.payload),
       );
       relay.reset();
       await ask(ws, { id: 601, op: 'meshData', topology: true });
       check(
-        'meshData — topology:true는 그대로',
-        JSON.stringify(relay.last()?.payload) === '{"topology":true}',
+        'meshData — topology:true는 그대로 (textures 기본은 유지된다)',
+        JSON.stringify(relay.last()?.payload) === '{"topology":true,"textures":true}',
         JSON.stringify(relay.last()?.payload),
       );
       relay.reset();
-      const badTopo = await ask(ws, { id: 602, op: 'meshData', topology: 'true' });
+      await ask(ws, { id: 602, op: 'meshData', textures: false });
+      check(
+        '★ meshData — textures:false 는 그대로 실린다 (기본값이 덮어쓰지 않는다)',
+        JSON.stringify(relay.last()?.payload) === '{"topology":false,"textures":false}',
+        JSON.stringify(relay.last()?.payload),
+      );
+      relay.reset();
+      const badTopo = await ask(ws, { id: 603, op: 'meshData', topology: 'true' });
       check(
         'meshData — topology:"true"(문자열) 거부, 워커 미도달',
         badTopo?.['ok'] === false && relay.calls.length === 0,
         JSON.stringify(badTopo),
       );
+      relay.reset();
+      const badTex = await ask(ws, { id: 604, op: 'meshData', textures: 'yes' });
+      check(
+        'meshData — textures:"yes"(문자열) 거부, 워커 미도달',
+        badTex?.['ok'] === false && relay.calls.length === 0,
+        JSON.stringify(badTex),
+      );
+
+      // ⑦-2 avatarMesh — 같은 계열이되 칸이 셋이다. `normals` 기본이 **true** 인
+      //     것이 핵심이다: 법선은 topology 가 아니라 positions 와 한 몸이라
+      //     기본이 false 로 뒤집히면 몸이 움직이는데 음영만 굳는다.
+      relay.reset();
+      await ask(ws, { id: 610, op: 'avatarMesh' });
+      check(
+        '★ avatarMesh — 기본은 topology:false · normals:true · textures:true',
+        JSON.stringify(relay.last()?.payload)
+          === '{"topology":false,"normals":true,"textures":true}',
+        JSON.stringify(relay.last()?.payload),
+      );
+      relay.reset();
+      await ask(ws, { id: 611, op: 'avatarMesh', topology: true, normals: false, textures: false });
+      check(
+        'avatarMesh — 셋 다 명시하면 그대로 실린다',
+        JSON.stringify(relay.last()?.payload)
+          === '{"topology":true,"normals":false,"textures":false}',
+        JSON.stringify(relay.last()?.payload),
+      );
+      let avatarBadBlocked = 0;
+      for (const [k, v] of [['topology', 1], ['normals', 'x'], ['textures', null]] as const) {
+        relay.reset();
+        const rep = await ask(ws, { id: 612, op: 'avatarMesh', [k]: v });
+        if (rep?.['ok'] === false && relay.calls.length === 0) avatarBadBlocked += 1;
+        else check(`avatarMesh{${k}} 비불린 거부`, false, JSON.stringify(rep));
+      }
+      check(
+        'avatarMesh — 불린이 아닌 값 3종이 워커에 닿기 전에 막힌다',
+        avatarBadBlocked === 3,
+        `${avatarBadBlocked}/3`,
+      );
+
+      // ⑦-3 setAvatarMeasurements — **`null` 은 "지정 안 함" 이지 잘못된 값이
+      //     아니다.** 엔진팀 문서의 규약이고, 여기서 막으면 25개 중 일부만
+      //     지정하는 정상 사용이 통째로 불가능해진다.
+      relay.reset();
+      await ask(ws, {
+        id: 620, op: 'setAvatarMeasurements',
+        measurements: { Waist: 70, Bust: null },
+      });
+      check(
+        '★ setAvatarMeasurements — null 이 그대로 워커에 실린다 (지정 안 함)',
+        JSON.stringify(relay.last()?.payload)
+          === '{"measurements":{"Waist":70,"Bust":null}}',
+        JSON.stringify(relay.last()?.payload),
+      );
+      relay.reset();
+      await ask(ws, {
+        id: 621, op: 'setAvatarMeasurements',
+        measurements: { Waist: 70 }, simulationIterations: 3, bodyDimensionStepCm: 0.5,
+      });
+      check(
+        'setAvatarMeasurements — 튜너블 둘은 있을 때만 실린다',
+        JSON.stringify(relay.last()?.payload)
+          === '{"measurements":{"Waist":70},"simulationIterations":3,"bodyDimensionStepCm":0.5}',
+        JSON.stringify(relay.last()?.payload),
+      );
+      const badMeasure: Array<[string, string]> = [
+        ['measurements 누락', '{"id":630,"op":"setAvatarMeasurements"}'],
+        ['빈 객체', '{"id":631,"op":"setAvatarMeasurements","measurements":{}}'],
+        ['배열', '{"id":632,"op":"setAvatarMeasurements","measurements":[1]}'],
+        ['문자열 값', '{"id":633,"op":"setAvatarMeasurements","measurements":{"Waist":"70"}}'],
+        ['Infinity', '{"id":634,"op":"setAvatarMeasurements","measurements":{"Waist":1e999}}'],
+        // 0 이면 단계 수가 무한이 되어 워커가 돌아오지 않는다 — 굳게 만들 수
+        // 있는 값은 게이트웨이를 지나면 안 된다.
+        ['stepCm 0', '{"id":635,"op":"setAvatarMeasurements","measurements":{"Waist":70},"bodyDimensionStepCm":0}'],
+        ['iterations 음수', '{"id":636,"op":"setAvatarMeasurements","measurements":{"Waist":70},"simulationIterations":-1}'],
+      ];
+      let measureBlocked = 0;
+      for (const [label, raw] of badMeasure) {
+        relay.reset();
+        const rep = await ask(ws, null, { raw });
+        if (rep?.['ok'] === false && relay.calls.length === 0) measureBlocked += 1;
+        else check(`setAvatarMeasurements{${label}} 거부`, false, JSON.stringify(rep));
+      }
+      check(
+        `setAvatarMeasurements 잘못된 값 ${badMeasure.length}종이 워커에 닿기 전에 막힌다`,
+        measureBlocked === badMeasure.length,
+        `${measureBlocked}/${badMeasure.length}`,
+      );
+
+      // ⑦-4 loadDraping 은 build 가 없다 — 부가 필드를 통째로 버린다.
+      relay.reset();
+      await ask(ws, { id: 640, op: 'loadDraping', name: 'x', path: 'C:\\Windows\\win.ini' });
+      check(
+        'loadDraping — 인자가 없는 op 이라 클라이언트 필드가 하나도 안 실린다',
+        relay.last()?.payload === undefined,
+        JSON.stringify(relay.last()?.payload ?? null),
+      );
 
       // ⑧ 거부를 그렇게 많이 받고도 세션이 그대로다
       check(
-        `거부 ${injections.length + badIds.length + badParams.length}건 뒤에도 연결과 세션 유지`,
+        `거부 ${injections.length + badIds.length + badParams.length + badMeasure.length + 5}건 뒤에도 연결과 세션 유지`,
         ws.readyState === WebSocket.OPEN && gw.sessions.stats.busy === 1 && fake.released === 0,
         `readyState=${ws.readyState}, busy=${gw.sessions.stats.busy}`,
       );
@@ -4519,6 +4651,314 @@ async function main(): Promise<void> {
       SMOKE_EXPORT_ROOT,
     );
     await rm(canary, { force: true }).catch(() => {});
+  }
+
+  // ── §11-1. 텍스처 등록 — 경로의 주인이 우리가 아닌 유일한 저장소 ──
+  //
+  // 씬·익스포트와 방향이 다르다: **워커가 경로를 준다.** 그 경로는 결국 사용자가
+  // 올린 `.zls` 안의 문자열에서 왔으므로, 검사를 빼먹으면 업로드 하나로 서버의
+  // 임의 파일을 읽는 길이 생긴다. 여기서 재는 것은 그 검사가 실제로 서 있는가다.
+  section('11-1. 텍스처 등록 — 허용 뿌리와 거절 (TextureStore)');
+  {
+    const root = await mkdtemp(path.join(tmpdir(), 'zelus-smoke-tex-'));
+    try {
+      // 뿌리 **밖**이지만 접두사가 같은 디렉토리. `startsWith` 로 검사하면
+      // 여기가 통과한다 — 그 회귀를 잡는 자리다.
+      const evil = `${root}-evil`;
+      await mkdir(path.join(root, 'sub'), { recursive: true });
+      await mkdir(evil, { recursive: true });
+
+      const png = path.join(root, 'skin.png');
+      await writeFile(png, 'PNGDATA-0123456789', 'utf8');
+      const jpg = path.join(root, 'sub', 'cloth.jpg');
+      await writeFile(jpg, 'JPGDATA', 'utf8');
+      const outside = path.join(evil, 'secret.png');
+      await writeFile(outside, 'SECRET', 'utf8');
+      const zls = path.join(root, 'scene.zls');
+      await writeFile(zls, 'x', 'utf8');
+      const empty = path.join(root, 'empty.png');
+      await writeFile(empty, '', 'utf8');
+      const big = path.join(root, 'big.png');
+      await writeFile(big, 'x'.repeat(2048), 'utf8');
+
+      const logs: string[] = [];
+      const store = new TextureStore({ roots: [root], onLog: (l) => logs.push(l) });
+
+      const a = await store.register(png);
+      check(
+        '허용 뿌리 안의 png 가 등록된다 — id 는 32자리 hex, url 은 /api/textures/<id>',
+        a !== null && /^[0-9a-f]{32}$/.test(a.id) && a.url === `/api/textures/${a.id}`
+        && a.bytes === 18,
+        JSON.stringify(a),
+      );
+      check(
+        '★ 응답 어디에도 서버 경로가 없다 (경로는 밖으로 안 나간다 — #5·#7 의 규칙)',
+        a !== null && !JSON.stringify(a).includes('zelus-smoke-tex')
+        && !JSON.stringify(a).includes('skin'),
+        JSON.stringify(a),
+      );
+      // ★ 캐시가 사는 유일한 근거. 난수였다면 씬을 다시 열 때마다 URL 이 바뀌어
+      //   19.7MB 를 매번 다시 받는다 — 이 단위의 값어치가 통째로 사라진다.
+      const a2 = await store.register(png);
+      check(
+        '★ 같은 파일이면 언제나 같은 id (결정적 해시 — 브라우저 캐시가 사는 조건)',
+        a !== null && a2 !== null && a.id === a2.id,
+        `${a?.id ?? 'null'} / ${a2?.id ?? 'null'}`,
+      );
+      const upper = await store.register(png.toUpperCase());
+      check(
+        '대소문자만 다른 경로도 같은 id (Windows 파일시스템 — 두 번 받지 않는다)',
+        upper !== null && a !== null && upper.id === a.id,
+        `${upper?.id ?? 'null'}`,
+      );
+      const sub = await store.register(jpg);
+      check(
+        '하위 디렉토리의 jpg 도 등록된다',
+        sub !== null && sub.id !== a?.id,
+        JSON.stringify(sub),
+      );
+
+      const bad: Array<[string, unknown]> = [
+        ['허용 뿌리 밖', outside],
+        ['접두사만 같은 옆 디렉토리 (startsWith 로 하면 샌다)', path.join(evil, 'secret.png')],
+        ['.. 탈출', path.join(root, 'sub', '..', '..', path.basename(evil), 'secret.png')],
+        ['.zls', zls],
+        ['.exe', path.join(root, 'a.exe')],
+        ['확장자 없음', path.join(root, 'noext')],
+        ['상대경로 (옛 워커)', 'skin.png'],
+        ['UNC', '\\\\server\\share\\a.png'],
+        ['널바이트', `${png} .txt`],
+        ['ADS', `${png}:evil`],
+        ['빈 파일', empty],
+        ['디렉토리', path.join(root, 'sub')],
+        ['없는 파일', path.join(root, 'nope.png')],
+        ['문자열이 아님', 42],
+        ['빈 문자열', ''],
+      ];
+      let denied = 0;
+      for (const [label, p] of bad) {
+        if (await store.register(p) === null) denied += 1;
+        else check(`텍스처 거절: ${label}`, false, String(p));
+      }
+      check(
+        `★ 경로 ${bad.length}종이 전부 거절된다 (뿌리 밖 · 탈출 · 확장자 · UNC · 널바이트 · ADS)`,
+        denied === bad.length,
+        `${denied}/${bad.length}`,
+      );
+      check(
+        '거절된 것은 등록되지 않는다 (등록 수가 안 늘었다)',
+        store.size === 2,
+        `${store.size}개`,
+      );
+
+      // 거절만 기억한다. 뿌리 설정이 틀렸을 때 같은 경고가 열 줄씩 쌓이면
+      // 진짜 신호가 묻힌다.
+      const before = logs.length;
+      await store.register(outside);
+      check(
+        '같은 경로를 다시 거절할 때는 로그가 안 늘어난다 (거절만 기억한다)',
+        logs.length === before,
+        `${before} → ${logs.length}`,
+      );
+      // ⚠️ 반대로 **성공은 캐시하면 안 된다.** 엔진이 씬을 열 때마다 직물을
+      //    다시 풀어서 크기가 달라질 수 있고, 옛 ETag 를 들고 있으면 낡은
+      //    이미지를 계속 내준다.
+      await writeFile(png, 'PNGDATA-CHANGED-LONGER', 'utf8');
+      const a3 = await store.register(png);
+      check(
+        '★ 성공은 캐시하지 않는다 — 크기가 바뀌면 새 크기로 다시 등록된다',
+        a3 !== null && a3.bytes === 22 && a3.id === a?.id,
+        JSON.stringify(a3),
+      );
+
+      const small = new TextureStore({ roots: [root], maxBytes: 1024, onLog: () => {} });
+      check(
+        '상한을 넘는 파일은 거절된다',
+        await small.register(big) === null,
+      );
+
+      // 색인이 밀리면 머티리얼이 **엉뚱한 이미지**를 가리킨다. 거절 칸은
+      // 지우지 않고 null 로 남겨야 한다.
+      const table = await store.registerAll([outside, png, zls, jpg]);
+      check(
+        '★ registerAll — 거절한 칸이 null 로 남고 색인이 안 밀린다',
+        table.length === 4 && table[0] === null && table[2] === null
+        && table[1]?.id === a?.id && table[3]?.id === sub?.id,
+        JSON.stringify(table.map((t) => t?.id ?? null)),
+      );
+
+      // 뿌리가 비면 **전부 금지**다. 전부 허용으로 해석하면 설정을 빠뜨렸을 때
+      // 가장 나쁜 쪽으로 열린다.
+      const off = new TextureStore({ roots: [], onLog: () => {} });
+      check(
+        '★ 허용 뿌리가 비면 기능이 꺼진다 (전부 허용이 아니다)',
+        !off.enabled && await off.register(png) === null,
+        `enabled=${off.enabled}`,
+      );
+
+      // 넘치면 가장 오래 전에 등록된 것부터 버린다 — 게이트웨이 수명 동안
+      // 새는 맵이 되지 않게 하는 유일한 장치다.
+      const tiny = new TextureStore({ roots: [root], maxEntries: 2, onLog: () => {} });
+      const files: string[] = [];
+      for (let i = 0; i < 3; i++) {
+        const f = path.join(root, `t${i}.png`);
+        await writeFile(f, `T${i}`, 'utf8');
+        files.push(f);
+      }
+      const ids = [];
+      for (const f of files) ids.push((await tiny.register(f))?.id ?? '');
+      check(
+        '★ maxEntries 를 넘으면 가장 오래된 것부터 버려진다',
+        tiny.size === 2 && tiny.get(ids[0] ?? '') === null
+        && tiny.get(ids[1] ?? '') !== null && tiny.get(ids[2] ?? '') !== null,
+        `size=${tiny.size}`,
+      );
+
+      const badIds = [
+        ['대문자 hex', (a?.id ?? '').toUpperCase()],
+        ['너무 짧다', 'abc'],
+        ['traversal', '../../scenes'],
+        ['확장자 붙임', `${a?.id ?? ''}.png`],
+        ['빈 문자열', ''],
+      ] as const;
+      let idDenied = 0;
+      for (const [label, id] of badIds) {
+        if (store.get(id) === null) idDenied += 1;
+        else check(`get(${label}) 거절`, false, id);
+      }
+      check(
+        `get() 이 형식 밖의 id ${badIds.length}종을 조회조차 하지 않는다`,
+        idDenied === badIds.length,
+        `${idDenied}/${badIds.length}`,
+      );
+
+      // 뿌리 목록의 정본. 환경변수는 **대체한다** — 더하지 않는다.
+      const env = { TEXTURE_ROOTS: `${root};${evil}` } as unknown as NodeJS.ProcessEnv;
+      check(
+        'TEXTURE_ROOTS 는 기본 뿌리를 대체한다 (더하지 않는다)',
+        JSON.stringify(defaultTextureRoots(env))
+          === JSON.stringify([path.resolve(root), path.resolve(evil)]),
+        JSON.stringify(defaultTextureRoots(env)),
+      );
+      check(
+        'LOCALAPPDATA 도 TEXTURE_ROOTS 도 없으면 뿌리가 없다 (= 기능이 꺼진다)',
+        defaultTextureRoots({} as NodeJS.ProcessEnv).length === 0,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true }).catch(() => {});
+      await rm(`${root}-evil`, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  // ── §11-2. GET /api/textures/:id — ETag 와 304 ──────────
+  //
+  // 이 단위의 값어치가 정확히 여기 있다: 두 번째 요청이 0 바이트여야 한다.
+  // express 기본 ETag(크기 + mtime)를 쓰면 씬을 다시 열 때마다 13.9MB 를
+  // 다시 받는데(엔진이 직물을 매번 다시 푼다), 그 회귀는 화면에서 안 보인다.
+  section('11-2. 텍스처 다운로드 라우트 (ETag · 304 · 목록 없음)');
+  {
+    const root = await mkdtemp(path.join(tmpdir(), 'zelus-smoke-texsrv-'));
+    try {
+      const png = path.join(root, 'a.png');
+      const body = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+      await writeFile(png, body);
+
+      await withServer(async (gw, addr) => {
+        const asset = await gw.textures.register(png);
+        if (!asset) {
+          check('텍스처가 등록된다', false, '게이트웨이의 뿌리 설정이 다르다');
+          return;
+        }
+        const res = await fetch(`${addr.url}${asset.url}`);
+        const got = new Uint8Array(await res.arrayBuffer());
+        const etag = res.headers.get('etag') ?? '';
+        check(
+          '등록된 텍스처가 바이트 그대로 내려온다',
+          res.status === 200 && got.length === body.length
+          && Buffer.compare(Buffer.from(got), body) === 0,
+          `status=${res.status}, ${got.length}B`,
+        );
+        check(
+          'content-type 은 확장자 표에서 온다 (express 추측이 아니다)',
+          (res.headers.get('content-type') ?? '').startsWith('image/png'),
+          res.headers.get('content-type') ?? '',
+        );
+        check(
+          `★ ETag 가 "<id>-<크기>" 다 — mtime 이 안 들어간다`,
+          etag === `"${asset.id}-${body.length.toString(16)}"`,
+          etag,
+        );
+        check(
+          '★ Last-Modified 를 안 보낸다 (엔진이 푼 파일의 mtime 이 1657년이다)',
+          res.headers.get('last-modified') === null,
+          String(res.headers.get('last-modified')),
+        );
+        check(
+          'Cache-Control 은 max-age=0 — 매번 재검증한다',
+          (res.headers.get('cache-control') ?? '').includes('max-age=0'),
+          res.headers.get('cache-control') ?? '',
+        );
+
+        // ⚠️ `Cache-Control` 을 **직접 적어야 한다.** node 의 fetch(undici)는
+        //    시키지 않아도 요청에 `cache-control: no-cache` 와 `pragma: no-cache`
+        //    를 붙이는데, `fresh` 는 그게 있으면 **일부러 304 를 안 준다**
+        //    ("캐시 말고 본문을 다시 달라" 는 뜻이니 서버 동작이 맞다).
+        //
+        //    그래서 이 한 줄이 없으면 **서버가 멀쩡한데도 200 이 나온다.**
+        //    2026-08-12 에 실제로 그렇게 빨간불이 떴고, 단언을 "200 도 통과"
+        //    로 약하게 고쳤다면 진짜 캐시 회귀(씬을 열 때마다 20MB 재전송)를
+        //    영영 못 잡게 될 뻔했다. 실측으로 갈랐다:
+        //
+        //      curl · node:http(raw) · 브라우저   → 304 / 0 바이트
+        //      node fetch (기본)                  → 200 / 전량
+        //      node fetch + 이 헤더               → 304 / 0 바이트
+        const again = await fetch(`${addr.url}${asset.url}`, {
+          headers: { 'If-None-Match': etag, 'Cache-Control': 'max-age=0' },
+        });
+        const againBody = new Uint8Array(await again.arrayBuffer());
+        check(
+          '★★ 두 번째 요청은 304 + 0 바이트다 (이 단위의 값어치가 여기 있다)',
+          again.status === 304 && againBody.length === 0,
+          `status=${again.status}, ${againBody.length}B`,
+        );
+
+        const missing = await get(`${addr.url}/api/textures/${'0'.repeat(32)}`);
+        check(
+          '등록 안 된 id → 404, 본문은 JSON',
+          missing.status === 404 && errorOf(missing.text).includes('찾을 수 없습니다'),
+          `status=${missing.status}, ${missing.text.slice(0, 80)}`,
+        );
+        check(
+          '그 거절에 서버 경로가 없다',
+          !missing.text.includes('zelus-smoke-texsrv') && !missing.text.includes(root),
+          missing.text.slice(0, 120),
+        );
+        // 형식이 틀린 것과 없는 것을 구분하지 않는다 — 400 을 따로 주면
+        // "이 id 는 형식은 맞는데 없다"가 그 자체로 신호가 된다.
+        for (const [label, id] of [
+          ['대문자 id', asset.id.toUpperCase()],
+          ['너무 짧다', 'abc'],
+          ['인코딩된 traversal', '%2e%2e%2f%2e%2e%2fwin.ini'],
+          ['확장자 붙임', `${asset.id}.png`],
+        ] as const) {
+          const r = await get(`${addr.url}/api/textures/${id}`);
+          check(`${label} → 404 (형식 오류와 미등록을 구분하지 않는다)`, r.status === 404, `status=${r.status}`);
+        }
+        const list = await get(`${addr.url}/api/textures`);
+        check(
+          '★ 목록 라우트는 없다 (id 가 곧 열람 권한이다)',
+          list.status === 404,
+          `status=${list.status}`,
+        );
+        check(
+          'served 카운터가 200 만 센다 (304 는 안 센다)',
+          gw.textures.served === 1,
+          `${gw.textures.served}`,
+        );
+      }, { textureRoots: [root] });
+    } finally {
+      await rm(root, { recursive: true, force: true }).catch(() => {});
+    }
   }
 
   // ── 7-7. 좀비 최종 확인 ───────────────────────────────
