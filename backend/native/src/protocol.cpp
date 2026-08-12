@@ -14,6 +14,10 @@
 #include <ztAvatarCommon.h>        // ztAvatarBodyParam·ztAvatarMeasurePart + 이름 함수
 #include <ztAvatarMeasurement.h>   // GetMeasuredLength — 적용 뒤 치수를 다시 잰다
 #include <ztAvatarShaper.h>        // ztAvatarShaperEx::MeasurementInfos (치수 목표값 배열)
+#include <ztAvatarManager.h>       // ztAccessoryMeshData — 액세서리 (avatarMesh)
+#include <ztSimulMesh.h>           // ztAccessoryMeshData::simulMeshes 의 완전한 타입.
+                                   // ztAvatarManager.h 는 전방선언만 한다 —
+                                   // 없으면 zsTriMesh 로 업캐스트가 안 된다
 #include <ztDesignZeta.h>          // SetMeasurementParam / UpdateBodyParams (치수→체형)
 #include <ztSimulationManager.h>   // 체형 단계마다 Step / Pause
 #include <ztDesignSurface.h>       // ztDesignSurfaceData::name (옷 사이즈)
@@ -1858,16 +1862,31 @@ json MeshData(ZestManager& manager, bool includeTopology, bool includeTextures =
 //   48,198삼각형). 재질이 파트마다 달라서 합치면 안 된다(속눈썹·각막은
 //   alpha 0.5, 동공은 검정).
 //
-// ── ⚠️ 아직 안 싣는 것: 액세서리 ────────────────────────────
+// ── 액세서리 (머리카락·신발·양말·속옷) ──────────────────────
 //
-//   제타에는 `GetRenderAccessoryMeshes()` 로 머리카락 등이 따로 있고,
-//   데스크톱(Renderer3D.cpp:566-)과 익스포터(:526-548)는 그것도 그린다.
-//   실측한 씬의 glTF 에 `zeta_accessory12` 노드가 실제로 하나 더 있다.
+//   제타는 몸과 **다른 접근자**로 액세서리를 준다 —
+//   `GetRenderAccessoryMeshes()` → `std::vector<ztAccessoryMeshData>`.
+//   데스크톱(Renderer3D.cpp:566-)과 익스포터(zwGltfExporterImpl.cpp:530-546)가
+//   둘 다 그것을 그리고, 실측한 씬의 glTF 에 `zeta_accessory12` 노드가 있다.
 //
-//   여기서 뺀 이유는 **텍스처 때문**이다 — 액세서리는 basecolor + alpha
-//   **이미지**로 그려지고(머리카락은 알파 컷아웃이 없으면 판때기로 보인다),
-//   이 프로토콜에는 아직 이미지를 실어 보내는 통로가 없다. 색만 보내면
-//   머리가 덩어리로 나온다. 통로가 생기면 여기 붙일 자리다.
+//   ⓘ **한동안 일부러 뺐던 자리다.** 이유는 텍스처였다 — 머리카락은
+//     basecolor + alpha **이미지**로 그려지는데(알파 컷아웃이 없으면 머리가
+//     판때기로 보인다) 프로토콜에 이미지를 싣는 통로가 없었다. 그 통로가
+//     생겼으므로(`TextureTable` + 게이트웨이 정적 서빙) 이제 붙인다.
+//     **색만 보내면 안 되는 이유는 그대로 유효하다** — 알파를 무시하면
+//     머리가 덩어리가 된다.
+//
+//   ★ 익스포터를 베꼈다. 렌더러가 아니라 익스포터인 이유는 성격이 같아서다
+//     — 둘 다 GL 재질을 만들지 않고 `ztDesignMaterialData` 를 **합성해서**
+//     내보낸다(:537-541). 그 구조체가 우리 `AvatarMaterialJson` 의 입력이라
+//     몸 파트와 **완전히 같은 경로**를 탄다. 새로 만든 코드가 거의 없다.
+//
+//   ⚠️ 익스포터가 안 하는 널 검사를 우리는 한다. 저쪽은 `mesh.image->path` 를
+//      타입 검사 없이 역참조하는데(:540-541), 렌더러는 **Hair 일 때만**
+//      이미지를 만진다(Renderer3D.cpp:593-597). 즉 신발·양말에는 이미지가
+//      없을 수 있다는 뜻이다 — 저쪽은 1회성 CLI 라 죽어도 티가 안 나지만
+//      우리는 상주 워커다. `accessoryInfo` 의 `find_if` 도 마찬가지로
+//      `end()` 를 안 보고 역참조한다(:534-535).
 
 /** 아바타 파트의 머티리얼. 옷 쪽(`MeshData`)과 같은 다섯 필드 + 색공간이다. */
 json AvatarMaterialJson(const ztDesignMaterialData& d, TextureTable& textures,
@@ -1893,6 +1912,25 @@ json AvatarMaterialJson(const ztDesignMaterialData& d, TextureTable& textures,
     if (includeTexturesRaw) j["texturesRaw"] = MaterialTextureJson(d);
 
     return j;
+}
+
+/**
+ * 액세서리 종류 이름. 숫자로 보내지 않는 이유는 옷·파라미터 쪽과 같다 —
+ * enum 값은 엔진이 재배열하면 조용히 뜻이 바뀐다.
+ *
+ * `ztAccessoryType`(ztAvatarCommon.h:129)의 5종 전부다.
+ */
+const char* AccessoryTypeName(ztAccessoryType t)
+{
+    switch (t)
+    {
+    case ztAccessoryType::UnderwearTop:    return "underwearTop";
+    case ztAccessoryType::UnderwearBottom: return "underwearBottom";
+    case ztAccessoryType::Sock:            return "sock";
+    case ztAccessoryType::Shoes:           return "shoes";
+    case ztAccessoryType::Hair:            return "hair";
+    default:                               return "unknown";
+    }
 }
 
 /** ztGlobalMutex 를 예외 경로에서도 반드시 놓는다. 이 op 은 try 블록 안이다. */
@@ -1955,32 +1993,44 @@ json AvatarMeshData(ZestManager& manager, bool includeTopology, bool includeNorm
         float lo[3] = {  1e30f,  1e30f,  1e30f };
         float hi[3] = { -1e30f, -1e30f, -1e30f };
 
-        for (std::size_t i = 0; i < meshes.size(); ++i)
+        // ★ 몸 파트와 액세서리가 **같은 포장을 쓴다.** 둘은 접근자만 다르고
+        //   (`GetRenderMeshs` vs `GetRenderAccessoryMeshes`) 실체는 같은
+        //   `zsTriMesh` 다 — `ztSimulMesh : public ZELUS::zsTriMesh`.
+        //   여기를 갈라 두면 아래 쓰레기 정점 AABB 규칙이나 법선 규약을
+        //   한쪽에만 고치는 사고가 난다.
+        //
+        // 인자 셋이 갈래를 만든다:
+        //   `material`   없으면 `material` 키를 아예 안 싣는다(옷과 같은 규약).
+        //   `uvFallback` 액세서리 전용 — `ztAccessoryMeshData` 는 `texcoords` 를
+        //                메시 **밖에** 따로 들고 있다. 메시에 uv 가 없을 때만 본다.
+        //   `extra`      파트 json 에 얹을 추가 필드(액세서리의 종류·양면 여부).
+        const auto packPart = [&](const ZELUS::zsTriMesh* mesh, int index,
+                                  const std::string& name,
+                                  const ztDesignMaterialData* material,
+                                  const std::vector<ZELUS::zsVector2>* uvFallback,
+                                  const json* extra) -> void
         {
-            const ZELUS::zsTriMesh* mesh = meshes[i].get();
-            if (!mesh) continue;
-
-            // 마네킹은 꺼진 파트가 있다(Renderer3D.cpp:505-507이 같은 검사를
-            // 한다). 제타는 항상 true 를 돌려주므로 이 줄이 무해하다
-            // (ztDesignZeta.cpp: GetMeshPartActivated → return true).
-            if (!avatar->GetMeshPartActivated(static_cast<unsigned int>(i))) continue;
+            if (!mesh) return;
 
             const std::size_t nv = static_cast<std::size_t>(mesh->vertices.size());
             const std::size_t ni = static_cast<std::size_t>(mesh->indices.size());
 
             // 익스포터가 같은 검사로 건너뛴다(:515·567). 빈 파트를 실으면
             // 받는 쪽이 정점 0짜리 지오메트리를 만들게 된다.
-            if (nv == 0 || ni == 0) continue;
+            if (nv == 0 || ni == 0) return;
 
             avatarV += nv;
             avatarT += ni / 3;
 
             json p{
-                { "index",     static_cast<int>(i) },
-                { "name",      avatar->GetMeshPartName(static_cast<unsigned int>(i)) },
+                { "index",     index },
+                { "name",      name },
                 { "vertices",  nv },
                 { "triangles", ni / 3 },
             };
+
+            if (extra)
+                for (auto it = extra->begin(); it != extra->end(); ++it) p[it.key()] = it.value();
 
             // zsVector3는 SIMD 정렬 때문에 16바이트다. 옷과 **같은 이유로**
             // float3로 다시 포장한다 — 그대로 보내면 4바이트씩 어긋난다.
@@ -2058,24 +2108,148 @@ json AvatarMeshData(ZestManager& manager, bool includeTopology, bool includeNorm
                                       static_cast<std::size_t>(mesh->uvs.size())
                                           * sizeof(ZELUS::zsVector2));
                 }
+                else if (uvFallback && !uvFallback->empty())
+                {
+                    // 액세서리 갈래. 여기까지 왔다는 것은 메시가 uv 를 안 들고
+                    // 있다는 뜻이고, 그러면 무늬가 한 점에 뭉쳐 단색이 된다.
+                    p["uvs"] = Base64(uvFallback->data(),
+                                      uvFallback->size() * sizeof(ZELUS::zsVector2));
+                }
 
                 // ⚠️ 머티리얼이 없으면 키를 아예 싣지 않는다 — 옷과 같은 규약.
                 //    흰색을 대신 보내면 "흰 몸"과 "색을 모름"이 구분되지 않는다.
-                if (zeta)
-                {
-                    if (i < zetaMaterials.size())
-                        p["material"] = AvatarMaterialJson(zetaMaterials[i], textures,
-                                                           includeTextures, includeTexturesRaw);
-                }
-                else if (mannequin)
-                {
-                    p["material"] =
-                        AvatarMaterialJson(mannequin->GetMaterialData(static_cast<unsigned int>(i)),
-                                           textures, includeTextures, includeTexturesRaw);
-                }
+                if (material)
+                    p["material"] = AvatarMaterialJson(*material, textures,
+                                                       includeTextures, includeTexturesRaw);
             }
 
             parts.push_back(std::move(p));
+        };
+
+        // ── 몸 ─────────────────────────────────────────────────
+        for (std::size_t i = 0; i < meshes.size(); ++i)
+        {
+            // 마네킹은 꺼진 파트가 있다(Renderer3D.cpp:505-507이 같은 검사를
+            // 한다). 제타는 항상 true 를 돌려주므로 이 줄이 무해하다
+            // (ztDesignZeta.cpp: GetMeshPartActivated → return true).
+            if (!avatar->GetMeshPartActivated(static_cast<unsigned int>(i))) continue;
+
+            // 제타는 서브머티리얼 배열이 파트와 1:1, 마네킹은 인덱스로 하나씩
+            // 받는다. 마네킹 쪽은 **값 반환**이라 지역 변수로 수명을 잡아 둔다.
+            ztDesignMaterialData          mannequinMaterial;
+            const ztDesignMaterialData*   material = nullptr;
+
+            if (zeta)
+            {
+                if (i < zetaMaterials.size()) material = &zetaMaterials[i];
+            }
+            else if (mannequin)
+            {
+                mannequinMaterial = mannequin->GetMaterialData(static_cast<unsigned int>(i));
+                material = &mannequinMaterial;
+            }
+
+            packPart(meshes[i].get(), static_cast<int>(i),
+                     avatar->GetMeshPartName(static_cast<unsigned int>(i)),
+                     material, nullptr, nullptr);
+        }
+
+        // ── 액세서리 (머리카락·신발·양말·속옷) ──────────────────
+        //
+        // 머리말의 "액세서리" 절이 근거다. 제타에만 있다 — 마네킹에는
+        // `GetRenderAccessoryMeshes()` 자체가 없다.
+        if (zeta)
+        {
+            const ztDesignAvatarData* avatarData = qi->GetAvatarData(entry.first);
+            const std::vector<ztAccessoryMeshData>& accessories =
+                zeta->GetRenderAccessoryMeshes();
+
+            // 파트 인덱스는 몸 뒤에 이어 붙인다 — 익스포터의 노드 이름
+            // `zeta_accessory12` 가 정확히 이 규칙이다(몸 12파트 다음이 12번).
+            int accIndex = static_cast<int>(meshes.size());
+
+            for (const ztAccessoryMeshData& acc : accessories)
+            {
+                // 데스크톱(:571)과 익스포터(:532)가 둘 다 이 검사로 거른다.
+                // 슬롯은 있는데 아무것도 안 걸친 경우가 여기서 빠진다.
+                if (!acc.IsEnableMesh()) { ++accIndex; continue; }
+
+                // ★ 머티리얼을 **합성한다.** 익스포터(:537-541)와 같은 일이다 —
+                //   액세서리에는 `ztDesignMaterialData` 가 원래 없고, 색은 씬
+                //   데이터(`accessoryInfos`)에, 이미지는 메시 쪽에 흩어져 있다.
+                //   합성해 두면 몸 파트와 완전히 같은 경로로 나간다.
+                ztDesignMaterialData md;
+
+                // ★★ 기본 생성자가 **이미 텍스처를 물고 있다.**
+                //    `basecolorTexture = { BASE_COLOR_TEXTURE }`
+                //    (ztDesignMaterial.h:60) — 빈 벡터가 아니라 프리셋 직물의
+                //    `Default_Base_Color.png` 다. 안 비우면 "우리가 아무것도
+                //    안 실었는데 텍스처가 하나 실린" 상태가 되고, 그 파일은
+                //    이 설치본에 **없어서** 게이트웨이가 거절한다.
+                //
+                //    실측으로 밟았다 — 신발에 `Default_Base_Color.png` 가
+                //    붙어 나왔고 처음엔 엔진이 준 값인 줄 알았다. 아니었다.
+                //
+                //    ⚠️ `MaterialTextureRefs` 가 읽는 셋만 비우면 된다.
+                //       나머지 슬롯의 기본값은 `""` 라 무해하다.
+                md.basecolorTexture.clear();
+                md.normalTexture.clear();
+                md.alphaTexture.clear();
+
+                if (avatarData)
+                {
+                    const auto& infos = avatarData->zetaData.accessoryInfos;
+                    const auto  found = std::find_if(
+                        infos.begin(), infos.end(),
+                        [&acc](const ztAccessoryInfo& d) { return d.selectedData == acc.name; });
+
+                    // ⚠️ 익스포터는 여기서 end() 를 안 보고 역참조한다(:535).
+                    //    우리는 색을 포기하고 진행한다 — 이름이 안 맞는다고
+                    //    머리카락을 통째로 빼는 것보다 낫다.
+                    if (found != infos.end())
+                        md.basecolor.Set(found->color.r, found->color.g, found->color.b);
+                }
+
+                // ★★ 텍스처는 **Hair 일 때만** 건다. 여기서 익스포터를 따르지
+                //    않고 렌더러(Renderer3D.cpp:593-601)를 따른다 — 실측으로
+                //    갈렸다:
+                //
+                //      신발 `low_top_sneakers.obj` 의 `image->path` 는
+                //      `fabric/Preset/Default/textures/Default_Base_Color.png`
+                //      인데 **그 파일이 디스크에 없다.** 엔진이 "안 쓰는 슬롯"
+                //      에 기본값을 꽂아 둔 것이고, 렌더러가 Hair 만 보는 이유가
+                //      그것이다. 익스포터(:540-541)는 타입을 안 보고 거는데,
+                //      그렇게 만든 glTF 는 없는 파일을 가리키게 된다 — 저쪽
+                //      버그다. 1회성 CLI 라 아무도 안 밟았을 뿐이다.
+                //
+                //    ⚠️ 이걸 그대로 두면 게이트웨이가 "파일이 없습니다" 로
+                //       거절하고 화면에 `⚠ 거절 1칸` 이 뜬다. 기능은 멀쩡한데
+                //       경고만 나는, 제일 나쁜 종류의 잡음이다.
+                if (ztAccessoryType::Hair == acc.type)
+                {
+                    // 널 검사는 여전히 우리 몫이다 — 렌더러는 Hair 라면
+                    // 이미지가 있다고 **가정하고** 역참조한다(:595-596).
+                    if (acc.image      && !acc.image->path.empty())
+                        md.basecolorTexture = { acc.image->path };
+                    if (acc.imageAlpha && !acc.imageAlpha->path.empty())
+                        md.alphaTexture     = { acc.imageAlpha->path };
+                }
+
+                // `doubleSided` 는 우리 판단이 아니라 데스크톱의 설정을 옮긴
+                // 것이다(Renderer3D.cpp:588 `enableTwoSided()`). 머리카락은
+                // 얇은 판이라 뒷면을 버리면 숱이 절반으로 보인다.
+                const json extra{
+                    { "accessory",   AccessoryTypeName(acc.type) },
+                    { "assetName",   acc.name },
+                    { "doubleSided", true },
+                };
+
+                packPart(acc.simulMeshes.get(), accIndex,
+                         acc.name.empty() ? std::string(AccessoryTypeName(acc.type)) : acc.name,
+                         &md, acc.texcoords, &extra);
+
+                ++accIndex;
+            }
         }
 
         totalV += avatarV;
