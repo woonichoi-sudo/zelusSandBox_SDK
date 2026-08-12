@@ -157,6 +157,21 @@ function isUnder(root: string, target: string): boolean {
   return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
+/**
+ * `#registerUncached` 의 결말. **거절을 두 갈래로 가르는 것이 요점이다.**
+ *
+ * `path`  경로 문자열만 보고 정했다 → 다시 물어도 답이 같으므로 기억해도 된다.
+ * `state` 그 순간의 디스크를 보고 정했다 → **기억하면 안 된다.** 파일이
+ *         나중에 생기거나 다 써질 수 있다.
+ *
+ * 갈래를 불리언(`cacheable`)이 아니라 이름으로 둔 이유: 새 검사를 넣는 사람이
+ * "true 가 뭐였더라" 를 되짚지 않아도 `rejectPath` / `rejectState` 중 어느
+ * 문을 쓸지가 그 자리에서 정해진다.
+ */
+type RegisterResult =
+  | { ok: true; asset: TextureAsset }
+  | { ok: false; kind: 'path' | 'state' };
+
 /** 등록된 텍스처의 id ↔ 경로 매핑. 게이트웨이 수명과 같다 */
 export class TextureStore {
   readonly roots: readonly string[];
@@ -167,18 +182,48 @@ export class TextureStore {
   /** 삽입 순서를 유지한다 — 넘치면 앞에서부터 버린다 */
   readonly #byId = new Map<string, TextureFile>();
   /**
-   * 이미 거절한 경로. **거절만 기억하고 성공은 기억하지 않는다.**
+   * 이미 거절한 경로. **경로 모양 때문에 거절한 것만 담는다.**
    *
-   * 거절 사유(뿌리 밖 · 확장자 · UNC · 상대경로)는 경로만 보고 정해지므로 다시
-   * 물어도 답이 같고, 기억해 두지 않으면 뿌리 설정이 틀렸을 때 체형을 만질
-   * 때마다 같은 경고가 열 줄씩 쌓인다.
+   * 그런 사유(뿌리 밖 · 확장자 · UNC · 상대경로 · 널바이트)는 경로 문자열만
+   * 보고 정해지므로 다시 물어도 답이 같다. 기억해 두지 않으면 뿌리 설정이
+   * 틀렸을 때 체형을 만질 때마다 같은 검사를 다시 돈다.
    *
-   * ⚠️ 반대로 **성공은 캐시하면 안 된다** — 엔진이 씬을 열 때마다 직물 파일을
-   *    다시 풀기 때문이다(머리말 ②). 크기가 달라졌는데 옛 ETag 를 들고 있으면
-   *    낡은 이미지를 계속 내주게 된다. 등록은 파일당 응답당 한 번뿐이고
-   *    (워커가 표에서 이미 중복을 없앴다) stat 열 번은 공짜다.
+   * ── ★★ 파일시스템 상태 거절은 여기 들어오면 안 된다 ────────
+   *
+   * ⚠️ **원래는 전부 담았고, 그게 버그였다.** `파일이 없습니다`·`빈 파일`
+   *    같은 사유는 **그 순간의 디스크 상태**라 다음에 물으면 답이 달라진다.
+   *    한 번 담기면 파일이 멀쩡해져도 이 프로세스가 사는 내내 거절이라,
+   *    **게이트웨이를 재시작하기 전에는 복구할 방법이 없었다.**
+   *
+   *    실제로 밟았다(2026-08-12): 씬 하나를 여는 동안 엔진이 `fabric_infile`
+   *    을 다시 푸는데(머리말 ②) 그 사이에 등록이 걸리면 4칸이 `파일이
+   *    없습니다` 로 떨어진다. 그 뒤로는 재로드해도 `⚠ 거절 4칸` 이 그대로였고
+   *    화면에서는 **옷 색이 통째로 사라진 것**으로 보였다. 파일은 디스크에
+   *    멀쩡히 있었다.
+   *
+   *    창이 열리는 원인은 따로 있다(씬을 두 번 연다 — ISSUE-025). 그것을
+   *    고치더라도 **일시적 실패를 영구 실패로 승격시키는 것 자체가 틀렸다** —
+   *    바이러스 검사·백업·네트워크 드라이브 어느 것이든 같은 창을 만든다.
+   *
+   * ⚠️ 그리고 **성공은 여전히 캐시하지 않는다** — 엔진이 씬을 열 때마다 직물
+   *    파일을 다시 풀기 때문이다(머리말 ②). 크기가 달라졌는데 옛 ETag 를
+   *    들고 있으면 낡은 이미지를 계속 내주게 된다. 등록은 파일당 응답당 한
+   *    번뿐이고(워커가 표에서 이미 중복을 없앴다) stat 열 번은 공짜다.
    */
   readonly #rejected = new Set<string>();
+
+  /**
+   * 이미 로그에 남긴 거절. **판단이 아니라 로그 도배 방지 전용이다.**
+   *
+   * 상태 거절을 다시 검사하게 만든 대가로, 정말로 없는 파일은 로드마다 같은
+   * 경고를 다시 찍게 된다. 그래서 **검사는 매번 하되 경고는 한 번만** 한다 —
+   * `#rejected` 가 원래 겸하던 두 역할(기억 / 조용히 하기) 중 뒤엣것만 여기로
+   * 뗀 것이다.
+   *
+   * 키에 사유를 붙이는 이유: 같은 경로가 `빈 파일` → `상한 초과` 로 바뀌면
+   * 그건 새 사실이라 한 번은 보여야 한다.
+   */
+  readonly #warned = new Set<string>();
 
   #served = 0;
 
@@ -221,37 +266,65 @@ export class TextureStore {
     if (this.#rejected.has(raw)) return null;
 
     const result = await this.#registerUncached(raw);
-    if (!result) this.#rejected.add(raw);
-    return result;
+    if (result.ok) return result.asset;
+    // ★ **`path` 갈래만 기억한다.** `state` 는 다음에 물으면 답이 달라질 수
+    //   있다 — 위 `#rejected` 주석이 그 이유이자 이 코드가 존재하는 이유다.
+    if (result.kind === 'path') this.#rejected.add(raw);
+    return null;
   }
 
-  async #registerUncached(raw: string): Promise<TextureAsset | null> {
-    const reject = (why: string): null => {
+  async #registerUncached(raw: string): Promise<RegisterResult> {
+    /** 한 번만 찍는다. 같은 경로+사유의 반복은 새 사실이 아니다 */
+    const warn = (why: string): void => {
+      const key = `${raw} ${why}`;
+      if (this.#warned.has(key)) return;
+      this.#warned.add(key);
       this.#log(`[warn] 텍스처를 거절했습니다 (${why})`);
-      return null;
     };
 
-    if (!this.enabled) return reject('허용 뿌리가 설정되지 않았습니다');
+    /** 경로 문자열만 보고 내린 거절. 다시 물어도 답이 같으므로 기억한다 */
+    const rejectPath = (why: string): RegisterResult => {
+      warn(why);
+      return { ok: false, kind: 'path' };
+    };
+
+    /**
+     * 그 순간의 디스크 상태를 보고 내린 거절. **기억하지 않는다** —
+     * 파일이 나중에 생기거나, 다 써지거나, 작아질 수 있다.
+     */
+    const rejectState = (why: string): RegisterResult => {
+      warn(why);
+      return { ok: false, kind: 'state' };
+    };
+
+    if (!this.enabled) return rejectPath('허용 뿌리가 설정되지 않았습니다');
     // 널바이트는 경로 API 를 통과하면서 문자열을 자를 수 있다.
-    if (raw.includes('\u0000')) return reject('널바이트');
+    if (raw.includes('\u0000')) return rejectPath('널바이트');
 
     // resolve 가 `..` 를 접는다. 상대경로는 여기서 프로세스 cwd 기준이 되는데,
     // **그런 것은 애초에 오면 안 된다** — 워커가 appdata 뿌리를 붙여 절대경로로
     // 보내기 때문이다. 상대경로가 왔다는 것은 워커가 옛 버전이라는 뜻이다.
-    if (!path.isAbsolute(raw)) return reject('절대경로가 아닙니다 — 워커가 옛 버전일 수 있습니다');
+    if (!path.isAbsolute(raw)) return rejectPath('절대경로가 아닙니다 — 워커가 옛 버전일 수 있습니다');
 
     const resolved = path.resolve(raw);
     // UNC(`\\서버\공유`)는 네트워크 경로다. 뿌리 검사를 통과할 수 없지만,
     // 검사 전에 끊어 두면 "원격을 읽으러 나간다"는 동작 자체가 없어진다.
-    if (resolved.startsWith('\\\\') || resolved.startsWith('//')) return reject('UNC 경로');
+    if (resolved.startsWith('\\\\') || resolved.startsWith('//')) return rejectPath('UNC 경로');
 
     const ext = path.extname(resolved).toLowerCase();
     const contentType = TEXTURE_TYPES[ext];
-    if (contentType === undefined) return reject(`허용되지 않는 확장자 ${ext || '(없음)'}`);
+    if (contentType === undefined) return rejectPath(`허용되지 않는 확장자 ${ext || '(없음)'}`);
 
     if (!this.roots.some((root) => isUnder(root, resolved))) {
-      return reject('허용 뿌리 밖');
+      return rejectPath('허용 뿌리 밖');
     }
+
+    // ── 여기부터 디스크를 본다 → 전부 `rejectState` ─────────────
+    //
+    // ★ 아래 사유는 **하나도 기억하지 않는다.** 지금 없는 파일이 다음 로드에는
+    //   있을 수 있고(엔진이 직물을 다시 푸는 중이었을 뿐), 지금 0바이트인
+    //   파일이 다 써지면 정상이 된다. 기억하면 그 순간의 사고가 영구 고장이
+    //   된다 — 위 `#rejected` 주석의 실측이 정확히 그 사고다.
 
     // ★ 심볼릭 링크·정션 해소. 뿌리 **안**에 밖을 가리키는 링크를 하나 두면
     //   위 검사만으로는 통과한다. 실경로로 한 번 더 본다.
@@ -259,28 +332,32 @@ export class TextureStore {
     try {
       realPath = await realpath(resolved);
     } catch {
-      return reject('파일이 없습니다');
+      return rejectState('파일이 없습니다');
     }
+    // 링크가 가리키는 곳은 **언제든 바뀔 수 있다.** 지금 거절하는 것은 맞지만
+    // 경로 모양이 아니라 상태라서 기억해서는 안 된다.
     if (!this.roots.some((root) => isUnder(root, realPath))) {
-      return reject('심볼릭 링크가 허용 뿌리 밖을 가리킵니다');
+      return rejectState('심볼릭 링크가 허용 뿌리 밖을 가리킵니다');
     }
     // 실경로의 확장자도 다시 본다 — `a.png` → `b.exe` 링크를 막는다.
     const realExt = path.extname(realPath).toLowerCase();
     if (TEXTURE_TYPES[realExt] === undefined) {
-      return reject(`심볼릭 링크의 실제 확장자가 허용되지 않습니다 (${realExt || '없음'})`);
+      return rejectState(`심볼릭 링크의 실제 확장자가 허용되지 않습니다 (${realExt || '없음'})`);
     }
 
     let bytes: number;
     try {
       const st = await stat(realPath);
       // 디렉토리·파이프·장치는 파일이 아니다.
-      if (!st.isFile()) return reject('일반 파일이 아닙니다');
+      if (!st.isFile()) return rejectState('일반 파일이 아닙니다');
       bytes = st.size;
     } catch {
-      return reject('파일이 없습니다');
+      return rejectState('파일이 없습니다');
     }
-    if (bytes === 0) return reject('빈 파일');
-    if (bytes > this.maxBytes) return reject(`상한 초과 (${bytes} > ${this.maxBytes})`);
+    // ⚠️ **여기가 가장 흔한 일시적 실패다.** 엔진이 파일을 만들고 아직 다 쓰지
+    //    않았으면 0바이트로 보인다.
+    if (bytes === 0) return rejectState('빈 파일');
+    if (bytes > this.maxBytes) return rejectState(`상한 초과 (${bytes} > ${this.maxBytes})`);
 
     // 실경로의 해시다. 대소문자를 접는 이유: Windows 파일시스템이 그렇고,
     // 같은 파일이 두 id 를 갖게 되면 브라우저가 두 번 받는다.
@@ -299,7 +376,7 @@ export class TextureStore {
       this.#byId.delete(oldest.value);
     }
 
-    return { id, url: `/api/textures/${id}`, bytes };
+    return { ok: true, asset: { id, url: `/api/textures/${id}`, bytes } };
   }
 
   /**
