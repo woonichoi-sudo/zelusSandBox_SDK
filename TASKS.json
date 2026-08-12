@@ -1,6 +1,6 @@
 {
   "project": "zelusSandBox_Cobalt 웹 서비스화",
-  "updated": "2026-08-10",
+  "updated": "2026-08-12",
   "source": "DESIGN.md §10 구현 순서를 테스트 가능한 단위로 분할한 것",
   "principle": "작은 단위 → 테스트 작성 → 통과 → 커밋 → 다음. 단위 크기 기준은 '최소'가 아니라 '테스트가 원인을 지목할 수 있는 최소'.",
 
@@ -322,24 +322,34 @@
         "cost": "중간. 엔진에 전부 있고 프로토콜 노출과 화면 배선만 남았다",
         "why": "실시간 뷰에 아바타가 없고 색이 패턴 구분용 임의 5색이다. 스냅샷(glTF)에만 진짜 그림이 있다. 둘을 맞추면 이후 작업의 눈 확인이 전부 빨라진다",
         "origin": "데스크톱 68개 기능 표가 아니라 사용자가 데스크톱 스크린샷을 주며 '이렇게 나와야 돼'라고 한 데서 나왔다. 그래서 A~D와 달리 ui 번호가 없다",
-        "status": "착수함 — materials-a 완료(6673613) · '아바타 체형 조절' 은 F그룹 L-3a(b576940·ce891d5·97b7d9e)로 완료. 남은 것은 materials-b · avatarMesh-a/b · 아바타 치수 역산(ISSUE-021 위에 선다) (2026-08-11)",
+        "status": "★ 목표 달성 — 실시간 뷰가 스냅샷 그림에 도달했다 (2026-08-12). materials-a(6673613) · materials-b(82a0fb3) · avatarMesh-a(530fa54) · avatarMesh-b(67cfce5) · 액세서리(a3fa2ce) 완료. '아바타 체형 조절' 은 F그룹 L-3a(b576940·ce891d5·97b7d9e). 남은 것은 '아바타 치수 역산' 하나뿐이고 그건 ISSUE-021 위에 선다. ── 이 그룹의 핵심 설계 판단: 워커는 텍스처 이미지를 싣지 않고 경로만 싣는다. 게이트웨이가 정적 서빙하고 브라우저가 캐시한다. 실측 — 첫 로드 20.6MB(10요청), 체형을 바꿀 때마다 0요청/0바이트, 새로고침 3.0KB(전부 304). 스냅샷 glTF 는 매번 34.9MB/6.3초이고 그 중 27.7MB(79%)가 체형을 바꿔도 안 변하는 텍스처였다 — 그 숫자를 재고 '기본 뷰를 스냅샷으로' 추천을 뒤집었다",
         "blocked": "GPU 드라이버 불안정으로 npm run verify:ui 를 못 돌린다. 화면을 바꾸는 항목은 그 하네스 없이는 검증이 반쪽이다 — #16에서 12건, #15에서 3건이 그 하네스에서만 잡혔다",
         "items": [
           {
             "what": "materials-b — 받아온 색을 화면에 칠한다",
-            "status": "todo",
-            "note": "워커·디코딩은 materials-a(6673613)로 끝났고 색이 cloth.ts 까지 와 있다. three 머티리얼에 물리는 배선만 남았다. ⚠️ sample.zls 는 5패턴이 전부 흰색이라 임의 팔레트를 폴백으로 남겨야 한다 — 언제 어느 쪽을 쓸지 정하는 것이 이 단위의 판단이다. verify:ui 가 이미 민트/노랑을 픽셀로 판정할 줄 안다"
+            "status": "done",
+            "commit": "82a0fb3",
+            "note": "워커·디코딩은 materials-a(6673613)로 끝났고 색이 cloth.ts 까지 와 있었다. 배선은 텍스처 작업(82a0fb3)에서 색과 함께 들어갔다 — cloth.ts +121줄. 실시간 옷 색이 스냅샷과 소수점까지 같다(#f6e9b6 / #def2e9). ⚠️ sample.zls 는 5패턴이 전부 흰색이라 임의 팔레트를 폴백으로 남겼다. verify:ui 가 민트/노랑을 픽셀로 판정할 줄 아는데 ⛔ GPU 이슈로 그 하네스를 아직 못 돌렸다 — 눈 확인으로 대신했다"
           },
           {
             "what": "avatarMesh-a — 워커가 아바타 메시를 낸다",
-            "status": "todo",
-            "zest": "ztSceneQueryInterface::GetAvatars() → ztDesignAvatar::GetMeshes()/GetRenderMeshs() → zsTriMesh",
-            "note": "GPU 불필요. 옷과 같은 자료구조라 MeshData() 재포장 로직을 그대로 쓴다. ⚠️ IsUpdateRenderMesh()/IsForceUpdatedMesh() 를 부르지 마라 — const 인데 읽는 순간 mutable 플래그를 지워 시뮬 동작이 바뀐다. ⚠️ 아바타 메시는 이중버퍼 보호가 없어 ztGlobalMutex 를 직접 잡아야 한다. 25,357정점(사용자 씬 28,564)으로 옷의 3.3배, 프레임당 304KB라 매 프레임 밀 물건이 아니다"
+            "status": "done",
+            "commit": "530fa54",
+            "zest": "ztSceneQueryInterface::GetAvatars() → ztDesignAvatar::GetRenderMeshs() → zsTriMesh",
+            "note": "GPU 불필요. 옷과 같은 자료구조라 MeshData() 재포장 로직을 그대로 썼다. ⚠️ IsUpdateRenderMesh()/IsForceUpdatedMesh() 를 부르지 않는다 — const 인데 읽는 순간 mutable 플래그를 지워 시뮬 동작이 바뀐다. ⚠️ 아바타 메시는 이중버퍼 보호가 없어 ztGlobalMutex 를 직접 잡는다. ★ 실측으로 갈린 것: GetMeshes() 가 아니라 GetRenderMeshs() 다 — 전자는 시뮬 충돌용 body mesh 1개이고 후자가 서브머티리얼별 12파트(몸 4 + 눈/속눈썹/동공/각막 8, 28,564정점)다. 재질이 파트마다 달라서(속눈썹·각막 alpha 0.5, 동공 검정) 합치면 안 된다. ★ 좌표계는 월드다 — 옷(ISSUE-011)과 정반대라 변환을 곱하면 안 된다. 근거 둘: 익스포터가 아바타 노드에 Identity() 를 준다, localTransform 이 정점에 이미 구워져 있다. 그래서 transform 키를 아예 안 싣는다 — 실으면 받는 쪽이 곱하고 싶어진다"
           },
           {
             "what": "avatarMesh-b — 실시간 뷰에 아바타를 세운다",
-            "status": "todo",
-            "note": "⚠️ 좌표계를 먼저 확인할 것. 옷은 패턴 로컬이라 변환이 따로 필요했다(ISSUE-011). 아바타도 그런지 안 쟀다 — 틀리면 옷과 아바타가 어긋난 채 두 벌 보인다"
+            "status": "done",
+            "commit": "67cfce5",
+            "note": "좌표계 걱정(옷처럼 패턴 로컬인가)은 avatarMesh-a 에서 '월드다' 로 먼저 결론이 났고 그대로 맞았다. ⓘ 카메라를 몸이 도착한 뒤 한 번 더 맞춘다 — showScene 의 frameCamera 는 옷(약 100cm)만 보고 잡은 것이라 그대로 두면 177cm 몸의 머리가 화면 밖으로 나간다. ⓘ 몸은 로드의 성패에 묶지 않는다(1.9MB 라 눈에 띄게 걸리고, 몸이 없어도 옷은 서야 한다)"
+          },
+          {
+            "what": "액세서리 — 머리카락·신발·양말·속옷",
+            "status": "done",
+            "commit": "a3fa2ce",
+            "zest": "ztDesignZeta::GetRenderAccessoryMeshes() → std::vector<ztAccessoryMeshData> (ztSimulMesh 는 zsTriMesh 를 상속한다)",
+            "note": "avatarMesh-a 가 일부러 뺐던 자리다 — 액세서리는 basecolor + alpha 이미지로 그려지는데 이미지를 싣는 통로가 없었다. 82a0fb3 에서 그 통로가 생겨 이제 붙였다. 실측 이 씬의 액세서리는 신발 하나다(low_top_sneakers.obj, 7,914정점 → 아바타 28,564 → 36,478). 머리카락은 이 씬에 없다. ★ 익스포터(zwGltfExporterImpl.cpp:530-546)를 옮겼다 — 렌더러가 아니라 익스포터인 이유는 성격이 같아서다(둘 다 GL 재질 대신 ztDesignMaterialData 를 합성해 내보내고, 그 구조체가 우리 AvatarMaterialJson 의 입력이라 몸 파트와 완전히 같은 경로를 탄다). ⚠️ 다만 세 자리에서 안 따랐다: (1) 텍스처는 Hair 일 때만 건다 — 익스포터는 타입을 안 보고 거는데 신발의 image->path 가 fabric/Preset/Default/textures/Default_Base_Color.png 이고 그 파일이 디스크에 없다. 데스크톱 렌더러(Renderer3D.cpp:593-601)가 Hair 만 보는 이유가 그것이다. (2) ztDesignMaterialData 의 기본 생성자가 이미 텍스처를 물고 있다(basecolorTexture = { BASE_COLOR_TEXTURE }, ztDesignMaterial.h:60) — 빈 벡터가 아니다. 안 비우면 우리가 아무것도 안 실었는데 텍스처가 하나 실리고, (1)의 진짜 출처가 이것이었다(엔진이 준 값인 줄 알고 한 번 헛짚었다). (3) find_if 결과의 end() 를 검사한다 — 익스포터(:535)도 렌더러(:577)도 안 보고 역참조한다. ★ 구조: 파트 포장을 packPart 람다로 들어올려 몸과 액세서리가 같은 코드를 쓴다. 갈라 두면 쓰레기 정점 AABB 규칙이나 법선 규약을 한쪽에만 고치는 사고가 난다 — 몸 파트가 내보내는 JSON 은 한 글자도 안 바뀐다. ★ 프론트엔드는 한 줄도 안 고쳤다 — 이미 전 파트 DoubleSide 이고 알파맵이 있으면 transparent 를 켠다. ⚠️ 미검증 둘: Hair 갈래(알파 컷아웃)는 이 씬에 머리카락이 없어 안 밟혔다. 액세서리 자체의 단언이 없다 — 기존 회귀(smoke 73 · smoke:server 376 · frontend 778)만 돌렸다"
           },
           {
             "what": "아바타 체형 조절",
