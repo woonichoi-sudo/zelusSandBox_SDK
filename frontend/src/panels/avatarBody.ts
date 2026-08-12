@@ -37,44 +37,53 @@
  *   `AvatarMeasureController.noteBodyParamsApplied()` 로 넘긴다.
  */
 
+import { t } from './i18n.ts';
 import type { AvatarBodyResult } from '../protocol/index.ts';
 
 /**
- * 엔진 키 → 한국어 이름. **목록이 아니라 사전이다** (머리말 참고).
+ * 엔진 키 → **사전 키**. **목록이 아니라 사전이다** (머리말 참고).
  *
  * 순서는 `ztAvatarBodyParam` 을 따르되 화면에서는 아래 `GROUPS` 로 묶는다.
  * 슬라이더 29개를 한 줄로 세워 두면 "키" 를 찾는 데 스크롤을 해야 한다.
+ *
+ * ★ **여기 오른쪽이 한국어 글자가 아니라 사전 키인 것이 I-1 이다.** 왼쪽
+ *   (`fatness`·`shoulder` …)은 **엔진이 준 값**이라 번역 대상이 아니고,
+ *   오른쪽은 **우리가 붙인 이름**이라 번역 대상이다. 글자 자체를 여기 두면
+ *   모듈이 로드될 때 언어가 굳는다 — 실제 글자는 `#field()` 가 꺼낸다.
+ *
+ * ⚠️ 표에 없는 엔진 키는 `t(key)` 로 떨어지고, 모르는 키는 키 자체를 돌려주므로
+ *    화면에는 엔진 키가 그대로 뜬다. 예전 동작(`LABELS[key] ?? key`)과 같다.
  */
-const LABELS: Record<string, string> = {
-  fatness: '살집',
-  height: '키',
-  shoulder: '어깨너비',
-  shoulder_height: '어깨높이',
-  neck: '목둘레',
-  mid_neck: '목 중간',
-  backneck_height: '뒷목높이',
-  head: '머리',
-  chest: '가슴우리',
-  bust_size: '가슴크기',
-  bust_depth: '가슴깊이',
-  bust_height: '가슴높이',
-  under_bust: '언더버스트',
-  bustpoint_to_bustpoint: '유두 간격',
-  belly: '배',
-  waist_height: '허리높이',
-  pelvis: '골반',
-  high_hip: '윗엉덩이',
-  low_hip: '아랫엉덩이',
-  hip_height: '엉덩이높이',
-  crotch: '밑위',
-  arm_length: '팔길이',
-  upper_arm_length: '윗팔길이',
-  bicep: '이두',
-  wrist: '손목',
-  thigh: '허벅지',
-  knee_height: '무릎높이',
-  calf: '종아리',
-  ankle: '발목',
+const LABEL_KEYS: Record<string, string> = {
+  fatness: 'body.fatness',
+  height: 'body.height',
+  shoulder: 'body.shoulder',
+  shoulder_height: 'body.shoulder_height',
+  neck: 'body.neck',
+  mid_neck: 'body.mid_neck',
+  backneck_height: 'body.backneck_height',
+  head: 'body.head',
+  chest: 'body.chest',
+  bust_size: 'body.bust_size',
+  bust_depth: 'body.bust_depth',
+  bust_height: 'body.bust_height',
+  under_bust: 'body.under_bust',
+  bustpoint_to_bustpoint: 'body.bustpoint_to_bustpoint',
+  belly: 'body.belly',
+  waist_height: 'body.waist_height',
+  pelvis: 'body.pelvis',
+  high_hip: 'body.high_hip',
+  low_hip: 'body.low_hip',
+  hip_height: 'body.hip_height',
+  crotch: 'body.crotch',
+  arm_length: 'body.arm_length',
+  upper_arm_length: 'body.upper_arm_length',
+  bicep: 'body.bicep',
+  wrist: 'body.wrist',
+  thigh: 'body.thigh',
+  knee_height: 'body.knee_height',
+  calf: 'body.calf',
+  ankle: 'body.ankle',
 };
 
 /**
@@ -84,22 +93,23 @@ const LABELS: Record<string, string> = {
  *
  * 여기 없는 키는 사라지지 않고 마지막 "기타" 로 떨어진다(머리말의 같은 이유).
  */
+/* `label` 은 **사전 키**다 (I-1) — 아래 `get view()` 가 `t()` 로 꺼낸다 */
 const GROUPS: readonly { key: string; label: string; fields: readonly string[] }[] = [
-  { key: 'overall', label: '전체', fields: ['fatness', 'height'] },
+  { key: 'overall', label: 'body.group.overall', fields: ['fatness', 'height'] },
   {
     key: 'upper',
-    label: '상체',
+    label: 'body.group.upper',
     fields: ['shoulder', 'shoulder_height', 'neck', 'mid_neck', 'backneck_height', 'head',
              'chest', 'bust_size', 'bust_depth', 'bust_height', 'under_bust',
              'bustpoint_to_bustpoint'],
   },
   {
     key: 'lower',
-    label: '하체',
+    label: 'body.group.lower',
     fields: ['belly', 'waist_height', 'pelvis', 'high_hip', 'low_hip', 'hip_height', 'crotch',
              'thigh', 'knee_height', 'calf', 'ankle'],
   },
-  { key: 'arm', label: '팔', fields: ['arm_length', 'upper_arm_length', 'bicep', 'wrist'] },
+  { key: 'arm', label: 'body.group.arm', fields: ['arm_length', 'upper_arm_length', 'bicep', 'wrist'] },
 ];
 
 /** 화면에 그릴 슬라이더 한 줄 */
@@ -204,8 +214,8 @@ export class AvatarBodyPanel {
 
   get view(): AvatarBodyView {
     const reason
-      = this.#phase === 'noScene' ? '씬을 로드하면 아바타 체형을 조절할 수 있습니다'
-      : this.#phase === 'noAvatar' ? '이 씬에는 아바타가 없습니다'
+      = this.#phase === 'noScene' ? t('body.noScene')
+      : this.#phase === 'noAvatar' ? t('avatar.none')
       : undefined;
 
     const seen = new Set<string>();
@@ -216,14 +226,14 @@ export class AvatarBodyPanel {
         seen.add(k);
         return this.#field(k);
       });
-      if (fields.length > 0) groups.push({ key: g.key, label: g.label, fields });
+      if (fields.length > 0) groups.push({ key: g.key, label: t(g.label), fields });
     }
 
     // ★ 표에 없는 키를 버리지 않는다. 엔진이 파라미터를 늘렸을 때 화면에서
     //   조용히 사라지면, 그것이 없는 것인지 우리가 빠뜨린 것인지 알 수 없다.
     const rest = Object.keys(this.#worker).filter((k) => !seen.has(k));
     if (rest.length > 0) {
-      groups.push({ key: 'other', label: '기타', fields: rest.map((k) => this.#field(k)) });
+      groups.push({ key: 'other', label: t('body.group.other'), fields: rest.map((k) => this.#field(k)) });
     }
 
     return {
@@ -239,7 +249,7 @@ export class AvatarBodyPanel {
     const pending = this.#pending.get(key);
     return {
       key,
-      label: LABELS[key] ?? key,
+      label: t(LABEL_KEYS[key] ?? key),
       worker,
       value: pending ?? worker,
       dirty: pending !== undefined,

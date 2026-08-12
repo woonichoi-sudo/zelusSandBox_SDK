@@ -25,6 +25,8 @@
  * 맞춰 놓고 몸을 바꿔 그 조정을 무르게 된다.
  */
 
+import { t } from './i18n.ts';
+
 export type SideTabId = 'avatar' | 'surface';
 
 /** 탭 하나의 정의. **순서가 곧 화면 순서다** */
@@ -42,9 +44,15 @@ export interface SideTabDef {
  * 탭 목록. `avatarBody.ts` 의 `LABELS` 와 달리 이쪽은 **진짜 목록이다** —
  * 오른쪽 칸의 상자는 우리가 `index.html` 에 박은 것이라 엔진이 늘리지 않는다.
  */
+/*
+ * ⚠️ `label` 이 **게터인 것이 배선이다** (I-1). 이 표는 모듈이 로드될 때 한 번
+ *    만들어지므로 글자를 값으로 박으면 언어를 바꿔도 탭 두 개만 한국어로
+ *    남는다. 아래 `get view()` 가 읽을 때마다 지금 언어로 나온다.
+ *    `id`·`paneId` 는 식별자라 그대로다.
+ */
 export const SIDE_TABS: readonly SideTabDef[] = [
-  { id: 'avatar', label: '아바타', paneId: 'avatarPanel' },
-  { id: 'surface', label: '옷 사이즈', paneId: 'surfacePanel' },
+  { id: 'avatar', get label(): string { return t('side.tab.avatar'); }, paneId: 'avatarPanel' },
+  { id: 'surface', get label(): string { return t('side.tab.surface'); }, paneId: 'surfacePanel' },
 ];
 
 /** 화면에 그릴 탭 한 개 */

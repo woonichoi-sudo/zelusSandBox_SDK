@@ -23,7 +23,7 @@
  *    차이는 회색 글자로 덧붙이고 빨갛게 칠하지 않는다.
  */
 
-import type { AvatarMeasureController, AvatarMeasureView } from '../panels/index.ts';
+import { t, type AvatarMeasureController, type AvatarMeasureView } from '../panels/index.ts';
 
 export interface AvatarMeasurePanelOptions {
   /** 행이 그려질 자리 */
@@ -68,18 +68,17 @@ export class AvatarMeasurePanel {
     this.#panel = opts.panel;
     this.#opts = opts;
 
+    // 글자는 전부 `render()` 가 채운다 (I-1) — 생성자에서 찍으면 언어를
+    // 바꿔도 이 상자만 한국어로 남는다.
     this.#title = document.createElement('h4');
-    this.#title.textContent = '치수 (cm)';
 
     this.#bar = document.createElement('div');
     this.#bar.className = 'pbar';
 
     this.#apply = document.createElement('button');
-    this.#apply.textContent = '적용';
     this.#apply.addEventListener('click', () => opts.onApply());
 
     this.#revert = document.createElement('button');
-    this.#revert.textContent = '되돌리기';
     this.#revert.addEventListener('click', () => opts.onRevert());
 
     this.#bar.append(this.#apply, this.#revert);
@@ -98,6 +97,11 @@ export class AvatarMeasurePanel {
   }
 
   render(view: AvatarMeasureView = this.#panel.view): void {
+    // ⓪ 늘 보이는 글자부터 (I-1)
+    this.#title.textContent = t('side.meas.title');
+    this.#apply.textContent = t('btn.apply');
+    this.#revert.textContent = t('btn.revert');
+
     // ① 사유든 진행이든 결과든 **한 줄로 화면에 남는다.**
     this.#stat.textContent = view.text;
     this.#stat.classList.toggle('err', view.isError);
@@ -108,10 +112,7 @@ export class AvatarMeasurePanel {
 
     // ② 체형을 보낸 뒤라면 이 숫자들이 낡았다는 사실을 말한다.
     this.#stale.hidden = !view.stale;
-    this.#stale.textContent = view.stale
-      ? '체형 슬라이더를 보낸 뒤입니다 — 아래 치수는 그 전에 잰 값입니다.'
-        + ' 치수를 한 번 적용하면 25개 전부 다시 잰 값으로 갱신됩니다.'
-      : '';
+    this.#stale.textContent = view.stale ? t('side.meas.stale') : '';
 
     this.#apply.disabled = !view.canApply;
     this.#revert.disabled = view.dirty === 0 || view.busy;
@@ -140,11 +141,14 @@ export class AvatarMeasurePanel {
       w.row.classList.toggle('dirty', r.dirty);
 
       // ④ 지금 몸의 값 + (목표를 걸었다면) 근사 차이. **오류가 아니다.**
-      w.now.textContent = `현재 ${r.current.toFixed(2)}`
+      w.now.textContent = t('side.meas.now', { v: r.current.toFixed(2) })
         + (r.offset === undefined || Math.abs(r.offset) < 0.005
           ? ''
-          : ` · 목표 ${r.target?.toFixed(2)} (${r.offset > 0 ? '+' : ''}${r.offset.toFixed(2)})`)
-        + (r.locked ? ' · 잠김' : '');
+          : t('side.meas.target', {
+            v: r.target?.toFixed(2) ?? '',
+            d: `${r.offset > 0 ? '+' : ''}${r.offset.toFixed(2)}`,
+          }))
+        + (r.locked ? t('side.meas.locked') : '');
 
       // 잘못된 값은 회색만 되지 않는다 — 이유가 글자로 남는다.
       w.why.textContent = r.invalid ?? '';

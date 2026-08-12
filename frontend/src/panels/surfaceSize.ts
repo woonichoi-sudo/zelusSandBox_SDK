@@ -25,6 +25,7 @@
  * 구분 수단이다.
  */
 
+import { t } from './i18n.ts';
 import type { SurfaceInfo } from '../protocol/index.ts';
 
 /** 화면에 그릴 행 하나 */
@@ -54,8 +55,8 @@ export interface SurfaceSizeView {
 
 /** 0 이하와 비수를 막는다. 상한은 두지 않는다 — 아래 주석 참고 */
 export function validateSize(v: number): string | undefined {
-  if (!Number.isFinite(v)) return '숫자가 아닙니다';
-  if (v <= 0) return '0보다 커야 합니다';
+  if (!Number.isFinite(v)) return t('valid.notNumber');
+  if (v <= 0) return t('valid.notPositive');
   // ⚠️ 상한을 두지 않는다. "옷이 이만큼까지만 커진다" 는 우리가 아는 사실이
   //    아니고, 막아 두면 엔진이 실제로 어떻게 다루는지가 우리 코드에 가려진다.
   //    게이트웨이·워커도 같은 판단이다.
@@ -123,8 +124,8 @@ export class SurfaceSizePanel {
 
   get view(): SurfaceSizeView {
     const reason
-      = this.#phase === 'noScene' ? '씬을 로드하면 패턴 크기를 조절할 수 있습니다'
-      : this.#phase === 'empty' ? '이 씬에는 패턴이 없습니다'
+      = this.#phase === 'noScene' ? t('surface.noScene')
+      : this.#phase === 'empty' ? t('surface.empty')
       : undefined;
 
     const rows: SurfaceRow[] = this.#worker.map((s) => {

@@ -50,6 +50,7 @@
  *   ⑤ 사용자가 몸을 꺼 두면 한 번도 안 받는다
  */
 
+import { t } from './i18n.ts';
 import {
   decodeAvatars,
   decodeAvatarTextures,
@@ -274,22 +275,25 @@ export class AvatarViewController {
   }
 
   #text(): string {
-    if (!this.#sink.visible) return '아바타 숨김';
+    if (!this.#sink.visible) return t('av.hidden');
     switch (this.#phase) {
       case 'noScene':
-        return this.#port.connected ? '씬을 로드하면 몸이 섭니다' : '연결되어 있지 않습니다';
+        return this.#port.connected ? t('av.noScene') : t('err.notConnected');
       case 'loading':
         // 첫 요청은 1.9MB 다. 말해 두지 않으면 "멈췄다" 로 읽힌다.
-        return this.#signature === null ? '몸을 받는 중… (1.9MB)' : '몸을 갱신하는 중…';
+        return this.#signature === null ? t('av.loading.first') : t('av.loading');
       case 'noAvatar':
-        return '이 씬에는 시뮬에 참여하는 아바타가 없습니다';
+        return t('av.none');
       case 'error':
-        return `몸을 받지 못했습니다: ${this.#stats.lastError?.message ?? '원인 불명'}`;
+        return t('av.failed', { why: this.#stats.lastError?.message ?? t('err.unknownCause') });
       case 'ready':
         return (
-          `아바타 ${this.#avatars} · 정점 ${this.#vertices.toLocaleString('ko-KR')}`
+          t('av.ready', {
+            avatars: this.#avatars,
+            vertices: this.#vertices.toLocaleString('ko-KR'),
+          })
           + (this.#animated && !this.#animationDone && this.#frameInfo
-            ? ` · 애니 ${this.#frameInfo[0] + 1}/${this.#frameInfo[1]}`
+            ? t('av.anim', { at: this.#frameInfo[0] + 1, total: this.#frameInfo[1] })
             : '')
         );
     }

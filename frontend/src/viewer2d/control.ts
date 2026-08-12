@@ -9,6 +9,9 @@
  * 갈라질 수 있는 곳은 전부 DOM 밖으로 뺀다.**
  */
 
+// ⚠️ `tr` 로 받는다 — 이 파일에서 `t` 는 **펼침 진행도**(0~1)를 뜻하는 이름이라
+//    사전 조회 함수와 이름이 부딪친다. 여기서는 진행도 쪽이 원래 주인이다.
+import { t as tr } from '../panels/i18n.ts';
 import type { UnfoldStats } from './unfold.ts';
 
 /** 화면이 그대로 그리면 되는 한 벌. **여기 없는 것은 화면에 없다** */
@@ -89,7 +92,7 @@ export class UnfoldController {
       return {
         t: 0, enabled: false, is3d: true, is2d: false,
         label: '—',
-        reason: '씬이 없습니다',
+        reason: tr('unfold.noScene'),
       };
     }
     if (!s || s.placed === 0) {
@@ -99,8 +102,8 @@ export class UnfoldController {
         reason: s && s.patterns > 0
           // 워커가 서피스를 모르는 경우다. 화면이 "안 된다" 가 아니라 **왜**
           // 안 되는지를 말해야 다음 사람이 워커를 볼 생각을 한다.
-          ? `패턴 ${s.patterns}개 모두 2D 배치가 없습니다 — 도면을 그릴 수 없습니다`
-          : '패턴이 없습니다',
+          ? tr('unfold.allUnplaced', { patterns: s.patterns })
+          : tr('unfold.noPatterns'),
       };
     }
 
@@ -118,7 +121,7 @@ export class UnfoldController {
       //   (그 패턴들은 `Unfolder` 가 모핑에서 빼 두므로 t=1 에서 혼자 3D 로
       //    떠 있게 된다. 그 낯선 그림의 이유가 이 글자다.)
       reason: s.unplaced > 0
-        ? `패턴 ${s.unplaced}개는 2D 배치가 없어 3D 자리에 남습니다`
+        ? tr('unfold.someUnplaced', { unplaced: s.unplaced })
         : null,
     };
   }

@@ -41,6 +41,11 @@ export class Design2DOptions {
   readonly #layer: Design2DLayer;
   readonly #opts: Design2DOptionsOptions;
   readonly #boxes = new Map<DesignLayerKey, HTMLInputElement>();
+  /**
+   * 글자를 담은 `<span>`. **참조를 들고 있어야 언어 전환이 여기까지 온다**
+   * (I-1) — 생성자에서 한 번 찍고 말면 체크박스 여섯 개만 한국어로 남는다.
+   */
+  readonly #texts = new Map<DesignLayerKey, HTMLElement>();
 
   constructor(opts: Design2DOptionsOptions) {
     this.#root = opts.root;
@@ -68,6 +73,7 @@ export class Design2DOptions {
 
       label.append(box, text);
       this.#boxes.set(l.key, box);
+      this.#texts.set(l.key, text);
       this.#root.append(label);
     }
   }
@@ -77,6 +83,9 @@ export class Design2DOptions {
     for (const l of this.#layer.layers) {
       const box = this.#boxes.get(l.key);
       if (box) box.checked = l.on;
+      // 글자도 매번 다시 쓴다 — 언어가 바뀌면 `l.label` 이 달라진다 (I-1).
+      const text = this.#texts.get(l.key);
+      if (text) text.textContent = l.label;
     }
   }
 

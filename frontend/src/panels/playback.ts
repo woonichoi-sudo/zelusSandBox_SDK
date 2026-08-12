@@ -85,6 +85,7 @@
  * 방법을 말한다.
  */
 
+import { t } from './i18n.ts';
 import type { StatusResult } from '../protocol/index.ts';
 
 // ── 상태 ────────────────────────────────────────────────────
@@ -288,7 +289,7 @@ export class PlaybackController {
     const free = live && this.#pending === null;
     return {
       state,
-      playLabel: state === 'playing' ? '⏸ 정지' : '▶ 재생',
+      playLabel: state === 'playing' ? t('bar.pause') : t('bar.play'),
       playing: state === 'playing',
       pending: this.#pending,
       busy: this.#pending !== null,
@@ -307,13 +308,13 @@ export class PlaybackController {
 
   /** 상태줄 한 줄. 프레임 번호가 없으면 아예 안 붙인다 — `-` 를 읽을 이유가 없다 */
   #text(state: PlaybackState): string {
-    const at = this.#frame === null ? '' : ` · 프레임 ${this.#frame}`;
+    const at = this.#frame === null ? '' : t('sim.atFrame', { frame: this.#frame });
     switch (state) {
-      case 'disconnected': return '연결 없음';
-      case 'noScene': return '씬 없음 — .zls 를 로드하세요';
-      case 'loading': return '씬을 로드하는 중…';
-      case 'playing': return `시뮬레이션 실행 중${at}`;
-      case 'paused': return `일시정지${at}`;
+      case 'disconnected': return t('sim.disconnected');
+      case 'noScene': return t('sim.noScene');
+      case 'loading': return t('sim.loading');
+      case 'playing': return t('sim.playing', { at });
+      case 'paused': return t('sim.paused', { at });
     }
   }
 
@@ -551,13 +552,14 @@ export class PlaybackController {
    */
   async #run(action: PlaybackAction, body: () => Promise<void>): Promise<boolean> {
     if (!this.#port.connected) {
-      this.#lastError = new Error('연결되어 있지 않습니다');
+      // 이 사유는 `main.ts` 의 `act()` 를 지나 **상태줄**에 뜬다 (I-1)
+      this.#lastError = new Error(t('err.notConnected'));
       return false;
     }
     // clear 는 씬을 내리는 op 이라 `scene === null` 이면 할 일이 없다. play/
     // pause/reset/step 도 씬 없이는 의미가 없다 — 워커가 조용히 성공시킨다.
     if (this.#scene === null || this.#loading) {
-      this.#lastError = new Error('씬이 로드되어 있지 않습니다');
+      this.#lastError = new Error(t('err.noScene'));
       return false;
     }
     if (this.#pending !== null) {

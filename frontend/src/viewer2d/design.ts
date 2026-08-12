@@ -34,6 +34,8 @@
 
 import * as THREE from 'three';
 
+import { t } from '../panels/i18n.ts';
+
 import type {
   Design2DCurve,
   Design2DResult,
@@ -137,13 +139,21 @@ function segmentsObject(
  *    조용히 아무 일도 안 하는데, 그 증상은 "체크박스가 안 먹는다" 로만 보여서
  *    원인이 이름인지 배선인지 화면으로는 못 가른다.
  */
+/*
+ * ⚠️ `label` 이 **게터인 것이 배선이다** (I-1). 이 표는 모듈이 로드될 때 한 번
+ *    만들어지므로, 글자를 값으로 박아 두면 언어를 바꿔도 체크박스 여섯 개만
+ *    한국어로 남는다. 게터면 읽을 때마다 지금 언어로 나온다 — 아래
+ *    `get layers()` 가 매번 읽으므로 화면이 자동으로 따라온다.
+ *    (`key`·`prefix` 는 그대로 리터럴이다. 접두사는 엔진이 준 이름과 맞물리는
+ *     식별자라 번역 대상이 아니다.)
+ */
 export const DESIGN_LAYERS = [
-  { key: 'links', label: '봉제 대응선', prefix: 'seam:links' },
-  { key: 'seams', label: '봉제선', prefix: 'seam:' },
-  { key: 'outer', label: '외곽선', prefix: 'curves:outer' },
-  { key: 'inner', label: '내부선', prefix: 'curves:inner' },
-  { key: 'vertices', label: '제어점', prefix: 'vertices:' },
-  { key: 'stitches', label: '스티치', prefix: 'stitch:' },
+  { key: 'links', get label(): string { return t('draft2d.layer.links'); }, prefix: 'seam:links' },
+  { key: 'seams', get label(): string { return t('draft2d.layer.seams'); }, prefix: 'seam:' },
+  { key: 'outer', get label(): string { return t('draft2d.layer.outer'); }, prefix: 'curves:outer' },
+  { key: 'inner', get label(): string { return t('draft2d.layer.inner'); }, prefix: 'curves:inner' },
+  { key: 'vertices', get label(): string { return t('draft2d.layer.vertices'); }, prefix: 'vertices:' },
+  { key: 'stitches', get label(): string { return t('draft2d.layer.stitches'); }, prefix: 'stitch:' },
 ] as const;
 
 export type DesignLayerKey = (typeof DESIGN_LAYERS)[number]['key'];

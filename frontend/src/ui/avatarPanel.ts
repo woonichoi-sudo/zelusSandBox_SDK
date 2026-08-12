@@ -21,7 +21,7 @@
  * 그려야 하는데, 한 위젯이면 슬라이더 29개까지 같이 흔들린다.
  */
 
-import type { AvatarBodyPanel, AvatarBodyView } from '../panels/index.ts';
+import { t, type AvatarBodyPanel, type AvatarBodyView } from '../panels/index.ts';
 
 export interface AvatarPanelOptions {
   /** 행이 그려질 자리 */
@@ -46,8 +46,22 @@ export class AvatarPanel {
   readonly #panel: AvatarBodyPanel;
   readonly #opts: AvatarPanelOptions;
 
-  /** 매번 다시 만들지 않고 값만 갈아 끼우려고 잡아 둔다 */
-  readonly #inputs = new Map<string, { range: HTMLInputElement; num: HTMLElement; row: HTMLElement }>();
+  /**
+   * 매번 다시 만들지 않고 값만 갈아 끼우려고 잡아 둔다.
+   *
+   * ★ `label` 도 여기 있다 (I-1). `#build()` 는 **필드 구성이 바뀔 때만** 도는데
+   *   언어 전환은 구성을 안 바꾼다 — 참조가 없으면 슬라이더 29개의 이름이
+   *   한국어로 남는다.
+   */
+  readonly #inputs = new Map<string, {
+    range: HTMLInputElement;
+    num: HTMLElement;
+    row: HTMLElement;
+    label: HTMLElement;
+  }>();
+
+  /** 그룹 제목(`전체`·`상체` …). `#inputs` 와 같은 이유로 잡아 둔다 (I-1) */
+  readonly #groupHeads = new Map<string, HTMLElement>();
 
   #title: HTMLElement;
   #bar: HTMLElement;
@@ -65,20 +79,17 @@ export class AvatarPanel {
 
     // 같은 탭에 [적용] 버튼이 둘(체형·치수)이 됐다. 어느 것이 무엇을 보내는지
     // 제목이 없으면 알 수 없다 — 하나는 정규화 0~1, 하나는 cm 다.
+    // 글자·툴팁은 전부 `render()` 가 채운다 (I-1) — 생성자에서 찍으면
+    // 언어를 바꿔도 이 상자만 한국어로 남는다.
     this.#title = document.createElement('h4');
-    this.#title.textContent = '체형 (정규화 0~1)';
 
     this.#bar = document.createElement('div');
     this.#bar.className = 'pbar';
 
     this.#apply = document.createElement('button');
-    this.#apply.textContent = '적용';
-    this.#apply.title = '바뀐 값만 워커로 보냅니다';
     this.#apply.addEventListener('click', () => opts.onApply());
 
     this.#revert = document.createElement('button');
-    this.#revert.textContent = '되돌리기';
-    this.#revert.title = '화면의 편집을 버리고 워커의 실제 값으로 다시 채웁니다';
     this.#revert.addEventListener('click', () => opts.onRevert());
 
     this.#bar.append(this.#apply, this.#revert);
@@ -94,10 +105,19 @@ export class AvatarPanel {
   }
 
   render(view: AvatarBodyView = this.#panel.view): void {
+    // 언어와 무관하게 늘 보이는 글자부터. **상태보다 먼저** — 아래 갈래 어느
+    // 쪽으로 빠져도 제목과 버튼은 지금 언어여야 한다 (I-1).
+    this.#title.textContent = t('side.body.title');
+    this.#apply.textContent = t('btn.apply');
+    this.#apply.title = t('btn.apply.title');
+    this.#revert.textContent = t('btn.revert');
+    this.#revert.title = t('side.body.revert.title');
+
     // ① 못 쓰는 상태 — 이유를 글자로.
     if (view.phase !== 'ready') {
       this.#builtFor = '';
       this.#inputs.clear();
+      this.#groupHeads.clear();
       this.#body.textContent = '';
       this.#banner.hidden = false;
       this.#banner.textContent = view.reason ?? '';
@@ -115,9 +135,14 @@ export class AvatarPanel {
     }
 
     for (const g of view.groups) {
+      // 그룹 제목도 매번 다시 쓴다 — `g.label` 은 이미 번역된 글자다 (I-1)
+      const head = this.#groupHeads.get(g.key);
+      if (head) head.textContent = g.label;
       for (const f of g.fields) {
         const w = this.#inputs.get(f.key);
         if (!w) continue;
+        // 이름도 매번 다시 쓴다 — 같은 이유다 (I-1)
+        w.label.textContent = f.label;
         // 사용자가 잡고 있는 슬라이더의 값을 덮어쓰지 않는다.
         const want = String(Math.round(f.value * 1000));
         if (w.range.value !== want && document.activeElement !== w.range) w.range.value = want;
@@ -138,6 +163,7 @@ export class AvatarPanel {
   #build(view: AvatarBodyView): void {
     this.#body.textContent = '';
     this.#inputs.clear();
+    this.#groupHeads.clear();
 
     for (const g of view.groups) {
       const group = document.createElement('div');
@@ -145,6 +171,7 @@ export class AvatarPanel {
 
       const h = document.createElement('h4');
       h.textContent = g.label;
+      this.#groupHeads.set(g.key, h);
       group.append(h);
 
       for (const f of g.fields) {
@@ -173,7 +200,7 @@ export class AvatarPanel {
 
         row.append(head, range);
         group.append(row);
-        this.#inputs.set(f.key, { range, num, row });
+        this.#inputs.set(f.key, { range, num, row, label });
       }
 
       this.#body.append(group);

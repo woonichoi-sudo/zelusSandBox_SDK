@@ -67,6 +67,16 @@ export {
 } from './sideDrawer.ts';
 
 /**
+ * 언어 전환 (I-1). 사전과 언어 결정은 `panels/i18n.ts` 가 하고 여기서는
+ * 상자 하나와 `data-i18n` 채우기만 한다.
+ */
+export {
+  applyStaticText,
+  LangSwitch,
+  type LangSwitchOptions,
+} from './langSwitch.ts';
+
+/**
  * 재단 도면의 표시 스위치 (D2-e). 켜짐/꺼짐의 정본은 `Design2DLayer` 이고
  * 이 위젯은 읽어서 그리기만 한다 — 씬을 다시 로드해도 안 갈라지는 이유다.
  */

@@ -29,6 +29,8 @@
  * 두어 900 으로 잡았다.
  */
 
+import { t } from './i18n.ts';
+
 /** 3분할이 성립하는 하한. 이 값 **이하**면 서랍이 된다 (머리말 참고) */
 export const NARROW_MAX_PX = 899;
 
@@ -62,9 +64,14 @@ export interface SideDrawerView {
   expanded: boolean;
 }
 
-/** 닫힌 서랍을 여는 버튼 / 열린 서랍을 닫는 버튼 */
-const LABEL_OPEN = '☰ 설정';
-const LABEL_CLOSE = '✕ 설정';
+/**
+ * 닫힌 서랍을 여는 버튼 / 열린 서랍을 닫는 버튼.
+ *
+ * **함수인 것이 배선이다** (I-1). 상수로 두면 모듈 로드 시점의 언어로 굳어
+ * 버튼 하나만 한국어로 남는다. `get view()` 가 읽을 때마다 지금 언어로 나온다.
+ */
+const labelOpen = (): string => t('side.drawer.open');
+const labelClose = (): string => t('side.drawer.close');
 
 /**
  * 오른쪽 칸의 서랍 상태. **DOM 을 모른다.**
@@ -145,7 +152,7 @@ export class SideDrawerPanel {
       mode: this.#mode,
       open,
       toggleVisible: drawer,
-      toggleLabel: this.#open ? LABEL_CLOSE : LABEL_OPEN,
+      toggleLabel: this.#open ? labelClose() : labelOpen(),
       expanded: drawer && this.#open,
     };
   }

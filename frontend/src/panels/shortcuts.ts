@@ -41,6 +41,8 @@
  * 되돌아오기 때문이다. 잃는 것은 시뮬 진행뿐이다 (`playback.ts` 머리말).
  */
 
+import { t } from './i18n.ts';
+
 /** 단축키가 만들어 내는 조작. `PlaybackController` 의 메서드 이름과 맞춘다 */
 export type ShortcutAction = 'toggle' | 'reset' | 'clear' | 'step';
 
@@ -100,5 +102,26 @@ export function shortcutFor(
   return TABLE[ev.key.toLowerCase()] ?? null;
 }
 
-/** 화면 아래 힌트에 쓸 한 줄. 표와 한 곳에서 나오게 둔다 */
+/**
+ * 화면 아래 힌트에 쓸 한 줄. 표와 한 곳에서 나오게 둔다.
+ *
+ * ⚠️ **상수는 한국어로 굳는다** (I-1). 모듈이 로드되는 순간의 언어로 한 번
+ *    계산되므로, 화면에는 이것 말고 아래 `shortcutHint()` 를 쓸 것. 상수를
+ *    남겨 두는 이유는 스모크가 "SPACE 가 안내에 없다"·"S/R/C 가 있다" 를 이
+ *    이름으로 보기 때문이다 — 검사의 대상은 **표에서 나온다는 사실**이지
+ *    언어가 아니다.
+ */
 export const SHORTCUT_HINT = 'S 재생/정지 · R 리셋 · C 씬 내림';
+
+/** 지금 언어로 된 단축키 한 줄 (I-1). 화면은 이것을 쓴다 */
+export function shortcutHint(): string {
+  return t('hint.shortcuts');
+}
+
+/**
+ * 3D 칸의 조작 설명 (I-1). 예전에는 `index.html` 에 박혀 있었는데, 그러면
+ * 언어를 바꿀 때 한 줄 안에서 앞 절반만 한국어로 남는다.
+ */
+export function viewHint(): string {
+  return t('hint.view');
+}

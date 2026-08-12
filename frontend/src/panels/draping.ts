@@ -25,6 +25,7 @@
  * 툴팁이 아니다 — 마우스를 올려야 보이는 것은 보이는 게 아니다(#16 에서 확립).
  */
 
+import { t } from './i18n.ts';
 import type { LoadDrapingResult } from '../protocol/index.ts';
 
 // ── 상태 ────────────────────────────────────────────────────
@@ -180,21 +181,23 @@ export class DrapingPanel {
    * 남아 있으면, 그 글자가 지금 화면의 옷을 가리키는 것처럼 읽힌다.
    */
   #text(phase: DrapingPhase): string {
-    if (phase === 'disconnected') return '연결 없음 — 드레이프를 적용할 수 없습니다';
-    if (phase === 'noScene') return '씬을 로드하면 저장된 드레이프를 입힐 수 있습니다';
-    if (phase === 'applying') return '드레이프를 적용하는 중…';
+    if (phase === 'disconnected') return t('drape.disconnected');
+    if (phase === 'noScene') return t('drape.noScene');
+    if (phase === 'applying') return t('drape.applying');
 
     switch (this.#outcome) {
       case 'applied':
-        return `드레이프 적용됨${this.#activeName ? ` — ${this.#activeName}` : ''}`
-          + ' · 시뮬레이션은 처음으로 되돌아갔습니다';
+        // ⛔ `#activeName` 은 **씬에 저장된 드레이프 이름**이라 번역하지 않는다
+        return this.#activeName
+          ? t('drape.applied.named', { name: this.#activeName })
+          : t('drape.applied');
       case 'noAutoItem':
         // ★ 조용히 넘기지 않는다. 아무 일도 안 일어난 화면은 고장으로 보인다.
-        return '이 씬에는 저장된 자동 드레이프가 없습니다 — 옷은 그대로입니다';
+        return t('drape.noAutoItem');
       case 'loadFailed':
-        return '엔진이 드레이프를 적용하지 못했습니다';
+        return t('drape.loadFailed');
       case 'error':
-        return `드레이프 적용 실패: ${this.#lastError?.message ?? '알 수 없는 오류'}`;
+        return t('drape.failed', { why: this.#lastError?.message ?? t('err.unknown') });
       default:
         // 누를 수 있고 아직 아무 일도 없었다. 할 말이 없으면 아무 말도 안 한다.
         return '';
@@ -246,11 +249,12 @@ export class DrapingPanel {
    */
   async apply(): Promise<boolean> {
     if (!this.#port.connected) {
-      this.#fail(new Error('연결되어 있지 않습니다'));
+      // 이 사유는 `#text()` 를 지나 **화면 글자**가 된다 — 번역 대상이다 (I-1)
+      this.#fail(new Error(t('err.notConnected')));
       return false;
     }
     if (!this.#scene) {
-      this.#fail(new Error('씬이 로드되어 있지 않습니다'));
+      this.#fail(new Error(t('err.noScene')));
       return false;
     }
     if (this.#applying) {

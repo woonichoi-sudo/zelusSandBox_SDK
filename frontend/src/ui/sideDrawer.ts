@@ -31,7 +31,7 @@
  * 밖으로 밀어내기만 한다 — `transform` 은 레이아웃을 안 건드린다.
  */
 
-import { type SideDrawerPanel, type SideDrawerView } from '../panels/index.ts';
+import { t, type SideDrawerPanel, type SideDrawerView } from '../panels/index.ts';
 
 /** 좁은 창일 때 `<body>` 에 붙는 표식. CSS 가 이것만 본다 */
 const CLASS_NARROW = 'narrow';
@@ -69,7 +69,6 @@ export class SideDrawer {
     btn.type = 'button';
     btn.id = 'sideToggle';
     btn.setAttribute('aria-controls', opts.panel.id);
-    btn.title = '아바타 체형·옷 사이즈 칸을 여닫습니다 (Esc 로 닫기)';
     btn.addEventListener('click', () => this.toggle());
     this.#button = btn;
     opts.bar.append(btn);
@@ -107,6 +106,8 @@ export class SideDrawer {
 
     this.#button.hidden = !view.toggleVisible;
     this.#button.textContent = view.toggleLabel;
+    // 툴팁도 매번 다시 쓴다 — 생성자에서 한 번 찍으면 언어를 바꿔도 안 바뀐다 (I-1)
+    this.#button.title = t('side.drawer.title');
     this.#button.setAttribute('aria-expanded', view.expanded ? 'true' : 'false');
 
     // 화면 밖으로 밀린 칸은 **읽는 기계에도 없어야 한다.** 보이지 않는데

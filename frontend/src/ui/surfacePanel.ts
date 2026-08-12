@@ -17,7 +17,7 @@
  * 표현해야 한다. 행마다 보내면 그 상태가 아예 생기지 않는다.
  */
 
-import type { SurfaceSizePanel, SurfaceSizeView } from '../panels/index.ts';
+import { t, type SurfaceSizePanel, type SurfaceSizeView } from '../panels/index.ts';
 
 export interface SurfacePanelOptions {
   root: HTMLElement;
@@ -52,8 +52,8 @@ export class SurfacePanel {
     this.#panel = opts.panel;
     this.#opts = opts;
 
+    // 글자는 `render()` 가 채운다 — 여기서 한 번 찍으면 언어 전환이 안 온다 (I-1)
     this.#head = document.createElement('h4');
-    this.#head.textContent = '옷 사이즈 (cm)';
 
     this.#banner = document.createElement('div');
     this.#banner.className = 'pbanner';
@@ -66,6 +66,7 @@ export class SurfacePanel {
   }
 
   render(view: SurfaceSizeView = this.#panel.view): void {
+    this.#head.textContent = t('side.surface.title');
     if (view.phase !== 'ready') {
       this.#builtFor = '';
       this.#rows.clear();
@@ -89,6 +90,11 @@ export class SurfacePanel {
       if (document.activeElement !== w.w) w.w.value = r.editWidth.toFixed(2);
       if (document.activeElement !== w.h) w.h.value = r.editHeight.toFixed(2);
       w.row.classList.toggle('dirty', r.dirty);
+      // ⚠️ 버튼 글자를 **여기서** 다시 쓴다 (I-1). `#build()` 는 행 목록이
+      //    바뀔 때만 도는데 언어 전환은 목록을 안 바꾼다 — 거기 두면 [적용]
+      //    스물넷이 한국어로 남는다.
+      w.apply.textContent = t('btn.apply');
+      w.revert.title = t('side.surface.revert.title');
       w.apply.disabled = !r.dirty || r.invalid !== undefined;
       w.revert.disabled = !r.dirty;
       // 잘못된 값은 회색만 되지 않는다 — 이유가 글자로 남는다.
@@ -132,13 +138,12 @@ export class SurfacePanel {
       x.className = 'phelp';
       inputs.append(w, x, h);
 
+      // 글자·툴팁은 `render()` 가 채운다 (I-1) — `↺` 는 기호라 그대로다
       const apply = document.createElement('button');
-      apply.textContent = '적용';
       apply.addEventListener('click', () => this.#opts.onApply(r.uuid));
 
       const revert = document.createElement('button');
       revert.textContent = '↺';
-      revert.title = '이 행의 편집을 버립니다';
       revert.addEventListener('click', () => this.#opts.onRevert(r.uuid));
 
       inputs.append(apply, revert);

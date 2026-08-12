@@ -71,6 +71,7 @@
  * 만들지 않는다**(`draping.ts` 의 `noAutoItem` 과 같은 판단).
  */
 
+import { t } from './i18n.ts';
 import type {
   AvatarBodyResult,
   AvatarMeasurementTargets,
@@ -151,8 +152,8 @@ export function estimateSeconds(
  * 돌아오는** 왕복 15초를 아낀다.
  */
 export function validateMeasure(v: number): string | undefined {
-  if (!Number.isFinite(v)) return '숫자가 아닙니다';
-  if (v <= 0) return '0보다 커야 합니다';
+  if (!Number.isFinite(v)) return t('valid.notNumber');
+  if (v <= 0) return t('valid.notPositive');
   return undefined;
 }
 
@@ -493,17 +494,18 @@ export class AvatarMeasureController {
       return false;
     }
     if (!this.#port.connected) {
-      this.#fail(new Error('연결되어 있지 않습니다'));
+      // 이 사유는 `#text()` 를 지나 **화면 글자**가 된다 — 번역 대상이다 (I-1)
+      this.#fail(new Error(t('err.notConnected')));
       return false;
     }
     if (!this.#scene || !this.#hasAvatar) {
-      this.#fail(new Error('아바타가 있는 씬이 로드되어 있지 않습니다'));
+      this.#fail(new Error(t('err.noAvatarScene')));
       return false;
     }
     const payload = this.payload();
     if (Object.keys(payload).length === 0) {
       // ⚠️ 게이트웨이가 빈 객체를 거절한다. 여기서 막으면 왕복이 아예 없다.
-      this.#fail(new Error('보낼 치수가 없습니다 — 값을 바꾼 뒤 누르세요'));
+      this.#fail(new Error(t('err.noMeasureToSend')));
       return false;
     }
 
@@ -694,18 +696,16 @@ export class AvatarMeasureController {
 
   #reason(phase: AvatarMeasurePhase): string | undefined {
     switch (phase) {
-      case 'disconnected': return '연결 없음 — 치수를 읽을 수도 보낼 수도 없습니다';
-      case 'noScene': return '씬을 로드하면 치수를 조절할 수 있습니다';
-      case 'noAvatar': return '이 씬에는 아바타가 없습니다';
+      case 'disconnected': return t('meas.disconnected');
+      case 'noScene': return t('meas.noScene');
+      case 'noAvatar': return t('avatar.none');
       case 'notSupported':
         // ★ 이 갈래를 글자로 말하지 않으면 "눌렀는데 아무 일도 없다" 가 된다.
         //
         // ⚠️ **"이 씬은 안 된다" 고 말하지 않는다.** 씬이 아니라 **지금 아바타**
         //    의 성질이고, 같은 씬에서도 드레이프 전에는 됐을 수 있다(머리말의
         //    실측 참고). 씬 탓으로 적으면 사용자가 되돌릴 수 있는데도 포기한다.
-        return '지금 아바타는 치수 변형을 지원하지 않습니다 (ztDesignZeta 아님)'
-          + ' — 체형 슬라이더는 그대로 쓸 수 있습니다.'
-          + ' 드레이프를 적용한 뒤라면 씬을 다시 로드하면 원래 아바타로 돌아갑니다';
+        return t('meas.notSupported');
       default: return undefined;
     }
   }
@@ -721,8 +721,7 @@ export class AvatarMeasureController {
     if (phase === 'applying') {
       const sec = Math.max(0, (this.#now() - this.#startedAt) / 1000);
       const want = this.#estimate(Object.fromEntries(this.#targets));
-      return `치수를 적용하는 중… ${sec.toFixed(0)}초 / 예상 ${want.toFixed(0)}초`
-        + ' · 그동안 재생·리셋 등 다른 조작은 워커가 응답하지 않습니다';
+      return t('meas.applying', { sec: sec.toFixed(0), want: want.toFixed(0) });
     }
     const reason = this.#reason(phase);
     if (reason !== undefined) return reason;
@@ -732,29 +731,33 @@ export class AvatarMeasureController {
         const res = this.#last;
         const took = ((this.#stats.lastMs ?? 0) / 1000).toFixed(1);
         const worst = this.#worstOffset();
-        return `치수 적용됨 — ${res?.applied.join(', ') ?? ''}`
-          + ` (${took}초 · 단계 ${res?.steps ?? 0}) · 시뮬레이션은 처음으로 되돌아갔습니다`
+        // ⛔ `applied`·`unknown`·`rejected` 안의 이름은 **엔진이 준 부위명**
+        //    (`WaistCircum` …)이라 번역하지 않는다.
+        return t('meas.applied', {
+          applied: res?.applied.join(', ') ?? '',
+          sec: took,
+          steps: res?.steps ?? 0,
+        })
           // ★ 근사는 실패가 아니다. 그래도 조용히 넘기지 않는다 —
           //   숫자가 목표와 다른 이유를 화면이 말해 주지 않으면 사용자가
           //   "적용이 안 됐다" 고 읽는다.
-          + (worst === null ? ''
-            : ` · 셰이퍼 근사라 목표와 최대 ${worst.toFixed(2)}cm 차이가 납니다 (정상입니다)`)
-          + (res && res.unknown.length > 0 ? ` · ⚠ 모르는 치수: ${res.unknown.join(', ')}` : '')
-          + (res && res.rejected.length > 0 ? ` · ⚠ 못 쓴 값: ${res.rejected.join(', ')}` : '');
+          + (worst === null ? '' : t('meas.approx', { cm: worst.toFixed(2) }))
+          + (res && res.unknown.length > 0 ? t('meas.unknown', { keys: res.unknown.join(', ') }) : '')
+          + (res && res.rejected.length > 0 ? t('meas.rejected', { keys: res.rejected.join(', ') }) : '');
       }
       case 'noChange':
-        return '바뀐 치수가 없습니다 — 값을 바꾼 뒤 [적용] 을 누르세요';
+        return t('meas.noChange');
       case 'notSupported':
         // phase 가 notSupported 라 위에서 이미 걸린다. 씬이 바뀌어 기억이
         // 지워졌는데 결과만 남은 경우를 위해 남겨 둔다.
         return this.#reason('notSupported') as string;
       case 'error':
-        return `치수 적용 실패: ${this.#lastError?.message ?? '알 수 없는 오류'}`;
+        return t('meas.failed', { why: this.#lastError?.message ?? t('err.unknown') });
       default:
         if (est === null) return '';
-        return `${this.#edits.size}개 편집됨 — 적용에 약 ${est.toFixed(0)}초 걸립니다`
+        return t('meas.edited', { n: this.#edits.size, sec: est.toFixed(0) })
           + (est * 1000 > WORKER_TIMEOUT_MS
-            ? ` · ⚠ 워커 제한 ${WORKER_TIMEOUT_MS / 1000}초를 넘길 수 있습니다 — 나눠서 적용하세요`
+            ? t('meas.tooLong', { limit: WORKER_TIMEOUT_MS / 1000 })
             : '');
     }
   }

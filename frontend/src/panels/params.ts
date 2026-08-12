@@ -71,6 +71,7 @@
  *    되돌려야 한다. 이 상수로 되돌리면 다른 씬에서 남의 값을 심는다.
  */
 
+import { t } from './i18n.ts';
 import type { SimulationParams } from '../protocol/index.ts';
 
 // ── 타입 ────────────────────────────────────────────────────
@@ -142,11 +143,22 @@ export interface ParamField {
 // 22개 × 14필드를 손으로 적으면 한 칸 빠뜨린 것을 아무도 못 본다. 공통값은
 // 여기서 채우고, **분류·잠금·출처처럼 판단이 들어간 것만** 표에 적는다.
 
+/*
+ * ★ **글자가 이 표에 없다** (I-1). `label`·`description`·`note` 는
+ *   `panels/i18n.ts` 의 `param.<key>.label` · `.desc` · `.note` 에서 온다.
+ *
+ *   이유는 두 가지다. ① 이 표는 모듈이 로드될 때 **한 번** 만들어지므로 글자를
+ *   값으로 박으면 언어를 바꿔도 파라미터 22개가 통째로 한국어로 남는다.
+ *   ② 키를 여기 또 적으면 `key` 와 사전 키가 두 곳이 되어, 한쪽만 고치는 날
+ *   화면에 `param.timeStep.label` 이 그대로 뜬다. `key` 하나에서 파생시키면
+ *   그런 어긋남이 원리적으로 생기지 않는다.
+ *
+ *   실제 글자는 아래 `localize()` 가 **게터로** 붙인다 — `f.label` 을 읽는
+ *   쪽(`ui/paramsPanel.ts`, 스모크)은 예전 그대로 문자열을 받는다.
+ */
 interface Spec {
   key: ParamKey;
-  label: string;
   group: ParamGroup;
-  description: string;
   /** 생략하면 'effective' */
   effect?: ParamEffect;
   requires?: ParamKey;
@@ -154,7 +166,8 @@ interface Spec {
   lockedWhenSimInit?: boolean;
   /** 생략하면 'code' */
   source?: ParamRangeSource;
-  note?: string;
+  /** 부연(실측 기록 등)이 있는가. 글자는 사전의 `param.<key>.note` 다 */
+  note?: boolean;
 }
 
 interface Range {
@@ -168,27 +181,58 @@ interface Range {
 function common(spec: Spec): Omit<ParamField, 'kind' | 'fallback' | 'min' | 'max' | 'step' | 'options'> {
   return {
     key: spec.key,
-    label: spec.label,
+    // 아래 `localize()` 가 게터로 덮는다. 자리를 비워 두지 않는 이유는 타입이
+    // 요구해서일 뿐이고, 이 값이 화면에 나가는 일은 없다.
+    label: '',
     group: spec.group,
     effect: spec.effect ?? 'effective',
     requires: spec.requires ?? null,
     lockedWhenSimInit: spec.lockedWhenSimInit ?? false,
     source: spec.source ?? 'code',
-    description: spec.description,
-    note: spec.note ?? null,
+    description: '',
+    note: null,
   };
 }
 
+/**
+ * 글자 셋을 **게터로 덮는다** (I-1).
+ *
+ * ⚠️ **전개(`...`)로는 안 된다.** `{ ...common(spec) }` 은 게터를 그 자리에서
+ *    한 번 읽어 값으로 굳혀 버린다 — 그래서 게터를 `common()` 이 아니라 전개가
+ *    **끝난 뒤** 여기서 붙인다. `enumerable: true` 라 `JSON.stringify` 나
+ *    `Object.keys` 로 보는 쪽도 예전과 같다.
+ */
+function localize(field: ParamField, spec: Spec): ParamField {
+  Object.defineProperties(field, {
+    label: {
+      get: (): string => t(`param.${spec.key}.label`),
+      enumerable: true,
+      configurable: true,
+    },
+    description: {
+      get: (): string => t(`param.${spec.key}.desc`),
+      enumerable: true,
+      configurable: true,
+    },
+    note: {
+      get: (): string | null => (spec.note === true ? t(`param.${spec.key}.note`) : null),
+      enumerable: true,
+      configurable: true,
+    },
+  });
+  return field;
+}
+
 function num(kind: 'float' | 'int', spec: Spec, range: Range): ParamField {
-  return { ...common(spec), kind, fallback: range.fallback, min: range.min, max: range.max, step: range.step, options: null };
+  return localize({ ...common(spec), kind, fallback: range.fallback, min: range.min, max: range.max, step: range.step, options: null }, spec);
 }
 
 function flag(spec: Spec, fallback: boolean): ParamField {
-  return { ...common(spec), kind: 'bool', fallback, min: null, max: null, step: null, options: null };
+  return localize({ ...common(spec), kind: 'bool', fallback, min: null, max: null, step: null, options: null }, spec);
 }
 
 function choice(spec: Spec, fallback: number, options: readonly ParamEnumOption[]): ParamField {
-  return { ...common(spec), kind: 'enum', fallback, min: null, max: null, step: null, options };
+  return localize({ ...common(spec), kind: 'enum', fallback, min: null, max: null, step: null, options }, spec);
 }
 
 // ── 열거형 라벨 ─────────────────────────────────────────────
@@ -203,10 +247,11 @@ function choice(spec: Spec, fallback: number, options: readonly ParamEnumOption[
  * enum 에는 3·4(`..._DOUBLE_PRECISION`)도 있지만 **데스크톱이 노출하지 않아
  * 우리도 노출하지 않는다** — 배정밀도 솔버가 이 빌드에서 도는지 확인된 바 없다.
  */
+/* `label` 이 게터인 이유는 `Spec` 위 주석과 같다 (I-1) — 표가 한 번만 만들어진다 */
 const SOLVER_TYPES: readonly ParamEnumOption[] = [
-  { value: 0, label: '내재적 오일러 1차' },
-  { value: 1, label: '내재적 오일러 2차' },
-  { value: 2, label: 'XPBD (위치 기반)' },
+  { value: 0, get label(): string { return t('param.solverType.opt.0'); } },
+  { value: 1, get label(): string { return t('param.solverType.opt.1'); } },
+  { value: 2, get label(): string { return t('param.solverType.opt.2'); } },
 ];
 
 /**
@@ -219,9 +264,9 @@ const SOLVER_TYPES: readonly ParamEnumOption[] = [
  *    데스크톱은 콤보 인덱스를 그대로 대입한다(`:506`)이므로 값=인덱스다.
  */
 const PRECONDITIONERS: readonly ParamEnumOption[] = [
-  { value: 0, label: 'Identity (없음)' },
-  { value: 1, label: 'Diagonal' },
-  { value: 2, label: 'Block-Diagonal (권장)' },
+  { value: 0, get label(): string { return t('param.preconditioner.opt.0'); } },
+  { value: 1, get label(): string { return t('param.preconditioner.opt.1'); } },
+  { value: 2, get label(): string { return t('param.preconditioner.opt.2'); } },
 ];
 
 /**
@@ -235,11 +280,11 @@ const PRECONDITIONERS: readonly ParamEnumOption[] = [
  * 매핑이 한 번 더 확인된다.
  */
 const COUPLING_METHODS: readonly ParamEnumOption[] = [
-  { value: 0, label: '없음' },
-  { value: 1, label: '내재적 접촉' },
-  { value: 2, label: '내재적 접촉 (방향)' },
-  { value: 3, label: '페널티' },
-  { value: 4, label: '투영 구속' },
+  { value: 0, get label(): string { return t('param.coupling.opt.0'); } },
+  { value: 1, get label(): string { return t('param.coupling.opt.1'); } },
+  { value: 2, get label(): string { return t('param.coupling.opt.2'); } },
+  { value: 3, get label(): string { return t('param.coupling.opt.3'); } },
+  { value: 4, get label(): string { return t('param.coupling.opt.4'); } },
 ];
 
 // ── ★ 스키마 ────────────────────────────────────────────────
@@ -253,10 +298,8 @@ export const PARAM_FIELDS: readonly ParamField[] = [
   // ── 일반 ────────────────────────────────────────────────
   num('float', {
     key: 'timeStep',
-    label: '타임스텝 (Hz)',
     group: 'general',
-    description: '1초를 몇 번으로 쪼개 풀 것인가. 높이면 안정적이지만 느려진다.',
-    note: '실측: 45 → 90 에서 평균 1.78cm / 최대 8.61cm 움직인다',
+    note: true,
   }, { fallback: 45, min: 1, max: 300, step: 1 }),
   // [코드 확인] 범위 1..300 은 `MainGUI.cpp:394` — SliderInt("timestep(Hz)", 1, 300).
   //
@@ -282,11 +325,9 @@ export const PARAM_FIELDS: readonly ParamField[] = [
 
   num('int', {
     key: 'subStep',
-    label: '서브스텝',
     group: 'general',
-    description: '타임스텝 하나를 다시 쪼개는 수.',
     effect: 'dead',
-    note: '엔진 미지원 — 1 → 8 로 바꿔도 전 정점이 비트 단위로 같다 (ISSUE-014)',
+    note: true,
   }, { fallback: 1, min: 1, max: 20, step: 1 }),
   // [코드 확인] 범위는 `MainGUI.cpp:398`.
   // ⛔ 죽은 이유: `ZestManager::LoadZls` 가 로드 직후
@@ -298,19 +339,15 @@ export const PARAM_FIELDS: readonly ParamField[] = [
 
   num('float', {
     key: 'drapingTime',
-    label: '드레이핑 시간 (초)',
     group: 'general',
-    description: '옷이 아바타에 자리를 잡는 초기 구간의 길이.',
-    note: '실측: 0.4 → 3 에서 평균 4.94cm / 최대 16.20cm. 영향이 큰 편이다',
+    note: true,
   }, { fallback: 0.4, min: 0, max: 10, step: 0.1 }),
   // [코드 확인] 범위는 `MainGUI.cpp:404` — SliderFloat("draping time", 0, 10).
 
   num('float', {
     key: 'gravityY',
-    label: '중력 Y (cm/s²)',
     group: 'general',
-    description: '아래로 당기는 가속도. 0 이면 무중력.',
-    note: '실측: -980 → 0 에서 평균 0.22cm. 반영은 되지만 변화가 작다 (ISSUE-014 미결 ②)',
+    note: true,
   }, { fallback: -980, min: -1000, max: 0, step: 1 }),
   // [코드 확인] 범위는 `MainGUI.cpp:401` — SliderFloat("gravity(cm/s^2)", -1000, 0).
   // ⚠️ ISSUE-014 의 **첫 판정이 뒤집힌 필드다.** 첫 측정은 "~1% 지터" 라는
@@ -325,22 +362,18 @@ export const PARAM_FIELDS: readonly ParamField[] = [
   // 일어나는 것은 **필드가 죽은 것이 아니라 물리가 옳은 것이다.**
   flag({
     key: 'groundPlane',
-    label: '바닥면 충돌',
     group: 'ground',
-    description: '충돌용 바닥면을 켠다. 렌더링용 바닥과는 별개다.',
     effect: 'conditional',
-    note: '이 씬에서 미검증 — 옷이 바닥에서 9.27cm 떠 있어 접촉이 없다 (ISSUE-014)',
+    note: true,
   }, true),
   // [코드 확인] 데스크톱 위젯은 `MainGUI.cpp:407` (체크박스라 범위 없음).
 
   num('float', {
     key: 'groundFriction',
-    label: '바닥 마찰',
     group: 'ground',
-    description: '옷이 바닥에 닿았을 때의 마찰 계수. 0 이면 미끄러진다.',
     effect: 'conditional',
     source: 'guess',
-    note: '이 씬에서 미검증 — 바닥 접촉이 없다 (ISSUE-014)',
+    note: true,
   }, { fallback: 0.2, min: 0, max: 1, step: 0.01 }),
   // ⚠️ 범위 **근거 없음, 추정.** 데스크톱에 이 위젯이 없다(`MainGUI.cpp` 전체에
   //    groundFriction 을 쓰는 줄이 없다). 0..1 은 "마찰 계수" 라는 이름에서 온
@@ -348,11 +381,9 @@ export const PARAM_FIELDS: readonly ParamField[] = [
 
   num('float', {
     key: 'groundMargin',
-    label: '바닥 여유 (cm)',
     group: 'ground',
-    description: '충돌 바닥면을 렌더링 바닥에서 얼마나 띄울 것인가. 음수면 아래.',
     source: 'guess',
-    note: '실측: 0.5 → 5 에서 평균 0.02cm / 최대 0.58cm — 접촉이 없는데 왜 움직이는지 미해결',
+    note: true,
   }, { fallback: 0.5, min: -10, max: 10, step: 0.1 }),
   // ⚠️ 범위 **근거 없음, 추정.** 데스크톱에 위젯이 없다.
   // ⚠️ ISSUE-014 의 미결 ① 이 이 필드다. 위 "바닥 접촉이 없다" 설명과 어긋난다 —
@@ -363,24 +394,20 @@ export const PARAM_FIELDS: readonly ParamField[] = [
   // ── 바람 ────────────────────────────────────────────────
   flag({
     key: 'useWind',
-    label: '바람 사용',
     group: 'wind',
-    description: '바람을 켠다. 세기는 아래 항목에서 정한다.',
     source: 'guess',
-    note: '실측: 단독으로 켜면 평균 0.11cm. 세기와 함께 걸면 7.19cm',
+    note: true,
   }, false),
   // ⚠️ 데스크톱에 위젯이 **없다.** 체크박스라 범위는 어차피 없지만, "데스크톱이
   //    이렇게 했다" 는 근거도 없다는 뜻이라 source 를 guess 로 둔다.
 
   num('float', {
     key: 'windMagnitude',
-    label: '바람 세기',
     group: 'wind',
-    description: '바람의 크기. 방향은 씬에 저장된 값을 쓴다 (프로토콜에 없다).',
     effect: 'conditional',
     requires: 'useWind',
     source: 'guess',
-    note: '단독으로는 0cm. `바람 사용`과 함께 걸어야 움직인다 (ISSUE-014 ①)',
+    note: true,
   }, { fallback: 30, min: 0, max: 500, step: 1 }),
   // ⚠️ 범위 **근거 없음, 추정.** 데스크톱에 위젯이 없다. 상한 500 은 측정에서
   //    실제로 걸어 본 값이라는 것 외에 근거가 없다.
@@ -391,11 +418,9 @@ export const PARAM_FIELDS: readonly ParamField[] = [
   // ── 솔버 ────────────────────────────────────────────────
   choice({
     key: 'solverType',
-    label: '적분기',
     group: 'solver',
-    description: '운동 방정식을 푸는 방식. 시뮬레이션이 초기화되기 전에만 바꿀 수 있다.',
     lockedWhenSimInit: true,
-    note: '실측: 0 → 1 에서 평균 1.19cm',
+    note: true,
   }, 0, SOLVER_TYPES),
   // ★ `lockedWhenSimInit` 이 붙는 **유일한 필드다.**
   //    [코드 확인] `MainGUI.cpp:459` — `if (!mZestManager.IsSimulationInitialized())`
@@ -411,38 +436,30 @@ export const PARAM_FIELDS: readonly ParamField[] = [
 
   choice({
     key: 'preconditioner',
-    label: '전처리기',
     group: 'solver',
-    description: '선형 시스템을 푸는 전처리 방식. Block-Diagonal 이 권장값이다.',
-    note: '실측: 2 → 1 에서 평균 3.84cm / 최대 9.80cm. 영향이 큰 편이다',
+    note: true,
   }, 2, PRECONDITIONERS),
 
   num('int', {
     key: 'nonlinearIterations',
-    label: '비선형 반복 수',
     group: 'solver',
-    description: '한 스텝에서 비선형 시스템을 몇 번 다시 풀 것인가. 높이면 정확하지만 크게 느려진다.',
-    note: '실측: 1 → 10 에서 평균 1.67cm. 같은 100프레임이 12초 → 56초가 된다',
+    note: true,
   }, { fallback: 1, min: 1, max: 200, step: 1 }),
   // [코드 확인] 범위는 `MainGUI.cpp:509` — SliderInt("non-linear iterations", 1, 200).
 
   num('int', {
     key: 'maxSolverIterations',
-    label: '선형 솔버 최대 반복 수',
     group: 'solver',
-    description: '허용 오차에 닿지 못했을 때 몇 번까지 반복할 것인가.',
     source: 'guess',
-    note: '실측: 600 → 5 에서 평균 2.97cm / 최대 11.33cm',
+    note: true,
   }, { fallback: 600, min: 1, max: 2000, step: 1 }),
   // ⚠️ 범위 **근거 없음, 추정.** 데스크톱에 위젯이 없다. 상한 2000 은 실측
   //    기본값 600 의 여유를 잡은 것일 뿐이다.
 
   num('float', {
     key: 'solverTolerance',
-    label: '선형 솔버 허용 오차',
     group: 'solver',
-    description: '작을수록 정확하고 느리다. 지수 표기로 넣는다 (예: 1e-4).',
-    note: '실측: 1e-4 → 0.1 에서 평균 3.03cm / 최대 13.56cm',
+    note: true,
   }, { fallback: 1e-4, min: 1e-10, max: 1, step: null }),
   // [코드 확인] 하한만 코드 근거가 있다 — `MainGUI.cpp:491` 이
   //   `zsMAX(CGTolerance, 1e-10f)` 로 바닥을 친다. 데스크톱은 슬라이더가 아니라
@@ -453,45 +470,35 @@ export const PARAM_FIELDS: readonly ParamField[] = [
 
   flag({
     key: 'useIEQS',
-    label: '준정적 (Quasi-static)',
     group: 'solver',
-    description: '드레이핑 구간에서 내재적 오일러 준정적 해법을 쓴다.',
-    note: '실측: false → true 에서 평균 5.51cm / 최대 17.94cm. 측정한 22개 중 영향이 가장 크다',
+    note: true,
   }, false),
   // [코드 확인] 위젯은 `MainGUI.cpp:487` — Checkbox("Quasi-static").
 
   // ── 커플링 ──────────────────────────────────────────────
   choice({
     key: 'staticCouplingMethod',
-    label: '정적 커플링',
     group: 'coupling',
-    description: '아바타처럼 움직이지 않는 물체와의 접촉을 푸는 방식. 투영 구속이 권장값이다.',
-    note: '실측: 4 → 1 에서 평균 5.29cm / 최대 10.78cm',
+    note: true,
   }, 4, COUPLING_METHODS),
 
   choice({
     key: 'dynamicCouplingMethod',
-    label: '동적 커플링',
     group: 'coupling',
-    description: '옷끼리의 자기 충돌을 푸는 방식. 페널티가 권장값이다.',
-    note: '실측: 3 → 1 에서 평균 0.41cm / 최대 6.80cm',
+    note: true,
   }, 3, COUPLING_METHODS),
 
   num('float', {
     key: 'dynCouplingStiffness',
-    label: '동적 페널티 강성',
     group: 'coupling',
-    description: '자기 충돌을 밀어내는 힘의 세기.',
-    note: '실측: 750 → 0 에서 평균 0.43cm',
+    note: true,
   }, { fallback: 750, min: 0, max: 20000, step: 10 }),
   // [코드 확인] 범위는 `MainGUI.cpp:736` — SliderFloat("Dynamic Penalty Stiffness", 0, 20000).
 
   num('float', {
     key: 'dynCouplingDamping',
-    label: '동적 페널티 감쇠',
     group: 'coupling',
-    description: '자기 충돌을 밀어낼 때의 감쇠.',
-    note: '실측: 0.1 → 0 에서 평균 0.57cm',
+    note: true,
   }, { fallback: 0.1, min: 0, max: 500, step: 0.1 }),
   // [코드 확인] 범위는 `MainGUI.cpp:737` — SliderFloat("Dynamic Penalty Damping", 0, 500).
   // ⚠️ 실측 기본값이 0.1 인데 상한이 500 이다. 데스크톱 슬라이더로는 사실상
@@ -500,10 +507,8 @@ export const PARAM_FIELDS: readonly ParamField[] = [
 
   num('float', {
     key: 'untanglingStiffness',
-    label: '엉킴 해소 강성',
     group: 'coupling',
-    description: '이미 관통해 엉킨 곳을 풀어내는 힘의 세기.',
-    note: '실측: 20000 → 0 에서 평균 0.33cm',
+    note: true,
   }, { fallback: 20000, min: 0, max: 20000, step: 10 }),
   // [코드 확인] 범위는 `MainGUI.cpp:738` — SliderFloat("Untangling Penalty Stiffness", 0, 20000).
   // ⚠️ 실측 기본값이 **상한과 같다.** 올릴 여지가 없는 슬라이더다. 데스크톱도
@@ -511,22 +516,18 @@ export const PARAM_FIELDS: readonly ParamField[] = [
 
   num('float', {
     key: 'untanglingDamping',
-    label: '엉킴 해소 감쇠',
     group: 'coupling',
-    description: '엉킴을 풀어낼 때의 감쇠.',
-    note: '실측: 250 → 0 에서 평균 1.80cm / 최대 6.89cm',
+    note: true,
   }, { fallback: 250, min: 0, max: 500, step: 1 }),
   // [코드 확인] 범위는 `MainGUI.cpp:739` — SliderFloat("Untangling Penalty Damping", 0, 500).
 
   // ── 메싱 ────────────────────────────────────────────────
   num('float', {
     key: 'meshingEdgeLength',
-    label: '메시 엣지 길이 (cm)',
     group: 'meshing',
-    description: '패턴을 삼각형으로 나눌 때의 목표 변 길이. 작을수록 촘촘하고 느리다.',
     effect: 'dead',
     source: 'guess',
-    note: '엔진 미지원 — 1 → 4 로 바꿔도 전 정점이 비트 단위로 같다 (ISSUE-014)',
+    note: true,
   }, { fallback: 1, min: 0.5, max: 10, step: 0.1 }),
   // ⚠️ 범위 **근거 없음, 추정.** 데스크톱에 위젯이 없다.
   // ⛔ 죽은 **원인은 미확인이다.** [추론] 리메싱이 로드 시점에 끝나고 그 뒤에는
@@ -588,12 +589,13 @@ export function paramField(key: string): ParamField | null {
 
 /** 그룹 헤더에 그대로 찍는다. 순서도 이 객체의 순서를 쓴다 */
 export const PARAM_GROUP_LABELS: Readonly<Record<ParamGroup, string>> = {
-  general: '일반',
-  ground: '바닥',
-  wind: '바람',
-  solver: '솔버',
-  coupling: '커플링',
-  meshing: '메싱',
+  // 게터인 이유는 `Spec` 위 주석과 같다 (I-1) — 표가 한 번만 만들어진다
+  get general(): string { return t('param.group.general'); },
+  get ground(): string { return t('param.group.ground'); },
+  get wind(): string { return t('param.group.wind'); },
+  get solver(): string { return t('param.group.solver'); },
+  get coupling(): string { return t('param.group.coupling'); },
+  get meshing(): string { return t('param.group.meshing'); },
 };
 
 export const PARAM_GROUP_ORDER: readonly ParamGroup[] =
@@ -679,21 +681,21 @@ function coerced(value: ParamValue, reason: string): ParamCoercion {
 export function coerceParamValue(field: ParamField, raw: unknown): ParamCoercion {
   if (field.kind === 'bool') {
     if (typeof raw === 'boolean') return { value: raw, ok: true, reason: null };
-    if (raw === 1 || raw === 0) return coerced(raw === 1, '숫자를 참/거짓으로 바꿨습니다');
-    return coerced(field.fallback, `참/거짓이 아닙니다 — 기본값(${String(field.fallback)})을 씁니다`);
+    if (raw === 1 || raw === 0) return coerced(raw === 1, t('coerce.numToBool'));
+    return coerced(field.fallback, t('coerce.notBool', { fallback: String(field.fallback) }));
   }
 
   if (typeof raw === 'boolean') {
-    return coerced(field.fallback, `숫자가 와야 합니다 — 기본값(${String(field.fallback)})을 씁니다`);
+    return coerced(field.fallback, t('coerce.wantNumber', { fallback: String(field.fallback) }));
   }
   if (typeof raw !== 'number' || !Number.isFinite(raw)) {
-    return coerced(field.fallback, `숫자가 아닙니다 — 기본값(${String(field.fallback)})을 씁니다`);
+    return coerced(field.fallback, t('coerce.notNumber', { fallback: String(field.fallback) }));
   }
 
   if (field.kind === 'enum') {
     const options = field.options ?? [];
     if (options.some((o) => o.value === raw)) return { value: raw, ok: true, reason: null };
-    return coerced(field.fallback, `선택지에 없는 값(${raw})입니다 — 기본값을 씁니다`);
+    return coerced(field.fallback, t('coerce.notAnOption', { raw }));
   }
 
   let value = raw;
@@ -711,14 +713,14 @@ export function coerceParamValue(field: ParamField, raw: unknown): ParamCoercion
 
   if (field.kind === 'int' && !Number.isInteger(value)) {
     value = Math.round(value);
-    reasons.push(`정수만 받습니다 — ${raw} 를 ${value} 로 반올림했습니다`);
+    reasons.push(t('coerce.rounded', { raw, value }));
   }
   if (field.min !== null && value < field.min) {
     value = field.min;
-    reasons.push(`최솟값 ${field.min} 아래입니다 — ${field.min} 로 맞췄습니다`);
+    reasons.push(t('coerce.belowMin', { min: field.min }));
   } else if (field.max !== null && value > field.max) {
     value = field.max;
-    reasons.push(`최댓값 ${field.max} 위입니다 — ${field.max} 로 맞췄습니다`);
+    reasons.push(t('coerce.aboveMax', { max: field.max }));
   }
 
   return reasons.length === 0
@@ -771,7 +773,7 @@ export function paramDisabledReason(field: ParamField, ctx: ParamContext): Param
     return {
       key: field.key,
       cause: 'dead',
-      text: '엔진이 이 값을 보지 않습니다 (ISSUE-014) — 바꿔도 시뮬이 달라지지 않아 전송하지 않습니다',
+      text: t('param.off.dead'),
     };
   }
 
@@ -779,7 +781,7 @@ export function paramDisabledReason(field: ParamField, ctx: ParamContext): Param
     return {
       key: field.key,
       cause: 'simInitialized',
-      text: '시뮬레이션이 초기화된 뒤에는 바꿀 수 없습니다 — 데스크톱도 같습니다',
+      text: t('param.off.simInit'),
     };
   }
 
@@ -791,7 +793,7 @@ export function paramDisabledReason(field: ParamField, ctx: ParamContext): Param
       return {
         key: field.key,
         cause: 'dependency',
-        text: `'${label}' 이(가) 꺼져 있어 이 값은 시뮬에 반영되지 않습니다`,
+        text: t('param.off.dependency', { label }),
       };
     }
   }

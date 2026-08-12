@@ -61,10 +61,13 @@ import {
   paramField,
   paramGroups,
   PARAM_FIELDS,
+  PARAM_GROUP_LABELS,
   readParamValues,
+  t,
   type ParamDisabled,
   type ParamDisabledCause,
   type ParamField,
+  type ParamGroup,
   type ParamKey,
   type ParamValue,
   type ParamValues,
@@ -127,10 +130,15 @@ const CAUSE_MARK: Readonly<Record<ParamDisabledCause, string>> = {
   dependency: '⚠',
 };
 
-/** 배지 글자. `effect` 를 화면에서 바로 읽히게 한다 */
-const EFFECT_BADGE: Readonly<Record<string, string>> = {
-  dead: '엔진 미지원',
-  conditional: '조건부',
+/**
+ * 배지 글자의 **사전 키**. `effect` 를 화면에서 바로 읽히게 한다.
+ *
+ * 여기 값이 글자가 아니라 키인 이유는 이 표가 모듈 로드 때 한 번 만들어지기
+ * 때문이다 (I-1) — 실제 글자는 `#buildRow()` 안의 `retext` 가 꺼낸다.
+ */
+const EFFECT_BADGE_KEY: Readonly<Record<string, string>> = {
+  dead: 'param.badge.dead',
+  conditional: 'param.badge.conditional',
 };
 
 // ── 행 하나 ─────────────────────────────────────────────────
@@ -143,6 +151,14 @@ interface Row {
   /** 위젯에 값을 반영한다. **같으면 건드리지 않는다** — 커서가 튄다 */
   set(v: ParamValue): void;
   setDisabled(on: boolean): void;
+  /**
+   * 이 행의 **정적 글자를 지금 언어로 다시 쓴다** (I-1).
+   *
+   * 행은 생성자에서 한 번만 만들어지고 언어 전환은 행 구성을 바꾸지 않으므로,
+   * 이 함수가 없으면 이름·배지·도움말·`<option>` 이 통째로 한국어로 남는다.
+   * `#paintState()` 가 매번 부른다.
+   */
+  retext(): void;
   /** 비활성 사유 (규칙 ①) */
   readonly why: HTMLElement;
   /** 값 보정 사유 (`coerceParamValue`) */
@@ -195,6 +211,8 @@ export class ParamsPanel {
   readonly #badge: HTMLElement | null;
 
   readonly #rows = new Map<ParamKey, Row>();
+  /** 그룹 제목. 언어 전환 때 다시 쓰려고 잡아 둔다 (I-1) */
+  readonly #groupHeads: { group: ParamGroup; el: HTMLElement }[] = [];
   readonly #banner: HTMLElement;
   readonly #hint: HTMLElement;
   readonly #applyBtn: HTMLButtonElement;
@@ -226,16 +244,14 @@ export class ParamsPanel {
     const bar = document.createElement('div');
     bar.className = 'pbar';
 
+    // 글자·툴팁은 `#paintState()` 가 채운다 (I-1) — 생성자에서 찍으면 언어를
+    // 바꿔도 이 상자만 한국어로 남는다.
     this.#applyBtn = document.createElement('button');
     this.#applyBtn.id = 'paramsApply';
-    this.#applyBtn.textContent = '적용';
-    this.#applyBtn.title = '바뀐 값만 워커로 보냅니다';
     this.#applyBtn.addEventListener('click', () => void this.apply());
 
     this.#readBtn = document.createElement('button');
     this.#readBtn.id = 'paramsRead';
-    this.#readBtn.textContent = '워커에서 읽기';
-    this.#readBtn.title = '화면의 값을 버리고 워커의 실제 값으로 다시 채웁니다';
     this.#readBtn.addEventListener('click', () => void this.refresh());
 
     bar.append(this.#applyBtn, this.#readBtn);
@@ -251,6 +267,9 @@ export class ParamsPanel {
       box.className = 'pgroup';
       const h = document.createElement('h4');
       h.textContent = g.label;
+      // 그룹 제목도 언어를 따라와야 한다 (I-1). `paramGroups()` 를 다시 부르면
+      // 순서·구성이 그대로이므로 제목만 짝지어 갈아 끼우면 된다.
+      this.#groupHeads.push({ group: g.group, el: h });
       box.append(h);
       for (const f of g.fields) {
         const row = this.#buildRow(f);
@@ -308,6 +327,21 @@ export class ParamsPanel {
    */
   markStale(): void {
     this.#stale = true;
+    this.#paintState();
+  }
+
+  /**
+   * 언어가 바뀌었다 (I-1). **값은 한 칸도 건드리지 않는다** — 사용자가 맞춰
+   * 둔 숫자를 언어 때문에 잃으면 안 된다.
+   *
+   * ⚠️ 값 보정 사유(`.pfix`)는 **다시 쓰지 않는다.** 그 글자는 "방금 무엇을
+   *    어떻게 고쳤는가" 의 기록이라 지금 값에서 다시 만들 수 없다(이미 고쳐진
+   *    뒤다). 다음 편집에서 그때의 언어로 새로 찍힌다.
+   */
+  relabel(): void {
+    for (const [key, row] of this.#rows) {
+      row.src.textContent = this.#missing.has(key) ? t('params.row.missing') : '';
+    }
     this.#paintState();
   }
 
@@ -584,9 +618,7 @@ export class ParamsPanel {
       row.fix.textContent = '';
       const missing = this.#missing.has(key);
       row.src.hidden = !missing;
-      row.src.textContent = missing
-        ? 'ⓘ 워커가 이 값을 주지 않았습니다 — 표시값은 자리채움입니다'
-        : '';
+      row.src.textContent = missing ? t('params.row.missing') : '';
     }
   }
 
@@ -601,7 +633,15 @@ export class ParamsPanel {
       reasons.set(d.key, d);
     }
 
+    // ⓪ 정적 글자를 지금 언어로 (I-1). 이 함수는 값이 바뀔 때마다 도는데,
+    //    언어 전환도 배선이 여기로 흘려 보낸다.
+    this.#applyBtn.title = t('btn.apply.title');
+    this.#readBtn.textContent = t('params.read');
+    this.#readBtn.title = t('params.read.title');
+    for (const g of this.#groupHeads) g.el.textContent = PARAM_GROUP_LABELS[g.group];
+
     for (const [key, row] of this.#rows) {
+      row.retext();
       const d = reasons.get(key) ?? null;
       row.setDisabled(d !== null || !ready || this.#busy);
       row.root.classList.toggle('off', d !== null);
@@ -613,7 +653,7 @@ export class ParamsPanel {
 
     const dirty = this.dirty;
     this.#applyBtn.disabled = !ready || this.#busy || this.#blocked !== null || dirty === 0;
-    this.#applyBtn.textContent = dirty === 0 ? '적용' : `적용 (${dirty})`;
+    this.#applyBtn.textContent = dirty === 0 ? t('btn.apply') : t('btn.apply.n', { n: dirty });
     this.#readBtn.disabled = this.#busy || !this.#port.connected;
 
     const banner = this.#bannerText();
@@ -631,19 +671,19 @@ export class ParamsPanel {
   #bannerText(): string | null {
     switch (this.#phase) {
       case 'idle':
-        return '아직 워커에서 값을 읽지 않았습니다 — 보이는 값은 자리채움입니다. [워커에서 읽기] 를 누르세요.';
+        return t('params.banner.idle');
       case 'disconnected':
-        return '연결이 없습니다 — 파라미터를 읽을 수도 보낼 수도 없습니다. 보이는 값은 자리채움입니다.';
+        return t('params.banner.disconnected');
       case 'noScene':
-        return '씬이 없습니다 — 파라미터는 씬에 딸려 있어 로드해야 읽을 수 있습니다. 보이는 값은 자리채움입니다.';
+        return t('params.banner.noScene');
       case 'loading':
-        return '워커에서 읽는 중…';
+        return t('params.banner.loading');
       case 'error':
-        return `워커에서 읽지 못했습니다: ${this.#lastError?.message ?? '원인 불명'}`;
+        return t('params.banner.error', { why: this.#lastError?.message ?? t('err.unknownCause') });
       case 'ready':
-        if (this.#stale) return '씬이나 세션이 바뀌었습니다 — [워커에서 읽기] 로 값을 다시 맞추세요.';
+        if (this.#stale) return t('params.banner.stale');
         if (this.#missing.size > 0) {
-          return `워커가 값을 주지 않은 필드가 ${this.#missing.size}개 있습니다 — 그 행은 자리채움을 보여줍니다.`;
+          return t('params.banner.missing', { n: this.#missing.size });
         }
         return null;
     }
@@ -653,19 +693,19 @@ export class ParamsPanel {
   #hintText(ready: boolean, dirty: number): string | null {
     if (this.#blocked !== null) return `🔒 ${this.#blocked}`;
     if (!ready) return null;
-    if (dirty === 0) return '바뀐 값이 없습니다. 워커의 값을 그대로 보여주는 중입니다.';
-    return `변경 ${dirty}건 — [적용] 은 바뀐 값만 보내고, 보낸 뒤 워커에서 다시 읽어 화면을 덮습니다.`;
+    if (dirty === 0) return t('params.hint.clean');
+    return t('params.hint.dirty', { n: dirty });
   }
 
   #badgeText(ready: boolean, dirty: number): string {
-    if (this.#phase === 'loading') return '· 읽는 중…';
-    if (this.#phase === 'disconnected') return '· 연결 없음';
-    if (this.#phase === 'noScene') return '· 씬 없음';
-    if (this.#phase === 'error') return '· 읽기 실패';
-    if (this.#phase === 'idle') return '· 자리채움';
+    if (this.#phase === 'loading') return t('params.badge.loading');
+    if (this.#phase === 'disconnected') return t('params.badge.disconnected');
+    if (this.#phase === 'noScene') return t('params.badge.noScene');
+    if (this.#phase === 'error') return t('params.badge.error');
+    if (this.#phase === 'idle') return t('params.badge.idle');
     if (!ready) return '';
-    if (this.#stale) return '· 갱신 필요';
-    return dirty === 0 ? '· 워커와 일치' : `· 변경 ${dirty}건`;
+    if (this.#stale) return t('params.badge.stale');
+    return dirty === 0 ? t('params.badge.clean') : t('params.badge.dirty', { n: dirty });
   }
 
   // ── 행 만들기 ─────────────────────────────────────────────
@@ -675,28 +715,38 @@ export class ParamsPanel {
     root.className = 'prow';
     root.dataset['key'] = field.key;
 
+    // 언어가 바뀔 때 다시 써야 하는 것들을 여기 모은다 (I-1). `#buildControl`
+    // 이 자기 몫(`<option>`·aria-label)을 뒤에 덧붙인다.
+    const retexts: Array<() => void> = [];
+
     const head = document.createElement('div');
     head.className = 'phead';
     const label = document.createElement('label');
     label.htmlFor = `p-${field.key}`;
-    label.textContent = field.label;
     head.append(label);
+    retexts.push(() => {
+      label.textContent = field.label;
+    });
 
-    const effectBadge = EFFECT_BADGE[field.effect];
-    if (effectBadge !== undefined) {
+    const effectBadgeKey = EFFECT_BADGE_KEY[field.effect];
+    if (effectBadgeKey !== undefined) {
       const b = document.createElement('span');
       b.className = `pbadge ${field.effect}`;
-      b.textContent = effectBadge;
       head.append(b);
+      retexts.push(() => {
+        b.textContent = t(effectBadgeKey);
+      });
     }
     if (field.source === 'guess') {
       // 최소/최대가 코드 근거 없는 추정이라는 사실을 화면에 남긴다. 슬라이더
       // 끝이 "엔진의 한계" 로 읽히면 그것도 거짓말이다.
       const b = document.createElement('span');
       b.className = 'pbadge guess';
-      b.textContent = '범위 추정';
-      b.title = '데스크톱에 이 위젯이 없어 최소/최대가 추정치입니다';
       head.append(b);
+      retexts.push(() => {
+        b.textContent = t('param.badge.guess');
+        b.title = t('param.badge.guess.title');
+      });
     }
     root.append(head);
 
@@ -710,26 +760,42 @@ export class ParamsPanel {
 
     const help = document.createElement('div');
     help.className = 'phelp';
-    help.textContent = field.description;
     root.append(help);
+    retexts.push(() => {
+      help.textContent = field.description;
+    });
 
     if (field.note !== null) {
       const note = document.createElement('div');
       note.className = 'pnote';
-      note.textContent = `ⓘ ${field.note}`;
       root.append(note);
+      retexts.push(() => {
+        note.textContent = `ⓘ ${field.note ?? ''}`;
+      });
     }
     root.append(why, fix, src);
 
-    const row = this.#buildControl(field, box, { root, why, fix, src });
+    const row = this.#buildControl(field, box, { root, why, fix, src, retexts });
+    // 처음 한 번은 여기서 찍는다 — `#paintState()` 가 뒤따라 오지만, 행이
+    // 글자 없이 잠깐이라도 서는 것을 막는다.
+    row.retext();
     return row;
   }
 
   #buildControl(
     field: ParamField,
     box: HTMLElement,
-    parts: { root: HTMLElement; why: HTMLElement; fix: HTMLElement; src: HTMLElement },
+    parts: {
+      root: HTMLElement;
+      why: HTMLElement;
+      fix: HTMLElement;
+      src: HTMLElement;
+      retexts: Array<() => void>;
+    },
   ): Row {
+    const retext = (): void => {
+      for (const f of parts.retexts) f();
+    };
     const commit = (row: Row, raw: unknown): void => {
       const c = coerceParamValue(field, raw);
       this.#pending[field.key] = c.value;
@@ -751,6 +817,7 @@ export class ParamsPanel {
         why: parts.why,
         fix: parts.fix,
         src: parts.src,
+        retext,
         read: () => input.checked,
         set: (v) => {
           const on = v === true;
@@ -767,12 +834,22 @@ export class ParamsPanel {
     if (field.kind === 'enum') {
       const select = document.createElement('select');
       select.id = `p-${field.key}`;
+      const opts: HTMLOptionElement[] = [];
       for (const o of field.options ?? []) {
         const opt = document.createElement('option');
         opt.value = String(o.value);
-        opt.textContent = o.label;
         select.append(opt);
+        opts.push(opt);
       }
+      // `<option>` 글자도 화면 글자다 (I-1). 값(`opt.value`)은 엔진 enum 의
+      // 숫자라 그대로 두고, 보이는 글자만 다시 쓴다.
+      parts.retexts.push(() => {
+        const list = field.options ?? [];
+        opts.forEach((opt, i) => {
+          const o = list[i];
+          if (o) opt.textContent = o.label;
+        });
+      });
       box.append(select);
       const row: Row = {
         field,
@@ -780,6 +857,7 @@ export class ParamsPanel {
         why: parts.why,
         fix: parts.fix,
         src: parts.src,
+        retext,
         read: () => Number(select.value),
         set: (v) => {
           const s = String(v);
@@ -813,7 +891,9 @@ export class ParamsPanel {
       slider.step = String(field.step);
       // 슬라이더에는 라벨을 붙이지 않는다 — 같은 값을 가리키는 두 위젯 중
       // 숫자 칸이 정본이고, htmlFor 가 둘이면 클릭 초점이 갈린다.
-      slider.setAttribute('aria-label', field.label);
+      // `aria-label` 도 화면 글자와 같이 움직여야 한다 (I-1).
+      const s = slider;
+      parts.retexts.push(() => s.setAttribute('aria-label', field.label));
       box.append(slider);
     }
     box.append(number);
@@ -831,6 +911,7 @@ export class ParamsPanel {
       why: parts.why,
       fix: parts.fix,
       src: parts.src,
+      retext,
       read: readNumber,
       set: (v) => {
         const s = String(v);

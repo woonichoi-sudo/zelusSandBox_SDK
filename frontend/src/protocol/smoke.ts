@@ -40,7 +40,7 @@
 
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { createServer as createNetServer } from 'node:net';
@@ -82,6 +82,25 @@ import {
   isSideTabId,
   SIDE_TABS,
   SideTabsPanel,
+  // I-1 다국어. 배럴로 가져오는 것은 의도적이다 — `panels/index.ts` 의 재export
+  // 가 빠지면 `ui/*` 가 사전에 못 닿는데, 그 줄도 같이 지나야 한다.
+  DEFAULT_LANG,
+  getLang,
+  initLang,
+  LANG_LABELS,
+  LANG_STORAGE_KEY,
+  LANGS,
+  MESSAGES,
+  normalizeLang,
+  onLangChange,
+  placeholdersIn,
+  readStoredLang,
+  setLang,
+  storeLang,
+  t,
+  translate,
+  type Lang,
+  type LangStore,
   type ParamField,
   type ParamKey,
   type ParamValue,
@@ -9131,6 +9150,9 @@ async function sectionRestageSplit(): Promise<void> {
 // ─────────────────────────────────────────────────────────────
 
 const MAIN_TS = path.resolve(FRONTEND, 'src/main.ts');
+// I-1(다국어) 뒤로 화면 문구가 여기로 옮겨왔다. 소스 대조 단언이 문구 대신
+// **사전 키**를 보게 되면서, 그 키가 두 언어에 실제로 있는지도 같이 봐야 한다.
+const I18N_TS = path.resolve(FRONTEND, 'src/panels/i18n.ts');
 const LOADER_TS = path.resolve(FRONTEND, 'src/viewer3d/loader.ts');
 const VIEWER3D_BARREL = path.resolve(FRONTEND, 'src/viewer3d/index.ts');
 
@@ -9255,8 +9277,22 @@ function sectionRestageWiring(): void {
     '★★ 복구 예산(MAX_TOPOLOGY_RECOVERIES)과 초과 시 중단이 그대로 산다',
     mismatch.includes('topologyRecoveries >= MAX_TOPOLOGY_RECOVERIES')
     && mismatch.includes('topologyRecoveries += 1')
-    && mismatch.includes('복구를 중단합니다'),
+    // ⚠️ 예전에는 화면 문구(`'복구를 중단합니다'`)를 직접 봤는데, I-1(다국어)이
+    //    그 문장을 사전으로 옮기면서 `main.ts` 에서 사라져 단언이 깨졌다.
+    //    **동작은 하나도 안 바뀌었다** — 옮겨간 자리를 가리키도록 고친다.
+    //    사전 키를 보는 것이 오히려 이빨이 세다: 문구는 번역·교정으로 언제든
+    //    바뀌지만 키는 두 언어를 잇는 계약이라 함부로 안 바뀐다.
+    && mismatch.includes('status.topology.giveUp'),
     mismatch.replace(/\s+/g, ' ').slice(0, 60),
+  );
+  // 위 단언이 문구 대신 **키**를 보므로, 그 키가 사전에 실제로 있는지를 함께
+  // 못박는다. 안 그러면 키를 오타 내도 위 단언이 초록으로 남고 화면에는 키
+  // 문자열이 그대로 뜬다 — 부정 단언이 공짜로 통과하는 것과 같은 실패 모드다.
+  const i18nSrc = existsSync(I18N_TS) ? readFileSync(I18N_TS, 'utf8') : '';
+  check(
+    '★ 대조군: 중단 문구의 키가 사전에 두 번 나온다 (한국어·영어 양쪽)',
+    countOf(i18nSrc, "'status.topology.giveUp':") === 2,
+    `사전 등장 ${countOf(i18nSrc, "'status.topology.giveUp':")}회 (2 = ko·en)`,
   );
 
   // ── ① 적용 뒤 갱신을 부른다 ────────────────────────────────
@@ -9411,6 +9447,336 @@ function sectionRestageWiring(): void {
 }
 
 // ─────────────────────────────────────────────────────────────
+// §16. 화면 글자의 다국어 (I-1, panels/i18n.ts)
+//
+// 이 단위가 깨지는 방식은 예외가 아니라 **글자다.** 셋뿐이고 셋 다 조용하다:
+//
+//   ① 사전 한쪽에만 키가 있다 → 그 자리가 반대 언어로 남는다
+//   ② 두 언어의 자리표시자가 다르다 → 끼워 넣던 **값이 화면에서 사라진다**
+//      (`{why}` 를 영어에서 빠뜨리면 실패 사유가 통째로 없어진다)
+//   ③ 부르는 쪽이 키를 오타 낸다 → 화면에 `status.loadd` 같은 것이 뜬다
+//
+// ①②는 사전 두 벌을 맞대면 잡히고, ③은 **소스를 읽어** 잡는다(§16-3).
+//
+// ⚠️ **여기서 못 보는 것을 분명히 해 둔다.** `repaintForLang()` 이 위젯을
+//    하나 빠뜨리면 그 위젯만 한국어로 남는데, 그것은 DOM 이 있어야 보인다 —
+//    Node 는 사전이 맞는지까지고 화면은 사람이 브라우저에서 본다. 실제로
+//    I-1 을 종결할 때 그렇게 확인했다(잔여 한글 0건).
+// ─────────────────────────────────────────────────────────────
+
+const INDEX_HTML = path.resolve(FRONTEND, 'index.html');
+
+/**
+ * **리터럴 키로 부르는 자리**만 잡는다. `t(key)` 처럼 변수로 부르는 자리와
+ * `` t(`param.${k}.label`) `` 같은 조립은 원리상 못 본다 — 그것까지 보려면
+ * 실행해야 한다.
+ *
+ * 이름이 셋인 이유: `viewer2d/control.ts` 는 번역기를 `tr` 로 **주입받는다**
+ * (그래야 그 모듈이 사전을 import 하지 않고도 테스트된다). `main.ts` 의
+ * `statusT` 는 상태줄 전용 통로다. 셋을 다 안 보면 그 파일들의 키가 대조 밖에
+ * 남는다.
+ */
+const LITERAL_KEY_CALL = /(?<![A-Za-z0-9_$.])(?:t|tr|statusT)\(\s*'([^']+)'/g;
+
+/** `src/` 아래 `.ts` 전부. 스모크 자신과 사전 원본은 뺀다 (아래 §16-3 참고) */
+function i18nScanTargets(): string[] {
+  const root = path.resolve(FRONTEND, 'src');
+  if (!existsSync(root)) return [];
+  return readdirSync(root, { recursive: true, encoding: 'utf8' })
+    .filter((rel) => rel.endsWith('.ts'))
+    .map((rel) => path.join(root, rel))
+    .filter((p) => !p.endsWith('smoke.ts') && p !== I18N_TS);
+}
+
+function sectionI18nDict(): void {
+  section('§16-1. 다국어 — 사전 두 벌의 계약 (I-1)');
+
+  const langs = Object.keys(MESSAGES);
+  check(
+    '사전이 `LANGS` 와 같은 언어를 덮는다',
+    langs.length === LANGS.length && LANGS.every((l) => l in MESSAGES),
+    `사전 [${langs.join(',')}] · LANGS [${LANGS.join(',')}]`,
+  );
+
+  const ko = Object.keys(MESSAGES.ko);
+  const en = Object.keys(MESSAGES.en);
+  const koSet = new Set(ko);
+  const enSet = new Set(en);
+  const onlyKo = ko.filter((k) => !enSet.has(k));
+  const onlyEn = en.filter((k) => !koSet.has(k));
+
+  // ★★ 이 단위에서 가장 흔한 결함이다. 키를 한쪽에만 넣으면 **화면은 멀쩡히
+  //    뜨고** 그 한 줄만 반대 언어로 남는다 — 눈으로 훑다 놓치기 딱 좋다.
+  check(
+    '★★ 두 사전의 키 집합이 같다 (한쪽에만 넣으면 그 자리가 반대 언어로 남는다)',
+    onlyKo.length === 0 && onlyEn.length === 0,
+    onlyKo.length === 0 && onlyEn.length === 0
+      ? `${ko.length}키 양쪽 일치`
+      : `ko 에만 [${onlyKo.slice(0, 5).join(', ')}] · en 에만 [${onlyEn.slice(0, 5).join(', ')}]`,
+  );
+
+  // 대조군. 위 단언은 **양쪽이 다 비어도** 통과한다 — 사전이 통째로 날아간
+  // 회귀가 초록으로 보이면 안 된다.
+  check(
+    '★ 대조군: 사전이 비어 있지 않다 (양쪽이 다 비어도 위 단언은 통과한다)',
+    ko.length > 100 && en.length > 100,
+    `ko ${ko.length}키 · en ${en.length}키`,
+  );
+
+  // 빈 값은 "글자가 조용히 사라지는" 그 실패 그대로다. 모르는 키에 빈 문자열을
+  // 안 돌려주기로 한 것과 같은 이유로 사전에도 있으면 안 된다.
+  const blank = [
+    ...ko.filter((k) => MESSAGES.ko[k]?.trim() === ''),
+    ...en.filter((k) => MESSAGES.en[k]?.trim() === ''),
+  ];
+  check(
+    '★ 빈 문구가 없다 (있으면 그 자리의 글자가 조용히 사라진다)',
+    blank.length === 0,
+    blank.length === 0 ? '' : blank.slice(0, 5).join(', '),
+  );
+
+  // ★★ ②번 실패. 값이 끼어드는 문구에서 한쪽 자리표시자가 빠지면 **그 값이
+  //    화면에서 없어진다.** `'meas.failed'` 에서 `{why}` 가 빠지면 사용자는
+  //    "치수 적용 실패:" 만 보고 이유를 영영 못 본다.
+  const phMismatch: string[] = [];
+  for (const k of ko) {
+    if (!enSet.has(k)) continue;
+    const a = placeholdersIn(MESSAGES.ko[k] ?? '');
+    const b = placeholdersIn(MESSAGES.en[k] ?? '');
+    if (a.join(',') !== b.join(',')) phMismatch.push(`${k}: ko{${a.join(',')}} en{${b.join(',')}}`);
+  }
+  check(
+    '★★ 같은 키의 자리표시자 집합이 두 언어에서 같다 (한쪽이 빠지면 그 값이 화면에서 사라진다)',
+    phMismatch.length === 0,
+    phMismatch.length === 0 ? '' : phMismatch.slice(0, 3).join(' / '),
+  );
+
+  const withVars = ko.filter((k) => placeholdersIn(MESSAGES.ko[k] ?? '').length > 0).length;
+  check(
+    '★ 대조군: 자리표시자를 쓰는 키가 실제로 있다 (0건이면 위 단언이 공짜로 통과한다)',
+    withVars > 20,
+    `${withVars}키`,
+  );
+
+  // 언어 이름은 자기 언어로 적는다 — 한국어 화면에서 "영어" 라고 쓰면 영어를
+  // 찾는 사람이 못 읽는다. 그래서 이 표만 번역 대상이 아니다.
+  check(
+    '언어 이름이 저마다 자기 언어로 적혀 있다',
+    LANGS.every((l) => (LANG_LABELS[l] ?? '').length > 0)
+    && /[가-힣]/.test(LANG_LABELS.ko) && /^[\x20-\x7e]+$/.test(LANG_LABELS.en),
+    `ko='${LANG_LABELS.ko}' en='${LANG_LABELS.en}'`,
+  );
+}
+
+function sectionI18nLookup(): void {
+  section('§16-2. 다국어 — 조회·저장·현재 언어 (I-1)');
+
+  // ⚠️ 이 절은 **모듈 상태를 만진다.** 뒤에 오는 절이 화면 글자로 단언한다면
+  //    영어로 둔 채 넘어가는 순간 그쪽이 빨개진다. 되돌리고, 되돌아왔는지도
+  //    본다 — 되돌림 자체가 깨질 수 있다.
+  const before = getLang();
+  try {
+    check('기본 언어는 한국어다 (기존 단언들이 한국어 화면 글자로 서 있다)', DEFAULT_LANG === 'ko', DEFAULT_LANG);
+
+    // ── 조회 ────────────────────────────────────────────────
+    check(
+      '자리표시자를 값으로 채운다',
+      translate('ko', 'side.meas.now', { v: '61.6cm' }) === '현재 61.6cm',
+      translate('ko', 'side.meas.now', { v: '61.6cm' }),
+    );
+
+    // ★ 빈 문자열을 돌려주면 "안 만든 것" 과 "고장난 것" 이 구분되지 않는다.
+    check(
+      '★ 모르는 키는 키 자체를 돌려준다 (빈 문자열이 아니다)',
+      translate('ko', 'no.such.key') === 'no.such.key',
+      `'${translate('ko', 'no.such.key')}'`,
+    );
+    // ★ 값이 안 들어와도 같은 이유로 자리를 남긴다.
+    check(
+      '★ 값이 안 온 자리표시자는 `{name}` 그대로 남는다',
+      translate('ko', 'side.meas.now') === '현재 {v}'
+      && translate('ko', 'side.meas.now', { other: 1 }) === '현재 {v}',
+      translate('ko', 'side.meas.now', { other: 1 }),
+    );
+    // 모르는 **언어** 로 물어도 화면이 비면 안 된다.
+    check(
+      '★ 모르는 언어로 물으면 한국어로 떨어진다 (화면이 비지 않는다)',
+      translate('fr' as Lang, 'bar.load') === MESSAGES.ko['bar.load'],
+      translate('fr' as Lang, 'bar.load'),
+    );
+
+    // ── 언어 코드 정규화 ────────────────────────────────────
+    check(
+      "'en-US'·'EN'·공백이 붙어도 영어로 읽는다",
+      normalizeLang('en-US') === 'en' && normalizeLang('EN') === 'en'
+      && normalizeLang(' en ') === 'en' && normalizeLang('en_GB') === 'en',
+      '',
+    );
+    check(
+      '모르는 값·숫자·null 은 전부 한국어다',
+      normalizeLang('fr') === 'ko' && normalizeLang(123) === 'ko'
+      && normalizeLang(null) === 'ko' && normalizeLang(undefined) === 'ko'
+      && normalizeLang('') === 'ko',
+      '',
+    );
+
+    // ── 저장 ────────────────────────────────────────────────
+    const box = new Map<string, string>();
+    const fake: LangStore = {
+      getItem: (k) => box.get(k) ?? null,
+      setItem: (k, v) => void box.set(k, v),
+    };
+    check(
+      '저장 → 되읽기 왕복',
+      storeLang('en', fake) && box.get(LANG_STORAGE_KEY) === 'en' && readStoredLang(fake) === 'en',
+      `저장값 '${box.get(LANG_STORAGE_KEY) ?? ''}'`,
+    );
+    box.set(LANG_STORAGE_KEY, '쓰레기');
+    check('저장소에 이상한 값이 있으면 한국어로 연다', readStoredLang(fake) === 'ko', '');
+    check('저장소가 없으면 한국어로 연다', readStoredLang(null) === 'ko' && !storeLang('en', null), '');
+
+    // ★ 사생활 모드의 브라우저는 `localStorage` **접근 자체**가 예외다.
+    //   저장이 안 되는 것은 다음 방문에 기본 언어로 열린다는 뜻일 뿐이고,
+    //   그것 때문에 지금 화면이 죽으면 안 된다.
+    const angry: LangStore = {
+      getItem: () => { throw new Error('사생활 모드'); },
+      setItem: () => { throw new Error('사생활 모드'); },
+    };
+    let threw = false;
+    let stored = true;
+    let read: Lang = 'en';
+    try {
+      read = readStoredLang(angry);
+      stored = storeLang('en', angry);
+    } catch { threw = true; }
+    check(
+      '★ 저장소가 던져도 화면이 죽지 않는다 (사생활 모드)',
+      !threw && read === 'ko' && !stored,
+      threw ? '예외가 새어 나왔다' : `읽기 '${read}' · 쓰기 ${String(stored)}`,
+    );
+
+    // ── 현재 언어 (싱글턴) ──────────────────────────────────
+    const seen: Lang[] = [];
+    const off = onLangChange((l) => seen.push(l));
+
+    setLang('ko', null);
+    seen.length = 0;
+    check('바꾸면 듣는 쪽에 알린다', setLang('en', null) === 'en' && seen.join(',') === 'en', seen.join(','));
+
+    // 같은 값으로 다시 불러도 알리면 화면 전체가 이유 없이 다시 그려진다.
+    seen.length = 0;
+    check('★ 같은 언어로 다시 불러도 알리지 않는다', setLang('en', null) === 'en' && seen.length === 0, `${seen.length}회`);
+
+    seen.length = 0;
+    check('모르는 값으로 부르면 한국어가 된다', setLang('fr', null) === 'ko' && getLang() === 'ko', getLang());
+
+    off();
+    seen.length = 0;
+    setLang('en', null);
+    check('해제 함수가 듣기를 끊는다', seen.length === 0, `${seen.length}회`);
+
+    // 기동 때의 자리. 저장된 값이 첫 화면의 언어를 정한다.
+    box.set(LANG_STORAGE_KEY, 'en');
+    check('`initLang` 이 저장된 값으로 첫 언어를 정한다', initLang(fake) === 'en' && getLang() === 'en', getLang());
+    box.set(LANG_STORAGE_KEY, 'ko');
+    check('`initLang` 은 저장된 값이 없으면 한국어다', initLang(null) === 'ko' && getLang() === 'ko', getLang());
+  } finally {
+    setLang(before, null);
+  }
+  check(
+    '★ 이 절이 언어를 원래대로 되돌렸다 (뒤 절이 화면 글자로 단언한다)',
+    getLang() === before && t('bar.load') === MESSAGES[before]['bar.load'],
+    `${getLang()} · '${t('bar.load')}'`,
+  );
+}
+
+function sectionI18nSources(): void {
+  section('§16-3. 다국어 — 부르는 자리와 사전이 갈라지지 않았는가 (소스 대조)');
+
+  const koSet = new Set(Object.keys(MESSAGES.ko));
+  const enSet = new Set(Object.keys(MESSAGES.en));
+
+  // ── ① 소스가 리터럴로 부르는 키 ─────────────────────────
+  //
+  // 오타를 내면 예외가 아니라 **화면에 키 문자열이 뜬다**(사전이 모르는 키를
+  // 그대로 돌려주기 때문이다 — 의도된 설계이고, 그래서 여기서 잡아야 한다).
+  //
+  // ⛔ `panels/i18n.ts` 자신은 훑지 않는다. 머리말이 `t('…')` 를 예시로 쓰고
+  //    있어 `…` 가 "사전에 없는 키" 로 잡힌다 — 주석이 단언을 빨갛게 만드는
+  //    그 함정이다(§15-2 의 `stripComments` 와 같은 종류).
+  const files = i18nScanTargets();
+  const used = new Map<string, string>();
+  let calls = 0;
+  for (const f of files) {
+    for (const m of readFileSync(f, 'utf8').matchAll(LITERAL_KEY_CALL)) {
+      calls++;
+      const key = m[1];
+      if (key !== undefined && !used.has(key)) used.set(key, path.relative(FRONTEND, f));
+    }
+  }
+  const unknown = [...used].filter(([k]) => !koSet.has(k) || !enSet.has(k));
+  check(
+    '★★ 소스가 부르는 키가 전부 사전에 있다 (오타는 화면에 키 문자열로 뜬다)',
+    unknown.length === 0,
+    unknown.length === 0
+      ? `${files.length}파일 · ${calls}회 호출 · ${used.size}키`
+      : unknown.slice(0, 5).map(([k, f]) => `${f} → ${k}`).join(' / '),
+  );
+
+  // 대조군. 정규식이 하나도 못 잡게 되면 위 단언이 **공짜로** 통과한다 —
+  // 부정 단언이 스스로 무력해지는 그 실패 모드다(§15-2 에서 한 번 겪었다).
+  check(
+    '★ 대조군: 스캔이 실제로 키를 찾고 있다',
+    files.length > 20 && calls > 100 && used.size > 80,
+    `${files.length}파일 · ${calls}회 · ${used.size}키`,
+  );
+
+  // ── ② `index.html` 의 `data-i18n` ───────────────────────
+  const html = existsSync(INDEX_HTML) ? readFileSync(INDEX_HTML, 'utf8') : '';
+  const htmlKeys = [...html.matchAll(/data-i18n(?:-title|-aria)?="([^"]+)"/g)]
+    .map((m) => m[1] ?? '');
+  const htmlUnknown = htmlKeys.filter((k) => !koSet.has(k) || !enSet.has(k));
+  check(
+    '★ `index.html` 의 `data-i18n` 키가 전부 사전에 있다',
+    html.length > 0 && htmlKeys.length > 10 && htmlUnknown.length === 0,
+    htmlUnknown.length === 0 ? `${htmlKeys.length}키` : htmlUnknown.slice(0, 5).join(', '),
+  );
+
+  // ── ③ 마크업에 그냥 박힌 한글 ───────────────────────────
+  //
+  // ★ **이 단위에서 가장 흔한 실패다**(`ui/langSwitch.ts` 머리말). `index.html`
+  //   에 글자를 하나 더 넣는 날, 거기에만 `data-i18n` 을 안 달면 그 자리가
+  //   어느 언어에서도 한국어로 남는다. 사전이 아무리 맞아도 안 잡힌다.
+  //
+  //   `<title>` 만 예외다 — `applyStaticText()` 가 이름으로 직접 집어
+  //   `app.title` 로 덮는다(선택자가 `data-i18n` 이 아니다).
+  const markup = html
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<script\b[\s\S]*?<\/script>/gi, '')
+    .replace(/<style\b[\s\S]*?<\/style>/gi, '');
+  const bare: string[] = [];
+  let tags = 0;
+  for (const m of markup.matchAll(/<([a-zA-Z][\w-]*)([^>]*)>([^<]*)/g)) {
+    tags++;
+    const [, tag = '', attrs = '', text = ''] = m;
+    if (tag.toLowerCase() !== 'title' && /[가-힣]/.test(text) && !/\bdata-i18n\s*=/.test(attrs)) {
+      bare.push(`<${tag}> ${text.trim().slice(0, 40)}`);
+    }
+    for (const [attr, mark] of [['title', 'data-i18n-title'], ['aria-label', 'data-i18n-aria']] as const) {
+      const v = new RegExp(`\\b${attr}="([^"]*)"`).exec(attrs)?.[1];
+      if (v && /[가-힣]/.test(v) && !new RegExp(`\\b${mark}\\s*=`).test(attrs)) {
+        bare.push(`<${tag} ${attr}> ${v.slice(0, 40)}`);
+      }
+    }
+  }
+  check(
+    '★★ `index.html` 에 `data-i18n` 없이 박힌 한글이 없다 (있으면 그 자리만 영어 화면에서 한국어로 남는다)',
+    html.length > 0 && tags > 20 && bare.length === 0,
+    bare.length === 0 ? `여는 태그 ${tags}개를 훑었다` : bare.slice(0, 5).join(' / '),
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
 // §9. 좀비 프로세스
 // ─────────────────────────────────────────────────────────────
 
@@ -9510,6 +9876,13 @@ async function main(): Promise<void> {
   // 클라이언트로 돌고, 그 갈래를 부르는 자리(§15-2)는 `main.ts` 를 소스로 읽는다.
   await sectionRestageSplit();
   sectionRestageWiring();
+  // I-1 다국어. 워커도 DOM 도 안 쓴다 — 사전 두 벌을 맞대고(§16-1), 조회·저장의
+  // 실패 갈래를 밟고(§16-2), 부르는 자리를 소스로 읽는다(§16-3).
+  // ⚠️ §16-2 가 모듈 상태(현재 언어)를 만지므로 **화면 글자로 단언하는 절보다
+  //    뒤에** 둔다. 되돌리기는 하지만, 되돌림이 깨져도 남들이 안 다치게 한다.
+  sectionI18nDict();
+  sectionI18nLookup();
+  sectionI18nSources();
   await sectionZombies();
 
   clearInterval(keepAlive);

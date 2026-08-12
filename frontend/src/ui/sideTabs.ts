@@ -112,6 +112,8 @@ export class SideTabs {
     for (const t of view.tabs) {
       const btn = this.#buttons.get(t.id);
       if (btn) {
+        // 글자도 매번 다시 쓴다 — 언어가 바뀌면 `t.label` 이 달라진다 (I-1).
+        btn.textContent = t.label;
         btn.classList.toggle('on', t.active);
         btn.setAttribute('aria-selected', t.active ? 'true' : 'false');
         // 켜진 탭은 눌러도 할 일이 없다. 비활성으로 만들면 포커스가 빠져

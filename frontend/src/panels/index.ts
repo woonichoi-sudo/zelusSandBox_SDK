@@ -62,7 +62,9 @@ export {
 export {
   isTypingTarget,
   shortcutFor,
+  shortcutHint,
   SHORTCUT_HINT,
+  viewHint,
   type KeyLike,
   type ShortcutAction,
   type TargetLike,
@@ -182,3 +184,29 @@ export {
   type SideDrawerMode,
   type SideDrawerView,
 } from './sideDrawer.ts';
+
+/**
+ * 화면 글자의 다국어 (I-1). 사전과 언어 결정만 있고 DOM 은 모른다 —
+ * **이 단위에서 자동으로 확인할 수 있는 유일한 자리다**(원본 머리말 참고).
+ */
+export {
+  DEFAULT_LANG,
+  getLang,
+  initLang,
+  LANG_LABELS,
+  LANG_STORAGE_KEY,
+  LANGS,
+  MESSAGES,
+  normalizeLang,
+  onLangChange,
+  placeholdersIn,
+  readStoredLang,
+  setLang,
+  storeLang,
+  t,
+  translate,
+  type Dict,
+  type Lang,
+  type LangStore,
+  type MessageVars,
+} from './i18n.ts';

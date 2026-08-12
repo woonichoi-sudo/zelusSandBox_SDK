@@ -18,7 +18,7 @@
  * **툴팁이 아니다** — 마우스를 올려야 보이는 것은 보이는 게 아니다(#16 에서 확립).
  */
 
-import type { TextureOptionsState } from '../panels/index.ts';
+import { t, type TextureOptionsState } from '../panels/index.ts';
 
 /** 컨트롤러 쪽. 구조적 타입이라 `TextureOptions` 가 이미 만족한다 */
 export interface TextureSwitchPort {
@@ -37,6 +37,8 @@ export class TextureSwitch {
   readonly #port: TextureSwitchPort;
   readonly #box: HTMLInputElement;
   readonly #stat: HTMLElement;
+  /** 체크박스 옆 글자. 참조를 들고 있어야 언어 전환이 여기까지 온다 (I-1) */
+  readonly #text: HTMLElement;
 
   constructor(opts: TextureSwitchOptions) {
     this.#port = opts.port;
@@ -57,7 +59,8 @@ export class TextureSwitch {
     });
 
     const text = document.createElement('span');
-    text.textContent = '🎨 무늬';
+    // 글자는 `render()` 가 채운다 — 여기서 한 번 찍으면 언어 전환이 안 온다 (I-1)
+    this.#text = text;
 
     label.append(this.#box, text);
 
@@ -70,6 +73,7 @@ export class TextureSwitch {
 
   /** 컨트롤러의 지금 상태를 화면에 옮긴다. **상태를 만들지 않는다** */
   render(state: TextureOptionsState = this.#port.state): void {
+    this.#text.textContent = t('cell.texture');
     if (this.#box.checked !== state.enabled) this.#box.checked = state.enabled;
     this.#stat.textContent = state.text;
     this.#stat.classList.toggle('err', state.isError);

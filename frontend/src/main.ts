@@ -53,8 +53,13 @@ import {
   SurfaceSizePanel,
   PlaybackController,
   shortcutFor,
-  SHORTCUT_HINT,
+  shortcutHint,
+  viewHint,
+  initLang,
+  onLangChange,
+  t,
   type AvatarCause,
+  type MessageVars,
   type AvatarMeasureView,
   type AvatarViewState,
   type DrapingView,
@@ -72,10 +77,12 @@ import {
   type SceneSummary,
 } from './protocol/index.ts';
 import {
+  applyStaticText,
   AvatarMeasurePanel,
   AvatarPanel,
   AvatarViewSwitch,
   Design2DOptions,
+  LangSwitch,
   ParamsPanel,
   SideTabs,
   SideDrawer,
@@ -97,6 +104,14 @@ import {
   type SnapshotLoaderStats,
 } from './viewer3d/index.ts';
 
+// ── 언어 (I-1) ──────────────────────────────────────────────
+//
+// ★ **무엇보다 먼저 부른다.** 아래 위젯들이 생성자에서 `t()` 를 읽으므로,
+//   저장된 언어를 여기서 정해 두지 않으면 화면이 한국어로 한 번 서고 나서
+//   영어로 덜컥 바뀐다. `localStorage` 가 없거나 던져도(사생활 모드) 조용히
+//   한국어로 떨어진다 — 이 한 줄 때문에 화면이 죽지 않는다.
+initLang();
+
 // ── DOM ─────────────────────────────────────────────────────
 
 function el<T extends HTMLElement>(id: string): T {
@@ -117,6 +132,9 @@ const ui = {
   scene: el<HTMLSelectElement>('scene'),
   load: el<HTMLButtonElement>('load'),
   file: el<HTMLInputElement>('file'),
+  // 감춘 입력 대신 고른 파일 이름을 보여주는 자리 (I-1). 네이티브 표시를
+  // 없앤 대가라 이것이 없으면 무엇을 골랐는지 알 수 없다.
+  fileName: el<HTMLElement>('fileName'),
   upload: el<HTMLButtonElement>('upload'),
   play: el<HTMLButtonElement>('play'),
   // ⛔ `#step` 은 없다 — 워커의 step op 이 no-op 이라 화면에 올리지 않았다
@@ -161,10 +179,22 @@ const ui = {
   unfoldWhy: el<HTMLElement>('unfoldWhy'),
 };
 
-ui.hint.textContent = `${ui.hint.textContent ?? ''}  |  ${SHORTCUT_HINT}`;
+/** 3D 칸 왼쪽 위 한 줄. 조작 설명과 단축키가 **한 언어**로 붙는다 (I-1) */
+function paintHint(): void {
+  ui.hint.textContent = `${viewHint()}  |  ${shortcutHint()}`;
+}
 
 const LOG_LIMIT = 300;
 const lines: string[] = [];
+
+/**
+ * 로그 한 줄.
+ *
+ * ⛔ **로그 문구는 번역 범위 밖이다** (I-1, 사용자가 좁혔다: "로그는 안해도 돼
+ *    사용자가 보는 ui만"). 이 함수에 들어오는 문자열은 한국어 그대로다 —
+ *    접힌 `#logWrap` 안에만 쌓이기 때문이다. 예외는 `status()` 가 남기는
+ *    메아리인데, 그쪽은 본적이 상태줄이라 이미 번역돼 들어온다.
+ */
 function log(line: string): void {
   lines.push(`${new Date().toLocaleTimeString('ko-KR')}  ${line}`);
   if (lines.length > LOG_LIMIT) lines.splice(0, lines.length - LOG_LIMIT);
@@ -172,9 +202,55 @@ function log(line: string): void {
   ui.log.scrollTop = ui.log.scrollHeight;
 }
 
+/**
+ * ── 지난 문장을 **값이 아니라 다시 만드는 법으로** 기억한다 (I-1) ──
+ *
+ * 상태줄·메시 통계·스냅샷 요약은 한 번 찍히면 다음 조작까지 화면에 남는다.
+ * 그동안 언어를 바꾸면 그 세 자리만 옛 언어로 굳는다 — 다시 그릴 근거(키와
+ * 값)를 우리가 안 들고 있기 때문이다. 그래서 **찍는 함수 자체**를 슬롯에
+ * 넣어 두고, 언어가 바뀌면 그대로 한 번 더 부른다.
+ *
+ * 값을 저장하지 않는 이유: 값(패턴 24개, 4.3초…)과 키가 짝을 이뤄야 문장이
+ * 되는데, 그 짝을 따로 들고 다니면 한쪽만 갱신되는 날이 온다.
+ */
+type TextSlot = 'status' | 'stat' | 'snapstat' | 'filename';
+const slotPainters = new Map<TextSlot, () => void>();
+
+function say(slot: TextSlot, paint: (() => void) | null): void {
+  if (paint === null) {
+    slotPainters.delete(slot);
+    return;
+  }
+  slotPainters.set(slot, paint);
+  paint();
+}
+
+/**
+ * 상태줄에 이미 번역된 글자를 찍는다. **패널이 훅으로 부르는 문**이라
+ * 서명을 바꾸지 않는다(`ParamsPanelHooks.status` 등).
+ *
+ * ⚠️ 이 문으로 들어온 글자는 **언어를 바꿔도 다시 그려지지 않는다** — 무슨
+ *    키였는지 모르기 때문이다. 그래서 슬롯을 비운다(옛 문장을 다시 찍는 것이
+ *    더 나쁘다). 키를 아는 자리는 아래 `statusT` 를 쓴다.
+ */
 function status(text: string, isError = false): void {
+  say('status', null);
+  ui.status.removeAttribute('data-i18n');
   ui.status.textContent = text;
   ui.status.classList.toggle('err', isError);
+  log(isError ? `⚠ ${text}` : text);
+}
+
+/** 사전 키로 상태줄을 찍는다. 언어를 바꾸면 이 문장이 그대로 따라온다 */
+function statusT(key: string, vars?: MessageVars, isError = false): void {
+  say('status', () => {
+    // 기동 직후의 자리채움(`data-i18n="bar.status.booting"`)을 뗀다. 안 떼면
+    // 언어를 바꿀 때 `applyStaticText()` 가 "시작하는 중…" 으로 되돌린다.
+    ui.status.removeAttribute('data-i18n');
+    ui.status.textContent = t(key, vars);
+    ui.status.classList.toggle('err', isError);
+  });
+  const text = t(key, vars);
   log(isError ? `⚠ ${text}` : text);
 }
 
@@ -267,7 +343,7 @@ client.on('close', ({ code, willReconnect }) => {
   // 유효한 정지 화면이라, 끊겼다고 지우면 볼 수 있는 것까지 사라진다.
   // 새로 찍는 것만 막는다 (paintSnap 이 client.connected 를 본다).
   paintSnap();
-  status(`연결이 끊겼습니다 (code=${code})${willReconnect ? ' — 재시도 중' : ''}`, true);
+  statusT(willReconnect ? 'status.closed.retry' : 'status.closed', { code }, true);
   if (code === 1006 && !willReconnect) {
     // 브라우저는 핸드셰이크 거절의 본문을 못 읽는다. 되물어야 안다.
     void client.diagnose().then((d) => {
@@ -332,11 +408,11 @@ const stream = new FrameStream({
     log(`프레임 ${frame} 의 토폴로지가 화면과 다릅니다 (패턴 ${incoming} vs ${current})`);
     if (!currentScene) return;
     if (topologyRecoveries >= MAX_TOPOLOGY_RECOVERIES) {
-      status('토폴로지를 다시 세워도 계속 어긋납니다 — 복구를 중단합니다', true);
+      statusT('status.topology.giveUp', undefined, true);
       return;
     }
     topologyRecoveries += 1;
-    status(`토폴로지를 다시 받습니다 (${topologyRecoveries}/${MAX_TOPOLOGY_RECOVERIES})`);
+    statusT('status.topology.retry', { n: topologyRecoveries, max: MAX_TOPOLOGY_RECOVERIES });
     void restageTopology('토폴로지 복구');
   },
 });
@@ -509,10 +585,11 @@ async function applyAvatarBody(): Promise<void> {
       + (res.unknown.length > 0 ? ` · ⚠ 모르는 키 ${res.unknown.join(', ')}` : ''),
     );
     if (res.unknown.length > 0) {
-      status(`워커가 모르는 체형 키가 있습니다: ${res.unknown.join(', ')}`, true);
+      // ⛔ `res.unknown` 안의 이름은 엔진의 체형 파라미터 키다 — 번역하지 않는다
+      statusT('status.body.unknownKeys', { keys: res.unknown.join(', ') }, true);
     }
   } catch (err: unknown) {
-    status(`아바타 체형 적용 실패: ${message(err)}`, true);
+    statusT('status.body.failed', { why: message(err) }, true);
   }
   avatarPanel.render();
   measurePanel.render();
@@ -793,7 +870,7 @@ async function applySurfaceSize(uuid: string): Promise<void> {
     );
     applied = true;
   } catch (err: unknown) {
-    status(`옷 사이즈 적용 실패: ${message(err)}`, true);
+    statusT('status.surface.failed', { why: message(err) }, true);
   }
   // 값을 먼저 그린다. 아래 왕복이 도는 동안에도 패널의 숫자는 새것이어야 한다.
   surfacePanel.render();
@@ -812,7 +889,9 @@ async function applySurfaceSize(uuid: string): Promise<void> {
 // ★ 참조를 남기지 않는다 — 클릭 → `setLayerVisible()` → 다시 그리기가 닫힌
 //   고리라 바깥에서 부를 일이 없다(`SideTabs` 와 같은 판단이다). 씬이 바뀌어도
 //   `build()` 끝에서 레이어가 스스로 꺼짐 상태를 다시 입힌다.
-new Design2DOptions({
+// ★ 참조를 **하나만** 남긴다 — 언어 전환 때 체크박스 여섯 개의 글자를 다시
+//   써야 해서다 (I-1). 그 외에는 여전히 스스로 굴러간다.
+const design2dOptions = new Design2DOptions({
   root: ui.draft2dOpts,
   layer: viewer2d.design,
   onChange: (key, on) => log(`2D 도면 — ${key} ${on ? '표시' : '숨김'}`),
@@ -828,8 +907,10 @@ new Design2DOptions({
 //   값이 맞는" 화면이 되고, 그건 화면이 잠깐 거짓말을 하는 상태다. 왕복이
 //   로드당 두 번뿐이라 아낄 값어치가 없다.
 // 탭 위젯은 스스로 굴러간다 — 클릭 → `SideTabsPanel.select()` → 가시성이
-// 닫힌 고리라 바깥에서 부를 일이 없다. 그래서 참조를 남기지 않는다.
-new SideTabs({
+// 닫힌 고리라 바깥에서 부를 일이 없었다.
+// ★ 그런데도 참조를 남기는 이유는 `Design2DOptions` 와 같다 — 탭 이름이
+//   언어를 따라와야 한다 (I-1).
+const sideTabs = new SideTabs({
   root: ui.sideTabs,
   scroll: ui.sideScroll,
   panel: new SideTabsPanel(),
@@ -843,15 +924,17 @@ new SideTabs({
 //
 // ⓘ 뷰포트 크기 갱신을 안 매단다. 두 뷰어가 `ResizeObserver` 로 자기 칸을
 //   보고 있어서 격자가 2열로 바뀌면 알아서 따라온다.
-{
-  const drawer = new SideDrawer({
-    body: document.body,
-    panel: ui.sidePanel,
-    bar: ui.bar,
-    state: new SideDrawerPanel(),
-    onChange: (open) => log(`설정 칸 ${open ? '펼침' : '접음'}`),
-  });
+// ★ `drawer` 만 블록 밖으로 나왔다 — 버튼 글자와 툴팁이 언어를 따라와야
+//   한다 (I-1). 나머지(`mq`·`sync`)는 그대로 이 블록 안이다.
+const drawer = new SideDrawer({
+  body: document.body,
+  panel: ui.sidePanel,
+  bar: ui.bar,
+  state: new SideDrawerPanel(),
+  onChange: (open) => log(`설정 칸 ${open ? '펼침' : '접음'}`),
+});
 
+{
   const mq = window.matchMedia(narrowQuery());
   const sync = (): void => drawer.setNarrow(mq.matches);
 
@@ -984,6 +1067,9 @@ function clearScene(): void {
   // 세우지 못하도록 번호부터 올린다 (`show()` 와 같은 판단이다).
   restageSeq += 1;
   viewer.cloth.clear();
+  // 메시 통계는 이제 아무것도 가리키지 않는다. 슬롯도 같이 비운다 (I-1) —
+  // 안 비우면 언어를 바꿀 때 이미 없는 메시의 숫자가 되살아난다.
+  say('stat', null);
   // 몸도 씬에 딸려 있다 (AM-1). 옷만 지우면 **몸만 남아 서 있어서** 씬이 아직
   // 있는 것처럼 보인다 — 가운데 칸에서 커브만 남던 것과 같은 계열의 사고다.
   avatarView.clear();
@@ -1016,7 +1102,7 @@ function clearScene(): void {
   // 파라미터는 씬에 딸려 있다. 씬이 내려갔으면 화면의 값은 더 이상 아무것도
   // 가리키지 않는다.
   refreshParams();
-  status('씬을 내렸습니다 — 다시 보려면 [로드] 를 누르세요');
+  statusT('status.cleared');
   setBusy(false);
 }
 
@@ -1050,7 +1136,7 @@ function paintPlayback(view: PlaybackView = playback.view): void {
   //   패널에 글자로 뜬다 (`ui/paramsPanel.ts` 머리말 참고).
   params.setBlocked(
     view.playing
-      ? '재생 중에는 적용하지 않습니다 — [⏸ 정지] 후 누르세요 (시뮬 도중 변경의 반영 방식은 측정되지 않았습니다)'
+      ? t('params.blocked.playing')
       : null,
   );
   syncParamLock(view);
@@ -1142,9 +1228,13 @@ function paintFrames(): void {
     return;
   }
   ui.frames.textContent =
-    `프레임 ${s.lastApplied ?? '-'} · 적용 ${s.applied} · 버림 ${s.dropped}`
-    + ` · ${s.fps.toFixed(1)}fps`
-    + (s.stalled ? ' · ⚠정지' : '');
+    t('stat.frames', {
+      frame: s.lastApplied ?? '-',
+      applied: s.applied,
+      dropped: s.dropped,
+      fps: s.fps.toFixed(1),
+    })
+    + (s.stalled ? t('stat.frames.stalled') : '');
 }
 
 // ── 씬 목록 ─────────────────────────────────────────────────
@@ -1184,15 +1274,17 @@ const snapshots = new SnapshotLoader<ParsedSnapshot>({
   // `viewer.snapshot` 이 `SnapshotTarget` 을 이미 구현한다. 어댑터가 없다.
   target: viewer.snapshot,
   onProgress: (p) => {
+    // 진행률은 1초에 몇 번씩 갈리므로 슬롯에 넣지 않는다 (I-1) — 다음 갱신이
+    // 바로 오고, 끝나면 아래 `takeSnapshot()` 이 요약을 슬롯에 넣는다.
     if (p.phase === 'exporting') {
-      ui.snapstat.textContent = `익스포트 중… ${(p.elapsedMs / 1000).toFixed(1)}s`;
+      ui.snapstat.textContent = t('snap.exporting', { sec: (p.elapsedMs / 1000).toFixed(1) });
     } else if (p.phase === 'downloading') {
       ui.snapstat.textContent = p.total
-        ? `내려받는 중… ${fmtBytes(p.loaded)} / ${fmtBytes(p.total)}`
-        : `내려받는 중… ${fmtBytes(p.loaded)}`;
+        ? t('snap.downloading.total', { loaded: fmtBytes(p.loaded), total: fmtBytes(p.total) })
+        : t('snap.downloading', { loaded: fmtBytes(p.loaded) });
     } else if (p.phase === 'parsing') {
       // 36.5MB 파싱은 메인 스레드를 잡는다. 미리 말해 두지 않으면 "멈췄다" 로 읽힌다.
-      ui.snapstat.textContent = `glTF 를 여는 중… (${fmtBytes(p.total)})`;
+      ui.snapstat.textContent = t('snap.parsing', { total: fmtBytes(p.total) });
     } else if (p.phase === 'idle') {
       ui.snapstat.textContent = '';
     }
@@ -1207,28 +1299,35 @@ async function takeSnapshot(): Promise<void> {
   if (playback.playing) {
     log('재생 중 스냅샷 — 파일에 담기는 포즈는 버튼을 누른 시점보다 몇 프레임 뒤입니다');
   }
-  status('스냅샷을 만드는 중… (아바타·머티리얼이 들어간 glTF 를 받습니다)');
+  statusT('status.snap.making');
   try {
     const r = await snapshots.load();
     // 성공했으니 화면을 스냅샷으로 돌린다. 이 한 줄이 유일한 전환 지점이다.
     setMode('snapshot', { refit: true });
-    ui.snapstat.textContent =
-      `스냅샷 ${fmtBytes(r.info.bytes)} · 메시 ${r.stats.meshes}`
-      + ` · 정점 ${r.stats.vertices.toLocaleString('ko-KR')}`
-      + ` · 머티리얼 ${r.stats.materials} · 텍스처 ${r.stats.textures}`;
+    say('snapstat', () => {
+      ui.snapstat.textContent = t('snap.summary', {
+        bytes: fmtBytes(r.info.bytes),
+        meshes: r.stats.meshes,
+        vertices: r.stats.vertices.toLocaleString('ko-KR'),
+        materials: r.stats.materials,
+        textures: r.stats.textures,
+      });
+    });
     log(
       `스냅샷 완료 ${r.elapsedMs}ms `
       + `(익스포트 ${r.timings.exportMs} / 다운로드 ${r.timings.downloadMs}`
       + ` / 파싱 ${r.timings.parseMs} / 부착 ${r.timings.installMs})`,
     );
-    status(`스냅샷 표시 중 — ${r.info.name}`);
+    // ⛔ `r.info.name` 은 익스포트 파일명이라 번역하지 않는다
+    statusT('status.snap.showing', { name: r.info.name });
   } catch (err: unknown) {
     if (err instanceof SnapshotStaleError) {
       // 취소다. 사용자가 그 사이에 다른 씬을 눌렀다는 뜻이므로 오류가 아니다.
       log(err.message);
     } else {
+      say('snapstat', null);
       ui.snapstat.textContent = '';
-      status(`스냅샷 실패: ${message(err)}`, true);
+      statusT('status.snap.failed', { why: message(err) }, true);
     }
   } finally {
     paintSnap();
@@ -1256,11 +1355,7 @@ function setMode(
   //   상태는 `#sim` 이 4/s 로 계속 갱신하므로 상태줄은 "무엇을 보고 있는가" 만
   //   말한다.
   if (!opts.quiet) {
-    status(
-      mode === 'snapshot'
-        ? '스냅샷 표시 중'
-        : '실시간 뷰 — 시뮬레이션 결과를 그립니다',
-    );
+    statusT(mode === 'snapshot' ? 'status.mode.snapshot' : 'status.mode.live');
   }
 }
 
@@ -1268,6 +1363,7 @@ function setMode(
 function dropSnapshot(): void {
   snapshots.clear();
   viewer.setMode('live');
+  say('snapstat', null);
   ui.snapstat.textContent = '';
   paintSnap();
 }
@@ -1275,10 +1371,14 @@ function dropSnapshot(): void {
 function paintSnap(): void {
   const has = snapshots.present;
   ui.snap.disabled = busy || currentScene === null || !client.connected || snapshots.busy;
-  ui.snap.textContent = has ? '🧍 다시 찍기' : '🧍 스냅샷';
+  // `data-i18n` 자리채움을 뗀다 — 안 떼면 언어 전환이 "🧍 다시 찍기" 를
+  // "🧍 스냅샷" 으로 되돌린다 (I-1).
+  ui.snap.removeAttribute('data-i18n');
+  ui.mode.removeAttribute('data-i18n');
+  ui.snap.textContent = has ? t('bar.snap.again') : t('bar.snap');
   ui.mode.hidden = !has;
   ui.mode.disabled = !has;
-  ui.mode.textContent = viewer.mode === 'snapshot' ? '↩ 실시간' : '🧍 스냅샷 보기';
+  ui.mode.textContent = viewer.mode === 'snapshot' ? t('bar.mode.live') : t('bar.mode.snapshot');
 }
 
 ui.snap.addEventListener('click', () => {
@@ -1296,7 +1396,7 @@ async function refreshScenes(select?: string): Promise<SceneSummary[]> {
   try {
     scenes = await listScenes();
   } catch (err: unknown) {
-    status(`씬 목록을 읽지 못했습니다: ${message(err)}`, true);
+    statusT('status.scenes.failed', { why: message(err) }, true);
     return [];
   }
 
@@ -1304,7 +1404,10 @@ async function refreshScenes(select?: string): Promise<SceneSummary[]> {
   if (scenes.length === 0) {
     const opt = document.createElement('option');
     opt.value = '';
-    opt.textContent = '업로드된 씬이 없습니다 — .zls 를 올리세요';
+    // `data-i18n` 을 달아 두면 언어를 바꿀 때 `applyStaticText()` 가 채운다 —
+    // 씬 목록을 다시 받는 왕복을 만들지 않는다 (I-1).
+    opt.dataset['i18n'] = 'bar.scene.empty';
+    opt.textContent = t('bar.scene.empty');
     ui.scene.append(opt);
   }
   for (const s of scenes) {
@@ -1414,7 +1517,13 @@ async function restageTopology(cause: string): Promise<RestageOutcome> {
   paintUnfold();
   // 정점·삼각형 수가 바뀐다(패턴을 키우면 다시 삼각형이 잘린다). 옛 숫자를
   // 남겨 두면 상태줄이 화면에 없는 메시를 말한다.
-  ui.stat.textContent = `패턴 ${staged.patterns} · 정점 ${staged.vertices} · 삼각형 ${staged.triangles}`;
+  say('stat', () => {
+    ui.stat.textContent = t('stat.mesh', {
+      patterns: staged.patterns,
+      vertices: staged.vertices,
+      triangles: staged.triangles,
+    });
+  });
   log(`${cause} — 토폴로지를 다시 받았습니다 (패턴 ${staged.patterns} · 정점 ${staged.vertices})`);
 
   // ★ 도면 커브·봉제선 (D2-c). **규칙을 하나로 둔다 — 토폴로지가 갈리면
@@ -1450,7 +1559,7 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
   // 로드 중에 프레임이 들이닥치는 것을 막는다. `setTopology()` 가 지오메트리를
   // 통째로 갈아 끼우는 동안 옛 프레임을 적용하면 어긋난 메시를 그린다.
   stream.resume();
-  status('씬을 로드하는 중… (103MB 면 1초쯤 걸립니다)');
+  statusT('status.loading');
   try {
     const shown = await showScene(client, viewer, sceneId, {
       // 재연결 후 다시 로드할 때는 사용자가 맞춰 둔 시점을 빼앗지 않는다.
@@ -1512,8 +1621,14 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
         : ' · 배치 없음')
       + (u.unplaced > 0 ? ` · ⚠ 배치 없는 패턴 ${u.unplaced}개` : ''),
     );
-    ui.stat.textContent = `패턴 ${shown.patterns} · 정점 ${shown.vertices} · 삼각형 ${shown.triangles}`;
-    status(`로드 완료 (${shown.elapsedMs}ms)`);
+    say('stat', () => {
+      ui.stat.textContent = t('stat.mesh', {
+        patterns: shown.patterns,
+        vertices: shown.vertices,
+        triangles: shown.triangles,
+      });
+    });
+    statusT('status.loaded', { ms: shown.elapsedMs });
   } catch (err: unknown) {
     playback.sceneLoadFailed();
     // 화면에 무엇이 서 있는지 모르는 상태다. 도면 좌표를 남겨 두면 슬라이더가
@@ -1526,7 +1641,7 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
     unfolder2d.clear();
     viewer2d.design.clear();
     paintDraft2d();
-    status(`로드 실패: ${message(err)}`, true);
+    statusT('status.load.failed', { why: message(err) }, true);
   } finally {
     setBusy(false);
     paintSnap();
@@ -1569,7 +1684,7 @@ async function act(action: PlaybackCommand): Promise<void> {
   const err = playback.lastError;
   // 실패가 아니라 "지금은 할 수 없다"(다른 op 왕복 중 등)면 조용히 넘긴다 —
   // 버튼이 이미 잠겨 있으므로 사용자가 볼 이유가 없다.
-  if (err) status(`${LABEL[action]} 실패: ${err.message}`, true);
+  if (err) statusT('status.action.failed', { action: t(LABEL[action]), why: err.message }, true);
 }
 
 /** 화면이 부를 수 있는 조작. 단축키의 것에 `play`/`pause` 를 더한 것이다 */
@@ -1584,13 +1699,18 @@ const RUN: Record<PlaybackCommand, () => Promise<boolean>> = {
   step: () => playback.step(),
 };
 
+/**
+ * 실패 문구에 들어갈 조작 이름의 **사전 키**. 글자가 아니라 키인 이유는
+ * 이 상수가 모듈 로드 때 한 번 만들어지기 때문이다 (I-1) — `act()` 가
+ * `t(LABEL[action])` 로 그때의 언어로 꺼낸다.
+ */
 const LABEL: Record<PlaybackCommand, string> = {
-  toggle: '재생/정지',
-  play: '재생',
-  pause: '정지',
-  reset: '리셋',
-  clear: '씬 내림',
-  step: '스텝',
+  toggle: 'action.toggle',
+  play: 'action.play',
+  pause: 'action.pause',
+  reset: 'action.reset',
+  clear: 'action.clear',
+  step: 'action.step',
 };
 
 /**
@@ -1632,8 +1752,32 @@ ui.load.addEventListener('click', () => {
   if (id) void show(id);
 });
 
+/**
+ * 고른 파일 이름을 우리가 보여준다 (I-1).
+ *
+ * 네이티브 `<input type=file>` 의 글자를 번역할 수 없어 입력을 감췄는데,
+ * 그 대가로 **브라우저가 보여주던 파일 이름도 같이 사라졌다.** 이 자리가
+ * 그것을 대신한다 — 없으면 무엇을 골랐는지 확인할 방법이 없다.
+ *
+ * ⚠️ 파일 이름 자체는 번역하지 않는다(사용자의 파일이다). 안 골랐을 때의
+ *    문구만 사전을 탄다. 그래서 이름이 있으면 `data-i18n` 을 떼고, 없으면
+ *    다시 달아 `applyStaticText()` 가 언어 전환 때 채우게 둔다.
+ */
+function paintFileName(): void {
+  const name = ui.file.files?.[0]?.name;
+  if (name === undefined) {
+    ui.fileName.dataset['i18n'] = 'bar.file.none';
+    ui.fileName.textContent = t('bar.file.none');
+  } else {
+    ui.fileName.removeAttribute('data-i18n');
+    ui.fileName.textContent = name;
+  }
+  ui.fileName.title = name ?? '';
+}
+
 ui.file.addEventListener('change', () => {
   ui.upload.disabled = busy || !ui.file.files?.length;
+  say('filename', paintFileName);
 });
 
 ui.upload.addEventListener('click', () => {
@@ -1641,7 +1785,8 @@ ui.upload.addEventListener('click', () => {
   if (!file) return;
   void (async (): Promise<void> => {
     setBusy(true);
-    status(`업로드 중… ${file.name} (${fmtBytes(file.size)})`);
+    // ⛔ `file.name` 은 사용자가 고른 파일 이름이라 번역하지 않는다
+    statusT('status.uploading', { name: file.name, size: fmtBytes(file.size) });
     try {
       const scene = await uploadScene(file.name, file);
       log(`업로드 완료: ${scene.id}`);
@@ -1649,29 +1794,77 @@ ui.upload.addEventListener('click', () => {
       setBusy(false);
       await show(scene.id);
     } catch (err: unknown) {
-      status(`업로드 실패: ${message(err)}`, true);
+      statusT('status.upload.failed', { why: message(err) }, true);
       setBusy(false);
     }
   })();
 });
+
+// ── 언어 전환의 배선 (I-1) ──────────────────────────────────
+//
+// ★ **새로고침을 요구하지 않는다.** 씬 로드가 2~3초(103MB)라 새로고침을
+//   요구하면 언어를 바꿀 때마다 씬을 다시 열게 된다. 대신 화면을 만드는
+//   자리를 **전부 한 번씩 다시 부른다** — 그 자리들이 이미 "상태를 만들지
+//   않고 받은 것만 그린다" 는 규약을 지키고 있어서, 다시 부르는 것이 안전하다.
+//
+// ⚠️ **여기 한 줄을 빠뜨리면 그 위젯만 한국어로 남는다.** 그리고 Node 는
+//    DOM 이 없어 그것을 못 본다(사전 키가 맞아도 부르는 자리가 없으면 그만이다).
+//    그래서 화면 확인은 사람이 브라우저에서 눈으로 한다.
+function repaintForLang(): void {
+  // ① `index.html` 에 박힌 정적 글자와 `<title>`·`<html lang>`
+  applyStaticText();
+  langSwitch.render();
+  paintHint();
+
+  // ② 지난 문장 (상태줄·메시 통계·스냅샷 요약). 위 `say()` 머리말 참고
+  for (const paint of slotPainters.values()) paint();
+
+  // ③ 스스로 다시 그리는 위젯들. 순서에 뜻은 없다 — 전부 멱등이다
+  paintPlayback();
+  paintDraping();
+  paintUnfold();
+  paintSnap();
+  paintFrames();
+  paintMeasure();
+  paintAvatarView();
+  textureSwitch.render();
+  avatarPanel.render();
+  surfacePanel.render();
+  design2dOptions.render();
+  sideTabs.render();
+  drawer.render();
+  params.relabel();
+}
+
+const langSwitch = new LangSwitch({
+  root: ui.bar,
+  onChange: repaintForLang,
+});
+
+// 기동 때 한 번. 저장된 언어가 영어면 마크업의 한국어가 **한 번도 안 보인 채**
+// 영어로 선다 — `initLang()` 이 위에서 이미 언어를 정해 뒀기 때문이다.
+repaintForLang();
+
+// 다른 곳(콘솔의 `cobalt` 창구 등)에서 `setLang` 을 불러도 화면이 따라온다.
+onLangChange(() => repaintForLang());
 
 // ── 기동 ────────────────────────────────────────────────────
 
 void (async (): Promise<void> => {
   const health = await fetchHealth();
   if (!health) {
-    status('게이트웨이가 응답하지 않습니다 — backend 에서 `npm run serve` 를 띄우세요', true);
+    statusT('status.gateway.down', undefined, true);
     return;
   }
   log(`게이트웨이 ok — node ${health.node}, pid ${health.pid}`);
 
   const scenes = await refreshScenes();
 
-  status('세션을 여는 중… (워커 프로세스가 뜹니다)');
+  statusT('status.connecting');
   try {
     await client.connect();
   } catch (err: unknown) {
-    status(`연결 실패: ${message(err)}`, true);
+    statusT('status.connect.failed', { why: message(err) }, true);
     return;
   }
 
@@ -1680,7 +1873,7 @@ void (async (): Promise<void> => {
 
   const first = scenes[0];
   if (!first) {
-    status('연결됨 — .zls 를 업로드하세요');
+    statusT('status.connected.empty');
     return;
   }
   // 씬이 있으면 바로 띄운다. 첫 화면이 곧 이 단위의 판정 기준이다.

@@ -36,6 +36,7 @@
  * 달라야 한다.
  */
 
+import { t } from './i18n.ts';
 import type { MaterialTextures, TextureAsset } from '../protocol/index.ts';
 
 /** UV 좌표계의 성격. ②의 식을 가르는 유일한 축이다 */
@@ -264,18 +265,22 @@ export class TextureOptions {
 
   #text(stats: TextureStats): string {
     if (this.#error) return this.#error;
-    if (this.#stats === null) return '씬을 로드하면 무늬가 입혀집니다';
-    if (stats.files === 0) return '이 씬에는 텍스처가 없습니다';
+    if (this.#stats === null) return t('tex.noScene');
+    if (stats.files === 0) return t('tex.none');
     const mb = (stats.bytes / 1048576).toFixed(1);
-    const head = this.#enabled ? `무늬 ${stats.files}장` : `무늬 ${stats.files}장 (꺼짐)`;
+    const head = this.#enabled
+      ? t('tex.count', { files: stats.files })
+      : t('tex.count.off', { files: stats.files });
     // 거절은 조용히 넘어가면 안 된다 — 허용 뿌리 설정이 틀렸을 때 유일한 신호다.
-    const bad = stats.rejected > 0 ? ` · ⚠ 거절 ${stats.rejected}칸` : '';
+    const bad = stats.rejected > 0 ? t('tex.rejected', { n: stats.rejected }) : '';
     return `${head} · ${mb}MB${bad}`;
   }
 
   setEnabled(on: boolean): void {
     if (this.#enabled === on) return;
     this.#enabled = on;
+    // ⛔ 로그 문구는 번역 범위 밖이다 (I-1, 사용자가 좁혔다) — 접힌 `#logWrap`
+    //    안에만 쌓이는 글자다. 한국어 그대로 둔다.
     this.#hooks.log?.(`텍스처 ${on ? '켬' : '끔'}`);
     this.#emit();
   }
