@@ -39,6 +39,8 @@ export type Request =
   | { id: number; op: 'loadDraping' }
   | { id: number; op: 'surfaces' }
   | { id: number; op: 'setSurfaceSize'; uuid: string; width?: number; height?: number }
+  | { id: number; op: 'fabrics' }
+  | { id: number; op: 'setFabric'; surface: string; fabricId: string }
   | { id: number; op: 'design2d' }
   | { id: number; op: 'meshInfo' }
   | { id: number; op: 'meshData'; topology?: boolean }
@@ -751,6 +753,61 @@ export interface SurfaceInfo {
 
 export interface SurfacesResult {
   surfaces: SurfaceInfo[];
+}
+
+// ── 직물 (UI #50) ───────────────────────────────────────────
+//
+// 데스크톱의 `Pattern ▸ Fabric` 콤보와 같은 것이다 — 재단 조각 하나를 고르고
+// 원단을 고르면 그 조각이 그 원단이 된다. 출처·필터도 데스크톱과 같다
+// (`zwMaterialManager::GetFabricRootFolder()` 의 `Preset` / `In file` 두 폴더).
+//
+// ⚠️⚠️ **이 설치본에는 `Preset` 이 없다.** 실측(2026-08-12): 씬을 열기 전에는
+//    0개, 연 뒤에는 **씬 내장 2개뿐**이다(`fabric_custom` 이 비어 있고 프리셋
+//    폴더는 디스크에 아예 없다). 즉 지금 할 수 있는 일은 "그 옷이 이미 쓰는
+//    직물끼리 재배정" 이고, "라이브러리에서 새 원단 고르기" 가 아니다.
+//    **기능이 좁은 것이 아니라 이 머신에 원단이 없는 것이다** — 원단이 있는
+//    환경에서는 그대로 다 뜬다.
+
+export interface FabricInfo {
+  /** 직물 자산 id. `setFabric` 에 그대로 돌려준다 */
+  id: string;
+  name: string;
+  /** `inFile` = `.zls` 안에 든 것(이 옷이 실제로 입은 것), `preset` = 설치본 라이브러리 */
+  source: 'preset' | 'inFile';
+  custom: boolean;
+  /** 앞면 basecolor 에 텍스처 경로가 있는가 */
+  hasTexture: boolean;
+  /**
+   * ★ **그 경로의 파일이 실제로 있는가.** 경로가 있다고 파일이 있는 것이
+   * 아니다 — 프리셋 직물이 가리키는 `Default_Base_Color.png` 가 이 설치본에
+   * 없고, 그런 것을 고르면 게이트웨이가 텍스처를 거절해 화면에 `⚠ 거절` 이
+   * 뜬다(액세서리 작업에서 실제로 밟았다). **고르기 전에 알 수 있어야 한다.**
+   */
+  textureExists: boolean;
+}
+
+export interface FabricsResult {
+  /** 씬을 열기 전에는 비어 있을 수 있다 — 씬 내장 직물은 로드해야 채워진다 */
+  fabrics: FabricInfo[];
+}
+
+export interface SetFabricResult {
+  surface: string;
+  fabricId: string;
+  /** 입힌 직물의 이름 */
+  name: string;
+  /**
+   * **되읽은 값이다** — 요청의 메아리가 아니다. 그 서피스를 쓰는 패턴의
+   * `GetFrontMaterial()` 을 적용 뒤 다시 읽었다. 비어 있으면 그 서피스를 쓰는
+   * 패턴을 못 찾았다는 뜻이다.
+   */
+  applied: {
+    fabricUuid: string;
+    /** `[r, g, b]`, 각 0~1 */
+    color: [number, number, number];
+    roughness: number;
+    hasTexture: boolean;
+  } | Record<string, never>;
 }
 
 // ── 디자인 기반 2D (D2-a) ───────────────────────────────────

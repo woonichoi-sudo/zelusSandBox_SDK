@@ -2652,6 +2652,9 @@ async function main(): Promise<void> {
         ['loadDraping', true],
         // 옷 사이즈 (L-3b). uuid 검증은 워커가 한다 — 게이트웨이는 타입만 본다.
         ['surfaces', true], ['setSurfaceSize', true],
+        // 직물 (UI #50). 읽기는 인자가 없고 씬도 요구하지 않는다. 쓰기는 build 가
+        // surface·fabricId 둘 다 요구한다 — extra 참고.
+        ['fabrics', true], ['setFabric', true],
         // 디자인 2D (D2-a). 읽기 전용이라 build 가 없다 — 인자가 없는 op 이다.
         ['design2d', true],
         ['meshInfo', true], ['meshData', true],
@@ -2672,6 +2675,9 @@ async function main(): Promise<void> {
         // build 가 비어 있지 않은 measurements 를 요구한다. 없으면(또는 `{}` 면)
         // 차단이 아니라 **거절**로 떨어져서 화이트리스트 판정이 무의미해진다.
         setAvatarMeasurements: { measurements: { Waist: 70 } },
+        // build 가 둘 다 요구한다. 없으면 차단이 아니라 **거절**로 떨어져서
+        // 화이트리스트가 막은 것과 구분되지 않는다.
+        setFabric: { surface: 'x', fabricId: 'y' },
       };
 
       let id = 100;
@@ -2692,9 +2698,9 @@ async function main(): Promise<void> {
       //   실제로 W-1/AM-1 의 op 3개(setAvatarMeasurements·loadDraping·avatarMesh)를
       //   이 단언이 잡아냈다. 아래 집합 비교와 짝이라 하나만으로는 부족하다:
       //   집합 비교는 **허용된 것**만 보므로 차단 op 이 늘어도 안 걸린다.
-      check('표가 프로토콜 op 26개를 전부 덮는다', TABLE.length === 26, `${TABLE.length}개`);
+      check('표가 프로토콜 op 28개를 전부 덮는다', TABLE.length === 28, `${TABLE.length}개`);
       check(
-        'allowedOps()가 허용 25개와 정확히 일치 (거부 문구에 실리는 목록)',
+        'allowedOps()가 허용 27개와 정확히 일치 (거부 문구에 실리는 목록)',
         allowedOps().slice().sort().join(',')
           === TABLE.filter(([, a]) => a).map(([o]) => o).sort().join(','),
         allowedOps().join(','),

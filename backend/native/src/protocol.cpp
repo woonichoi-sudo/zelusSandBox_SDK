@@ -42,11 +42,18 @@
 #include <LumiaVersion.h>
 #include <ZelusVersion.h>
 
+// 직물 목록 (`fabrics` op). **앱 코드다** — SDK 가 아니라 `zelusSandBox/core/`
+// 이고 우리 CMakeLists 가 이미 컴파일한다(zwMaterialManager.cpp·zwFabricMaterial.cpp).
+// GL 에 닿지 않는 이유는 `ReadFabrics` 머리말 참고.
+#include "core/zwFabricMaterial.h"
+#include "core/zwMaterialManager.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <cmath>
 #include <condition_variable>
 #include <deque>
@@ -782,6 +789,218 @@ json ReadSurfaces(ZestManager& manager)
     }
 
     return json{ { "surfaces", items } };
+}
+
+// ── 직물 목록 (UI #50) ──────────────────────────────────────
+//
+// **데스크톱과 같은 출처·같은 필터다** (`MainGUI.cpp:1090-1105`):
+// `zwMaterialManager::GetFabricRootFolder()` 아래에서 폴더 **둘만** 본다 —
+// 프리셋과 씬 내장(in-file). 다른 폴더(사용자 라이브러리 등)를 우리가 임의로
+// 더하면 데스크톱과 목록이 갈린다.
+//
+// ── ★ `zwMaterialManager` 를 쓰는데 GL 에 안 닿는다 ──────────
+//
+// 이 파일의 다른 자리(`materials-a`)가 **`zwMaterialManager` 를 일부러 피했다** —
+// "헤드리스에서 GL 텍스처 생성에 닿는 알려진 위험 경로" 라고 적어 두고 씬에서
+// 직접 읽었다. 그 경고는 맞지만 **함수 단위로 갈린다**:
+//
+//   `ParseFile` → `InitTextureOriginalSize` → `zsTexture::createAndLoadTexture`
+//       (zwMaterialManager.cpp:2075)  ← GL. **폴더를 스캔할 때** 돈다
+//   `GetFabricRootFolder()`           ← 이미 만들어진 트리를 읽기만 한다
+//   `LoadIntoMaterial` → `ConvertToDesignMaterialData` (:1169)
+//       ← 경로 문자열과 스칼라만 만든다. **GL 없음**
+//
+// 폴더 스캔은 `ZestManager::Initialize()` 때 이미 끝나 있고 그것이 헤드리스에서
+// 통과한다는 것은 확인된 사실이다. 그래서 이 두 접근자는 안전하다.
+//
+// ⚠️ **텍스처 파일이 실제로 있는지 함께 싣는다.** 프리셋 직물이 가리키는
+//    `Default_Base_Color.png` 가 **이 설치본에 없다** — 액세서리 작업에서
+//    그것 때문에 게이트웨이가 거절하고 화면에 `⚠ 거절 1칸` 이 떴다. 없는 것을
+//    고를 수 있게 두면 같은 잡음이 사용자 손에서 재현된다. 고르기 전에 알 수
+//    있어야 한다.
+
+/** 폴더 하나 안의 직물을 `out` 에 담는다 */
+void CollectFabrics(const std::shared_ptr<zwMaterialFolder>& folder,
+                    const char* source, json& out)
+{
+    if (!folder) return;
+
+    for (const auto& zfm : folder->zfms)
+    {
+        if (!zfm) continue;
+
+        // 앞면 basecolor 의 텍스처 경로. 없으면 색만 있는 직물이다.
+        const ztString texPath =
+            zwFabricMaterial::TryGetTexturePath(zfm->front.basecolor, zfm->pathToZfm);
+        const std::string tex = texPath.toStdString();
+
+        out.push_back(json{
+            { "id",     Utf8(zfm->id) },
+            { "name",   Utf8(zfm->name) },
+            // `preset` / `inFile`. 화면이 둘을 갈라 보여줄 수 있어야 한다 —
+            // 씬 내장은 이 옷이 실제로 쓰는 직물이고 프리셋은 라이브러리다.
+            { "source", source },
+            { "custom", zfm->isCustom },
+            { "hasTexture", !tex.empty() },
+            // ⚠️ **경로가 있다고 파일이 있는 것이 아니다** (위 주석). 화면이
+            //    이 값으로 "고르면 무늬가 빠진다" 를 미리 말할 수 있다.
+            { "textureExists", !tex.empty() && std::filesystem::exists(std::filesystem::u8path(tex)) },
+        });
+    }
+}
+
+/** id 로 직물 하나를 찾는다. 못 찾으면 null (목록과 **같은 두 폴더**만 본다) */
+std::shared_ptr<zwFabricMaterial> FindFabric(const std::string& id)
+{
+    const std::shared_ptr<zwMaterialFolder> root = zwMaterialManager::GetFabricRootFolder();
+    if (!root || id.empty()) return nullptr;
+
+    for (const auto& folder : root->Folders)
+    {
+        if (!folder) continue;
+        if (folder->Name != zwMaterialManager::ZS_PRESET_FOLDER_NAME
+            && folder->Name != zwMaterialManager::ZS_IN_FILE_FOLDER_NAME) continue;
+
+        for (const auto& zfm : folder->zfms)
+        {
+            // 목록이 실은 것과 **같은 문자열**로 찾는다. 여기서 다른 키를 쓰면
+            // 화면이 고른 것과 우리가 찾는 것이 갈린다.
+            if (zfm && Utf8(zfm->id) == id) return zfm;
+        }
+    }
+    return nullptr;
+}
+
+json ReadFabrics()
+{
+    json items = json::array();
+
+    const std::shared_ptr<zwMaterialFolder> root = zwMaterialManager::GetFabricRootFolder();
+    if (root)
+    {
+        for (const auto& folder : root->Folders)
+        {
+            if (!folder) continue;
+            if (folder->Name == zwMaterialManager::ZS_PRESET_FOLDER_NAME)
+                CollectFabrics(folder, "preset", items);
+            else if (folder->Name == zwMaterialManager::ZS_IN_FILE_FOLDER_NAME)
+                CollectFabrics(folder, "inFile", items);
+        }
+    }
+
+    return json{ { "fabrics", items } };
+}
+
+/**
+ * 서피스 하나에 직물을 입힌다 (UI #50).
+ *
+ * 데스크톱과 **같은 3단계**다(`MainGUI.cpp:298-312`):
+ *   ① 고른 직물(`zwFabricMaterial`)을 찾고
+ *   ② `LoadIntoMaterial` 로 `ztDesignMaterialData` 로 바꾼 뒤
+ *   ③ `ZestManager::SetFabricMaterial(surfaceUuid, data)` 에 넘긴다
+ *
+ * **한 번에 서피스 하나다.** `setSurfaceSize` 와 같은 판단이다 — 여러 개를 모아
+ * 보내면 중간에 하나가 실패했을 때 "일부만 적용됨" 이라는 상태를 화면이
+ * 표현해야 하는데, 하나씩 보내면 그 상태가 아예 생기지 않는다. 데스크톱도
+ * 콤보 하나에 서피스 하나다.
+ *
+ * ── ★ 되읽어서 실어 준다 ────────────────────────────────────
+ *
+ * 이 파일의 규약이다 — 요청값을 메아리치면 엔진이 아무 일도 안 했을 때조차
+ * 성공으로 보인다. 적용 뒤 그 서피스를 쓰는 패턴의 `GetFrontMaterial()` 을
+ * 다시 읽어 색과 텍스처를 응답에 담는다.
+ *
+ * ⚠️ **화면이 이 응답만으로 새 색을 그리지는 못한다.** 옷 색은 `meshData` 의
+ *    `topology` 페이로드 안에 있고, 클라이언트는 그것을 최초 1회만 받는다
+ *    (그렇게 정한 근거가 "한 세션 안에서 상수" 였는데 이 op 이 그 근거를
+ *    깨뜨린다 — meshData 주석에 예고돼 있다). **그래서 화면은 적용 뒤
+ *    `restageTopology` 로 토폴로지를 다시 받아야 한다.** L-3d 가 옷 사이즈
+ *    때문에 만들어 둔 그 갈래를 그대로 쓰면 된다(씬을 다시 열지 않는다).
+ *    안 부르면 증상은 **"적용 버튼이 안 먹는다"** 로 보인다.
+ */
+json SetSurfaceFabric(ZestManager& manager, ztSceneQueryInterface* qi,
+                      const std::string& surfaceUuidStr, const std::string& fabricId,
+                      bool& ok, std::string& error)
+{
+    ok = false;
+
+    const std::shared_ptr<zwFabricMaterial> zfm = FindFabric(fabricId);
+    if (!zfm)
+    {
+        error = "직물을 찾을 수 없습니다: " + fabricId;
+        return json::object();
+    }
+
+    // ⚠️ **uuid 문자열을 되파싱하지 않는다** — 위 `ReadSurfaces` 머리말의 규칙을
+    //    그대로 따른다. `ztUuidSaver::Convert(string)` 이 `GetString()` 과 같은
+    //    형식이라는 보장이 헤더에 없고, 어긋나면 "없는 서피스" 로 조용히 실패해
+    //    화면에서는 "적용했는데 아무 일도 안 일어난다" 로만 보인다. 목록을 돌며
+    //    비교하면 그 위험이 원리적으로 없다(서피스 24개, 비용 없음).
+    // ⚠️⚠️ **`ReadSurfaces` 가 싣는 것과 같은 함수로 비교해야 한다.** 저쪽은
+    //    `entry.first.GetString()` 이고 `ztUuidSaver::Convert` 와 **형식이 다르다** —
+    //    실측: 같은 서피스가 `007C7IvlTV0/000000000W3`(GetString) 와
+    //    `356924893322900/150000`(Convert) 로 나온다. 처음에 Convert 로 비교했다가
+    //    전부 "서피스를 찾을 수 없습니다" 로 떨어졌다. 위 머리말이 경고한 그
+    //    함정에 **경고를 적어 둔 파일 안에서** 걸린 것이다.
+    ztUuid surfaceUuid;
+    bool found = false;
+    for (const auto& entry : manager.GetSurfaceInfos())
+    {
+        if (entry.first.GetString() != surfaceUuidStr) continue;
+        surfaceUuid = entry.first;
+        found = true;
+        break;
+    }
+    if (!found)
+    {
+        error = "서피스를 찾을 수 없습니다: " + surfaceUuidStr;
+        return json::object();
+    }
+
+    ztDesignMaterialData data;
+    // ⚠️ 기본 생성자가 프리셋 직물의 텍스처를 이미 물고 있다(액세서리에서 밟았다).
+    //    여기서는 `LoadIntoMaterial` 이 **통째로 대입**하므로(`*material = ...`)
+    //    남지 않는다 — 그래도 이 사실은 적어 둔다. 직접 채우는 코드가 생기면
+    //    다시 문제가 된다.
+    zwMaterialManager::LoadIntoMaterial(&data, *zfm);
+    manager.SetFabricMaterial(surfaceUuid, data);
+
+    // ── 되읽기 ──────────────────────────────────────────────
+    json applied = json::object();
+    if (qi)
+    {
+        for (const auto& entry : qi->GetClothPatterns())
+        {
+            const ztDesignClothPattern* pattern = entry.second.get();
+            if (!pattern) continue;
+            // 위와 같은 이유로 `GetString()` 이다.
+            const ztDesignSurface* surface = pattern->GetSurface();
+            if (!surface || surface->GetUuid().GetString() != surfaceUuidStr) continue;
+
+            if (const ztDesignMaterial* m = pattern->GetFrontMaterial())
+            {
+                const ztDesignMaterialData& d = m->GetMaterialData();
+                // ⚠️ `basecolor` 는 `zsVector4` 라 `.r/.g/.b` 가 아니라 `.x/.y/.z` 다.
+                //    `.w` 는 불투명도가 아니다 — 그건 `alpha` 다(meshData 주석 참고).
+                applied = json{
+                    { "fabricUuid", ztUuidSaver::Convert(d.assetUuid) },
+                    { "color", json::array({ d.basecolor.x, d.basecolor.y, d.basecolor.z }) },
+                    { "roughness", d.roughness },
+                    { "hasTexture", !d.basecolorTexture.empty() },
+                };
+            }
+            break;
+        }
+    }
+
+    ok = true;
+    return json{
+        { "surface",  surfaceUuidStr },
+        { "fabricId", fabricId },
+        { "name",     Utf8(zfm->name) },
+        // 되읽은 값. 비어 있으면 그 서피스를 쓰는 패턴을 못 찾았다는 뜻이다.
+        { "applied",  applied },
+    };
 }
 
 /**
@@ -2738,6 +2957,36 @@ int RunProtocolLoop(ZestManager& manager)
                         maxFrame.store(-1);
                         curFrame.store(-1);
                         lastEmitted = -1;
+                    }
+                }
+            }
+            else if (op == "fabrics")
+            {
+                // ⚠️ **씬을 요구하지 않는다.** 목록은 설치본의 라이브러리이고
+                //    씬과 무관하다 — 다만 씬 내장(in-file) 직물은 씬을 열어야
+                //    채워지므로, 씬 없이 부르면 프리셋만 온다. 그것이 거짓말은
+                //    아니다(그때는 정말 그것뿐이다).
+                result = ReadFabrics();
+            }
+            else if (op == "setFabric")
+            {
+                if (!manager.IsLoadedZls())
+                {
+                    ok = false; error = "씬이 로드되지 않았습니다";
+                }
+                else
+                {
+                    const std::string surfaceUuid = req.value("surface", std::string{});
+                    const std::string fabricId    = req.value("fabricId", std::string{});
+                    if (surfaceUuid.empty() || fabricId.empty())
+                    {
+                        ok = false;
+                        error = "surface 와 fabricId 가 필요합니다";
+                    }
+                    else
+                    {
+                        result = SetSurfaceFabric(manager, QueryInterface(manager),
+                                                  surfaceUuid, fabricId, ok, error);
                     }
                 }
             }

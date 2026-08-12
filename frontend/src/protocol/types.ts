@@ -54,6 +54,13 @@ export type {
   // 옷 사이즈 (L-3b). 크기는 cm 다
   SurfaceInfo,
   SurfacesResult,
+  // 직물 (UI #50). ⚠️ 이 설치본에는 프리셋이 없어 **씬 내장뿐**이다 —
+  // 목록이 2개인 것은 고장이 아니다. 원본 주석에 실측이 있다.
+  // ⚠️ `setFabric` 뒤에는 **토폴로지를 다시 받아야** 색이 바뀐다(`material` 이
+  //    `meshData` 의 topology 페이로드 안이라 최초 1회만 온다).
+  FabricInfo,
+  FabricsResult,
+  SetFabricResult,
   // 디자인 기반 2D (D2-a). ★ 좌표가 **월드 2D 다** — 화면이 transform2d 를
   // 다시 곱하면 두 번 적용된다. 원본 주석 참고
   Design2DCurve,

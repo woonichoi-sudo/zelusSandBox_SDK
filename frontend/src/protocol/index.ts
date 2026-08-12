@@ -92,6 +92,10 @@ export type {
   // 옷 사이즈 (L-3b)
   SurfaceInfo,
   SurfacesResult,
+  // 직물 (UI #50)
+  FabricInfo,
+  FabricsResult,
+  SetFabricResult,
   // 디자인 기반 2D (D2-a)
   Design2DCurve,
   Design2DResult,

@@ -19,6 +19,8 @@ import {
   type LoadDrapingResult,
   type SetAvatarBodyResult,
   type SetAvatarMeasurementsResult,
+  type FabricsResult,
+  type SetFabricResult,
   type SurfacesResult,
   type Design2DResult,
   type SetParamsResult,
@@ -294,6 +296,29 @@ export class Session extends EventEmitter {
    */
   setSurfaceSize(uuid: string, size: { width?: number; height?: number }): Promise<SurfacesResult> {
     return this.#call('setSurfaceSize', { uuid, ...size });
+  }
+
+  /**
+   * 고를 수 있는 직물 목록 (UI #50).
+   *
+   * ⚠️ **씬을 열기 전에는 비어 있다** — 씬 내장 직물이 그때 채워진다.
+   *    그리고 이 설치본에는 프리셋이 없어 **씬 내장뿐**이다(`FabricsResult` 주석).
+   */
+  fabrics(): Promise<FabricsResult> {
+    return this.#call('fabrics');
+  }
+
+  /**
+   * 서피스(재단 조각) 하나에 직물을 입힌다. **한 번에 하나다** —
+   * `setSurfaceSize` 와 같은 판단이다(부분 적용 상태를 안 만든다).
+   *
+   * ⚠️ **화면은 이 응답만으로 새 색을 그리지 못한다.** 옷 색은 `meshData` 의
+   *    `topology` 페이로드 안에 있고 클라이언트는 그것을 최초 1회만 받는다.
+   *    적용 뒤 **토폴로지를 다시 받아야** 한다(프론트의 `restageTopology`).
+   *    안 하면 증상이 "적용 버튼이 안 먹는다" 로 보인다.
+   */
+  setFabric(surface: string, fabricId: string): Promise<SetFabricResult> {
+    return this.#call('setFabric', { surface, fabricId });
   }
 
   /**

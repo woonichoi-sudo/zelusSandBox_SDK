@@ -392,6 +392,25 @@ const buildSetSurfaceSize: Build = (msg) => {
 };
 
 /**
+ * setFabric: 서피스 하나에 직물 하나 (UI #50).
+ *
+ * 둘 다 필수다 — `setSurfaceSize` 가 "둘 중 하나만" 인 것과 다른 이유는,
+ * 저쪽은 **안 준 축을 지금 값으로 채울 수 있는** 반면 여기는 대상도 값도
+ * 대신할 것이 없어서다. 하나라도 빠지면 무엇을 어디에 입힐지가 정해지지 않는다.
+ */
+const buildSetFabric: Build = (msg) => {
+  const out: Record<string, string> = {};
+  for (const k of ['surface', 'fabricId'] as const) {
+    const v = msg[k];
+    if (typeof v !== 'string' || v === '') {
+      reject(`${k} 필드가 필요합니다 (문자열, 받은 값: ${describe(v)})`);
+    }
+    out[k] = v;
+  }
+  return { payload: out };
+};
+
+/**
  * export: 클라이언트는 **형식만** 준다. 산출물 위치는 서버가 정한다 (#10).
  *
  *   { id, op: 'export' }                    → gltf
@@ -664,6 +683,17 @@ const OPS: Record<Op, OpRule> = {
   // 미리 목록을 들고 있으려면 게이트웨이가 씬 상태를 따라다녀야 하는데,
   // 그건 세션이 이미 하는 일을 두 번 하는 것이고 갈라지면 더 나쁘다.
   setSurfaceSize: { allow: true, build: buildSetSurfaceSize },
+
+  // ── 직물 (UI #50) ─────────────────────────────────────────
+  //
+  // 읽기는 씬 없이도 받는다 — 목록은 설치본의 라이브러리이고 씬과 무관하다.
+  // (다만 이 설치본에는 프리셋이 없어 실제로는 씬 내장뿐이다. 워커 주석 참고.)
+  fabrics: { allow: true },
+
+  // 쓰기. `setSurfaceSize` 와 같은 판단으로 **uuid 검증은 워커에 맡긴다** —
+  // 게이트웨이가 씬 상태를 따라다니면 세션이 이미 하는 일을 두 번 하게 되고,
+  // 갈라지면 더 나쁘다. 여기서는 **모양만** 본다.
+  setFabric: { allow: true, build: buildSetFabric },
 
   // ── 디자인 기반 2D (D2-a) ─────────────────────────────────
   //

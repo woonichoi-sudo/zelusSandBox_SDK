@@ -48,6 +48,8 @@ import {
   type LoadDrapingResult,
   type SetAvatarBodyResult,
   type SetAvatarMeasurementsResult,
+  type FabricsResult,
+  type SetFabricResult,
   type SurfacesResult,
   type Design2DResult,
   type SetParamsResult,
@@ -591,6 +593,26 @@ export class GatewayClient {
    */
   setSurfaceSize(uuid: string, size: { width?: number; height?: number }): Promise<SurfacesResult> {
     return this.request<SurfacesResult>('setSurfaceSize', { uuid, ...size });
+  }
+
+  /**
+   * 고를 수 있는 직물 목록 (UI #50).
+   *
+   * ⚠️ **씬을 연 뒤에 불러야 한다** — 씬 내장 직물이 그때 채워진다.
+   */
+  fabrics(): Promise<FabricsResult> {
+    return this.request<FabricsResult>('fabrics');
+  }
+
+  /**
+   * 재단 조각 하나에 직물을 입힌다. **한 번에 하나다.**
+   *
+   * ⚠️ **이 응답만으로 색이 바뀌지 않는다.** 옷 색은 `meshData` 의 topology
+   *    페이로드 안이라 화면은 최초 1회만 받았다 — 적용 뒤 `restageTopology`
+   *    로 다시 받아야 한다. 안 하면 "적용 버튼이 안 먹는다" 로 보인다.
+   */
+  setFabric(surface: string, fabricId: string): Promise<SetFabricResult> {
+    return this.request<SetFabricResult>('setFabric', { surface, fabricId });
   }
 
   /**

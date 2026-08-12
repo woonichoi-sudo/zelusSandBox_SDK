@@ -1154,20 +1154,22 @@ async function main(): Promise<void> {
         // 그때 증상은 **원단을 바꿔도 색이 그대로**이고, 크래시도 에러도 없어서
         // "적용 버튼이 안 먹는다"로 보인다. UI 배선 문제로 오진하기 딱 좋다.
         //
-        // 그 미래를 테스트로 지킬 방법은 "없는 것을 단언하는 것" 뿐이다. 워커가
-        // `setFabric` 을 아직 모른다는 사실 자체를 못박아 두면, 그 op 이 생기는
-        // 순간 이 줄이 **빨간불**이 되어 게이팅을 다시 보게 만든다. 값도 화면도
-        // 아무것도 안 바뀌는 변경을 잡을 수 있는 유일한 자리다.
-        {
-          const probe = await session.worker
-            .request('setFabric' as never, { patterns: [], fabricUuid: 'x' })
-            .then(() => '성공해버렸다', (e: unknown) => (e instanceof Error ? e.message : String(e)));
-          check(
-            '★★★ 워커가 아직 setFabric 을 모른다 — 이 op 이 생기는 순간 material 의 topology 게이팅을 다시 봐야 한다',
-            probe.includes('알 수 없는 op'),
-            probe,
-          );
-        }
+        // ── ✅ 그 미래가 왔다 (2026-08-12, UI #50) ──────────────
+        //
+        // 여기 있던 단언은 **"워커가 아직 `setFabric` 을 모른다"** 였다. 없는
+        // 것을 단언해 두면 그 op 이 생기는 순간 빨간불이 되어 게이팅을 다시
+        // 보게 만드는 장치였고, **실제로 그렇게 걸렸다.**
+        //
+        // 다시 본 결과: **게이팅은 그대로 둔다.** `material` 은 여전히
+        // `topology` 안이고 프레임마다 보내지 않는다 — 바뀌는 순간이 사용자가
+        // 버튼을 누른 그때뿐이라 그 자리에서 **토폴로지를 다시 받으면 된다.**
+        // L-3d 가 옷 사이즈 때문에 만들어 둔 `restageTopology`(씬을 다시 열지
+        // 않고 `meshData(true)` 만 다시 받는 갈래)가 정확히 그것이다.
+        //
+        // 그래서 이 자리의 이빨은 아래 §5.13 으로 옮겼다 — **`setFabric` 뒤에
+        // `meshData(true)` 가 실제로 다른 색을 준다**를 본다. 화면 쪽에서 그
+        // 갈래를 부르는지는 프론트 스모크가 소스로 대조한다.
+        note('§5.9 게이팅', 'setFabric 이 생겼다 — material 은 topology 유지, 재수신은 restageTopology (§5.13 참고)');
       }
     }
 
@@ -1626,6 +1628,123 @@ async function main(): Promise<void> {
       // 다시 읽는다 — 셰이퍼는 되돌리는 연산이 따로 없다.
       await session.clear();
       await session.load(ZLS);
+    }
+
+    // ── 5.13 직물 갈아입히기 (UI #50) ──────────────────────
+    //
+    // ★ 이 절이 §5.9 의 덫을 이어받는다. 거기서 지키던 것은 "`material` 이
+    //   `topology` 안에 있는데 그걸 바꿀 op 이 생기면, 클라이언트가 최초 1회
+    //   받은 색을 계속 써서 **원단을 바꿔도 화면이 그대로**가 된다" 였다.
+    //   여기서 재는 것은 그 반대편이다 — **`meshData(true)` 를 다시 받으면
+    //   실제로 다른 색이 온다.** 그것이 성립해야 화면의 `restageTopology` 가
+    //   의미를 갖는다.
+    //
+    // ⚠️ 사용자 씬이 있어야 한다. `sample.zls` 는 패턴 5개가 **전부 흰색**이라
+    //    "바뀌었다" 를 색으로 판정할 수 없고, 직물도 갈리지 않는다.
+    {
+      const found = await findAccessoryScene(session);
+      const scene = found?.path ?? null;
+      if (!scene) {
+        note('§5.13 생략', '사용자 씬을 찾지 못했다 — 직물 갈아입히기는 이번 실행에서 미검증');
+      } else {
+        if (session.loadedPath !== scene) {
+          await session.clear();
+          await session.load(scene);
+        }
+        const { fabrics } = await session.fabrics();
+        const { surfaces } = await session.surfaces();
+        note('§5.13 직물', `${fabrics.length}개 — ${fabrics.map((f) => `${f.name}(${f.source})`).join(', ')}`);
+
+        // 전제 셋. 하나라도 무너지면 아래 판정이 헛돈다.
+        check(
+          '★ 전제: 직물이 2개 이상이라 "다른 것으로" 가 성립한다',
+          fabrics.length >= 2,
+          `${fabrics.length}개`,
+        );
+        check(
+          '직물마다 id·이름·출처가 있다',
+          fabrics.every((f) => f.id !== '' && f.name !== '' && (f.source === 'preset' || f.source === 'inFile')),
+          fabrics.map((f) => `${f.name}:${f.source}`).join(' '),
+        );
+        // ⚠️ 이 설치본에는 프리셋이 없다(protocol.ts 주석). **그것을 판정으로
+        //    삼지 않는다** — 원단이 깔린 환경에서는 늘어나는 것이 정상이고,
+        //    여기서 `=== 0` 을 못박으면 그런 환경에서 거짓 실패가 난다.
+        note('§5.13 프리셋', `${fabrics.filter((f) => f.source === 'preset').length}개 (이 설치본에는 없는 것이 정상이다)`);
+
+        // 색 분포로 판정한다 — 패턴에 `name` 이 비어 있어 이름으로는 못 짚는다.
+        const tally = (ps: readonly { material?: { color: readonly number[] } }[]): Map<string, number> => {
+          const m = new Map<string, number>();
+          for (const p of ps) {
+            const k = (p.material?.color ?? []).map((v) => v.toFixed(4)).join(',');
+            m.set(k, (m.get(k) ?? 0) + 1);
+          }
+          return m;
+        };
+        const before = tally((await session.meshData(true)).patterns);
+        check(
+          '★ 전제: 색이 두 종류 이상으로 갈려 있다 (한 색뿐이면 바뀌어도 못 본다)',
+          before.size >= 2,
+          `${before.size}종 — ${[...before.entries()].map(([, n]) => n).join('/')}`,
+        );
+
+        const target = surfaces[0];
+        const cur = (await session.meshData(true)).patterns[0]?.material?.fabricUuid ?? '';
+        const other = fabrics.find((f) => f.id !== cur) ?? fabrics[1] ?? fabrics[0];
+
+        const res = await session.setFabric(target?.uuid ?? '', other?.id ?? '');
+        check(
+          '★ 응답이 되읽은 값이다 (요청의 메아리가 아니다 — 색이 실려 온다)',
+          'color' in res.applied && Array.isArray((res.applied as { color: number[] }).color)
+          && (res.applied as { color: number[] }).color.length === 3,
+          JSON.stringify(res.applied),
+        );
+
+        const after = tally((await session.meshData(true)).patterns);
+        const keys = new Set([...before.keys(), ...after.keys()]);
+        const moved = [...keys].filter((k) => (before.get(k) ?? 0) !== (after.get(k) ?? 0));
+        const delta = moved.reduce((s2, k) => s2 + Math.abs((before.get(k) ?? 0) - (after.get(k) ?? 0)), 0) / 2;
+
+        // ⚠️ 색깔별로 **전→후를 짝지어** 찍는다. `[...values()]` 를 그냥 이으면
+        //    Map 삽입 순서가 바뀌면서 `16/8 → 9/15` 처럼 보여, 1개가 옮겨간 것을
+        //    7개로 오해하게 된다(실제로 읽다가 헷갈렸다).
+        const detail = [...keys]
+          .map((k) => `${(before.get(k) ?? 0)}→${(after.get(k) ?? 0)}`).join(' · ');
+        check(
+          '★★★ 직물을 바꾸면 `meshData(true)` 가 다른 색을 준다 (§5.9 의 덫이 지키던 바로 그것)',
+          moved.length > 0,
+          moved.length > 0
+            ? `색깔별 ${detail}`
+            : '분포가 그대로다 — 화면은 원단을 바꿔도 색이 안 변한다',
+        );
+        // ★ 번짐을 본다. `SetFabricMaterial` 이 서피스 하나만 건드려야 하는데
+        //   에셋을 공유하는 다른 패턴까지 끌려가면 "하나 골랐는데 열여섯이
+        //   바뀐다" 가 된다 — 실측으로는 정확히 1개다.
+        check(
+          '★★ 정확히 한 패턴만 옮겨간다 (에셋을 공유하는 다른 패턴으로 안 번진다)',
+          delta === 1,
+          `${delta}개 이동`,
+        );
+
+        // 없는 것을 고르면 조용히 넘어가지 않는다.
+        const badFabric = await session.setFabric(target?.uuid ?? '', 'no-such-fabric')
+          .then(() => '성공해버렸다', (e: unknown) => (e instanceof Error ? e.message : String(e)));
+        check(
+          '모르는 직물 id 는 에러다 (조용히 넘어가면 화면이 "적용됨" 으로 보인다)',
+          badFabric.includes('직물을 찾을 수 없습니다'),
+          badFabric,
+        );
+        const badSurface = await session.setFabric('no-such-surface', other?.id ?? '')
+          .then(() => '성공해버렸다', (e: unknown) => (e instanceof Error ? e.message : String(e)));
+        check(
+          '★ 모르는 서피스도 에러다 (uuid 형식이 갈려 조용히 실패하는 것을 막는다)',
+          badSurface.includes('서피스를 찾을 수 없습니다'),
+          badSurface,
+        );
+
+        // 다음 절이 깨끗한 옷에서 시작하도록 되돌린다.
+        await session.clear();
+        await session.load(ZLS);
+      }
     }
 
     // ── 6. 세션 재사용 ────────────────────────────────────
