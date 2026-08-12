@@ -243,12 +243,33 @@
         "key": "scene",
         "title": "B. 씬 인벤토리 & 편집 — 새 op 6개",
         "cost": "중간. ZestManager에 전부 있고 프로토콜에 노출만 안 돼 있다",
+        "status": "절반 완료 (2026-08-12에 실측으로 갱신). 5항목 중 2개가 다른 단위를 하다가 들어갔고, 1개는 좁은 형태로 들어갔다. ⚠️ 이 그룹은 2026-08-12까지 '전부 미착수'로 남아 있었다 — 남은 일 목록이 실제와 어긋나 있었으므로, 다른 그룹도 착수 전에 게이트웨이 OPS 테이블과 대조할 것(`backend/src/server/bridge.ts` 의 `OPS`가 현재 op의 정본이다)",
         "items": [
-          { "ui": [45, 46, 47], "op": "drapingItems / loadDrapingItem", "zest": "GetDrapingItems / LoadDrapingItem" },
-          { "ui": [49], "op": "surfaces", "zest": "GetSurfaceInfos + GetSurfaceSize" },
-          { "ui": [51, 52], "op": "setSurfaceSize", "zest": "UpdateSizeSurface" },
-          { "ui": [50], "op": "setFabric", "zest": "SetFabricMaterial" },
-          { "ui": [48], "op": "setEndPose", "zest": "SetEndPose" }
+          {
+            "ui": [45, 46, 47], "op": "drapingItems / loadDrapingItem", "zest": "GetDrapingItems / LoadDrapingItem",
+            "status": "partial",
+            "note": "**적용은 된다, 목록은 없다.** W-1(`2b6b3ce`·`0946a1a`)이 `loadDraping` op을 넣어 씬에 저장된 자동 드레이프를 입힌다 — 화면의 [👗 드레이프] 버튼이 그것이다. 남은 것은 **항목 목록 조회**(`GetDrapingItems`)와 그중 하나를 골라 적용하는 갈래다. 지금은 '자동 드레이프 하나'만 다룬다(없으면 `drape.noAutoItem`으로 말한다). ⚠️ ISSUE-024를 먼저 볼 것 — 드레이프를 적용하면 아바타가 통째로 바뀌어 체형 조절이 막히는 씬이 있다"
+          },
+          {
+            "ui": [49], "op": "surfaces", "zest": "GetSurfaceInfos + GetSurfaceSize",
+            "status": "done",
+            "note": "L-3b(`58c50f4`)에서 들어갔다. 워커·게이트웨이·SDK·프론트까지 이어져 있고 오른쪽 칸 '옷 사이즈' 탭이 이것을 쓴다"
+          },
+          {
+            "ui": [51, 52], "op": "setSurfaceSize", "zest": "UpdateSizeSurface",
+            "status": "done",
+            "note": "L-3b(`58c50f4`) + L-3d(`530bbff`). L-3d가 '적용해도 화면이 안 변하고 재생하면 되돌아간다'를 고쳤다 — 씬을 다시 열지 않고 토폴로지만 다시 받는 `restageTopology` 갈래가 그때 생겼다"
+          },
+          {
+            "ui": [50], "op": "setFabric", "zest": "SetFabricMaterial",
+            "status": "todo",
+            "note": "미착수. 직물을 바꾸면 색·무늬가 함께 바뀌므로 화면 체감이 가장 큰 남은 op이다. ⚠️ 텍스처 경로가 함께 바뀌므로 게이트웨이의 `TextureStore` 등록을 다시 타야 한다(경로만 싣는 설계라 재등록이 필요하다). ⚠️ 적용 뒤에는 `restageTopology`를 타야 화면이 따라온다 — `setSurfaceSize`가 밟은 것과 같은 함정이다(L-3d)"
+          },
+          {
+            "ui": [48], "op": "setEndPose", "zest": "SetEndPose",
+            "status": "todo",
+            "note": "미착수"
+          }
         ]
       },
       {
