@@ -48,6 +48,8 @@ import {
   TextureOptions,
   DrapingPanel,
   SideTabsPanel,
+  SideDrawerPanel,
+  narrowQuery,
   SurfaceSizePanel,
   PlaybackController,
   shortcutFor,
@@ -76,6 +78,7 @@ import {
   Design2DOptions,
   ParamsPanel,
   SideTabs,
+  SideDrawer,
   SurfacePanel,
   TextureSwitch,
 } from './ui/index.ts';
@@ -145,6 +148,10 @@ const ui = {
   sideTabs: el<HTMLElement>('sideTabs'),
   // 탭 전환 시 위치를 기억·복원할 스크롤 상자
   sideScroll: el<HTMLElement>('sideScroll'),
+  // 좁은 창에서 서랍이 될 칸 자체. 그 안의 탭·패널은 그대로 굴러간다
+  sidePanel: el<HTMLElement>('sidePanel'),
+  // 여닫기 버튼이 들어갈 상단 바
+  bar: el<HTMLElement>('bar'),
   // 2D 펼침 (#15-b). 슬라이더 하나와 글자 두 자리 — 판단은 `viewer2d/` 다.
   unfold: el<HTMLInputElement>('unfold'),
   unfoldStat: el<HTMLElement>('unfoldStat'),
@@ -770,6 +777,39 @@ new SideTabs({
   scroll: ui.sideScroll,
   panel: new SideTabsPanel(),
 });
+
+// ── 좁은 창에서는 그 칸이 서랍이 된다 ───────────────────────
+//
+// 여기 있는 것은 **`matchMedia` 를 위젯에 잇는 배선 세 줄**이다. 문턱은
+// `panels/sideDrawer.ts` 의 `NARROW_MAX_PX` 가 정본이고 CSS 에는 미디어
+// 쿼리가 없다 — 숫자를 두 곳에 두면 한쪽만 고치는 날 화면이 어긋난다.
+//
+// ⓘ 뷰포트 크기 갱신을 안 매단다. 두 뷰어가 `ResizeObserver` 로 자기 칸을
+//   보고 있어서 격자가 2열로 바뀌면 알아서 따라온다.
+{
+  const drawer = new SideDrawer({
+    body: document.body,
+    panel: ui.sidePanel,
+    bar: ui.bar,
+    state: new SideDrawerPanel(),
+    onChange: (open) => log(`설정 칸 ${open ? '펼침' : '접음'}`),
+  });
+
+  const mq = window.matchMedia(narrowQuery());
+  const sync = (): void => drawer.setNarrow(mq.matches);
+
+  // ★ 지금 상태를 **먼저 한 번** 반영한다. 리스너만 걸면 좁은 창으로 새로
+  //   연 사용자는 창을 한 번 흔들기 전까지 3분할이 찌그러진 화면을 본다.
+  sync();
+  mq.addEventListener('change', sync);
+  // ⚠️ **`matchMedia` 의 change 만 믿지 않는다.** 실측 — 브라우저 창을 도구로
+  //    800px 로 줄였을 때 `mq.matches` 는 `true` 가 됐는데 `change` 는 오지
+  //    않았다(뷰포트를 에뮬레이션으로 바꾸는 경로). 안 오면 칸이 찌그러진 채
+  //    그대로라 화면만 봐서는 원인을 읽을 수 없다.
+  //    `setNarrow` 는 바뀔 때만 다시 그리므로(안 바뀌면 불리언 비교 하나)
+  //    resize 마다 불러도 값이 싸다.
+  window.addEventListener('resize', sync);
+}
 
 // ── 재생 컨트롤 (#14) ───────────────────────────────────────
 //

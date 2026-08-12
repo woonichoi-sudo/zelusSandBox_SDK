@@ -8,6 +8,15 @@
       :root { color-scheme: dark; }
       * { box-sizing: border-box; }
       html, body { height: 100%; margin: 0; background: #1b1e24; color: #e6e9ef; }
+      /*
+        ⚠️ **`body` 의 `overflow: hidden` 만으로는 부족하다.** 아래 서랍이
+        닫혀 있을 때 `translateX(101%)` 로 화면 밖에 서 있는데, 그것이
+        문서를 넓혀서 **가로로 실제 스크롤이 됐다**(실측: 800px 창에서
+        `scrollWidth` 1188, `scrollLeft` 를 388 까지 밀 수 있었다). 스크롤바가
+        안 보여서 눈으로는 멀쩡한데 트랙패드로 옆으로 쓸면 빈 공간과 서랍이
+        끌려 나온다. 루트에서 못을 박는다.
+      */
+      html { overflow: hidden; }
 
       /*
         ── 3분할 골격 (L-1) ────────────────────────────────────────
@@ -43,17 +52,77 @@
         ③ 두 뷰포트가 `1fr : 1fr` 인 이유: 데스크톱 앱이 3D/2D 듀얼 뷰포트를
            같은 크기로 놓는다. 어느 쪽이 더 커야 하는지는 **실제로 2D 가
            들어와 봐야**(L-2) 알 수 있으므로 지금 기울여 두지 않는다.
-        ④ `24rem` 이 max 일 뿐 min 이 0 인 이유: 창이 좁아지면 설정 칸이 먼저
-           줄어드는 것이 맞다. 고정폭으로 두면 좁은 창에서 뷰포트가 0 이 된다.
+        ④ **min 이 0 이었다가 `20rem` 이 됐다.** 원래 근거는 "창이 좁아지면
+           설정 칸이 먼저 줄어드는 것이 맞다. 고정폭으로 두면 좁은 창에서
+           뷰포트가 0 이 된다" 였고, 그 자체는 옳았다. 문제는 **양쪽 다
+           나쁘다는 것**이다 — 최소가 0 이면 슬라이더 29개와 치수 25개가
+           들어 있는 칸이 250px 아래에서 이름과 숫자가 겹쳐 못 읽는다.
+
+           그래서 "좁으면 칸을 줄인다" 를 **"좁으면 칸을 격자에서 뺀다"** 로
+           바꿨다. 아래 `body.narrow` 가 그 갈래다. 칸이 없어지면 뷰포트가
+           자리를 다 쓰므로 min 을 박아도 안전하다.
       */
       body {
         font: 13px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
         overflow: hidden;
         display: grid;
-        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 24rem);
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(20rem, 24rem);
         /* 바는 자기 높이만큼(줄바꿈되면 두 줄), 나머지 전부가 칸 세 개 */
         grid-template-rows: auto minmax(0, 1fr);
       }
+
+      /*
+        ── 좁은 창: 세 번째 칸이 서랍이 된다 ─────────────────────
+
+        ★ **문턱(900px)이 여기 없다.** `src/panels/sideDrawer.ts` 의
+          `NARROW_MAX_PX` 하나가 정본이고, `main.ts` 가 `matchMedia` 로 듣고
+          `<body>` 에 `.narrow` 를 건다. 미디어 쿼리를 여기에 또 적으면 같은
+          숫자가 두 곳이 되고, 한쪽만 고치는 날 "버튼은 있는데 칸이 그대로"
+          가 된다.
+
+        ★ **`position: fixed` 를 쓰지 않았다.** 서랍이 상단 바를 덮으면 안
+          되는데 바 높이는 버튼이 줄바꿈되면 달라진다(`grid-template-rows` 의
+          `auto`). 대신 칸을 격자에 그대로 두고 **두 뷰포트와 같은 칸에 겹쳐**
+          오른쪽에 붙인다 — 격자가 이미 "바를 뺀 자리" 를 알고 있으므로 JS 가
+          잴 숫자가 없다.
+
+        `transform` 으로 미는 이유: `hidden`/`display:none` 으로 지우면 안쪽
+        패널이 크기 0 이 되고, 다시 열 때 `ui/sideTabs.ts` 가 기억해 둔 스크롤
+        위치가 0 으로 잘려 들어간다. `transform` 은 레이아웃을 안 건드린다.
+      */
+      body.narrow {
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      }
+
+      body.narrow #sidePanel {
+        grid-column: 1 / -1;
+        grid-row: 2;
+        justify-self: end;
+        width: min(24rem, 92vw);
+        z-index: 40;
+        background: #1a1e25;
+        border-left: 1px solid #2c333f;
+        box-shadow: -12px 0 28px rgba(0, 0, 0, 0.5);
+        /* 101% 는 그림자까지 화면 밖으로 뺀다. 100% 면 그림자가 가장자리에 남는다 */
+        transform: translateX(101%);
+        transition: transform 0.18s ease;
+        /* 닫힌 서랍이 화면 밖에서 클릭을 먹지 않게 한다. `inert` 를 지원하지
+           않는 브라우저에서 남는 마지막 방어이기도 하다 */
+        pointer-events: none;
+      }
+
+      body.narrow.sideOpen #sidePanel {
+        transform: none;
+        pointer-events: auto;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        body.narrow #sidePanel { transition: none; }
+      }
+
+      /* 여닫기 버튼은 `ui/sideDrawer.ts` 가 상단 바 끝에 만든다.
+         넓은 창에서는 `hidden` 이라 자리를 차지하지 않는다. */
+      #sideToggle { margin-left: 0.25rem; }
 
       /*
         칸의 공통 골격. **`position: relative` 는 장식이 아니라 배선이다** —
@@ -474,7 +543,7 @@
       파라미터는 #16. 여기에 그것들을 미리 넣지 말 것 — 각 단위가 자기 화면으로
       판정되는데, 버튼이 늘수록 무엇 때문에 실패했는지가 흐려진다.
     -->
-    <div class="bar">
+    <div class="bar" id="bar">
       <label for="scene">씬</label>
       <select id="scene"><option value="">불러오는 중…</option></select>
       <button id="load" disabled>로드</button>

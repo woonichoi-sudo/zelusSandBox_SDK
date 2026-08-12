@@ -174,3 +174,11 @@ export {
   type SideTabItem,
   type SideTabsView,
 } from './sideTabs.ts';
+
+export {
+  NARROW_MAX_PX,
+  narrowQuery,
+  SideDrawerPanel,
+  type SideDrawerMode,
+  type SideDrawerView,
+} from './sideDrawer.ts';
