@@ -117,11 +117,8 @@ const KO: Dict = {
   'bar.clear': '✕ 씬 내림',
   'bar.clear.title': '씬을 워커에서 내립니다. 다시 보려면 로드해야 합니다 (C)',
   'bar.drape': '👗 드레이프',
-  'bar.snap': '🧍 스냅샷',
-  'bar.snap.again': '🧍 다시 찍기',
-  'bar.snap.title': '지금 포즈를 glTF 로 내보내 아바타와 함께 세웁니다',
-  'bar.mode.live': '↩ 실시간',
-  'bar.mode.snapshot': '🧍 스냅샷 보기',
+  // ⛔ `bar.snap*` · `bar.mode.*` 는 2026-08-13 에 뺐다 (H-1) — 버튼 자체가
+  //    화면에서 내려갔다. 사유는 `index.html` 의 그 자리 주석에 있다.
   'bar.status.booting': '시작하는 중…',
 
   // ── 칸 안의 글자 ────────────────────────────────────────
@@ -435,11 +432,8 @@ const KO: Dict = {
   'stat.mesh': '패턴 {patterns} · 정점 {vertices} · 삼각형 {triangles}',
   'stat.frames': '프레임 {frame} · 적용 {applied} · 버림 {dropped} · {fps}fps',
   'stat.frames.stalled': ' · ⚠정지',
-  'snap.exporting': '익스포트 중… {sec}s',
-  'snap.downloading': '내려받는 중… {loaded}',
-  'snap.downloading.total': '내려받는 중… {loaded} / {total}',
-  'snap.parsing': 'glTF 를 여는 중… ({total})',
-  'snap.summary': '스냅샷 {bytes} · 메시 {meshes} · 정점 {vertices} · 머티리얼 {materials} · 텍스처 {textures}',
+  // ⛔ `snap.*` 진행률·요약 문구는 2026-08-13 에 뺐다 (H-1) — 그 글자를 찍던
+  //    `#snapstat` 자리가 화면에서 내려갔다.
 
   // ── 상태줄 (#status) ────────────────────────────────────
   //
@@ -454,10 +448,8 @@ const KO: Dict = {
   'status.body.failed': '아바타 체형 적용 실패: {why}',
   'status.surface.failed': '옷 사이즈 적용 실패: {why}',
   'status.cleared': '씬을 내렸습니다 — 다시 보려면 [로드] 를 누르세요',
-  'status.snap.making': '스냅샷을 만드는 중… (아바타·머티리얼이 들어간 glTF 를 받습니다)',
-  'status.snap.showing': '스냅샷 표시 중 — {name}',
-  'status.snap.failed': '스냅샷 실패: {why}',
-  'status.mode.snapshot': '스냅샷 표시 중',
+  // ⛔ `status.snap.*` 와 `status.mode.snapshot` 은 2026-08-13 에 뺐다 (H-1).
+  //    `status.mode.live` 는 남는다 — `returnToLive()` 가 아직 부른다.
   'status.mode.live': '실시간 뷰 — 시뮬레이션 결과를 그립니다',
   'status.scenes.failed': '씬 목록을 읽지 못했습니다: {why}',
   'status.loading': '씬을 로드하는 중… (103MB 면 1초쯤 걸립니다)',
@@ -498,11 +490,8 @@ const EN: Dict = {
   'bar.clear': '✕ Unload',
   'bar.clear.title': 'Unloads the scene from the worker. Load it again to see it (C)',
   'bar.drape': '👗 Drape',
-  'bar.snap': '🧍 Snapshot',
-  'bar.snap.again': '🧍 Retake',
-  'bar.snap.title': 'Exports the current pose as glTF and shows it with the avatar',
-  'bar.mode.live': '↩ Live',
-  'bar.mode.snapshot': '🧍 Show snapshot',
+  // ⛔ `bar.snap*` · `bar.mode.*` — 한국어 사전과 같이 뺐다 (H-1). 두 벌의 키
+  //    집합은 대칭이어야 한다(스모크 §16-1) — 한쪽만 지우면 거기가 빨개진다.
   'bar.status.booting': 'Starting…',
 
   // ── 칸 안의 글자 ────────────────────────────────────────
@@ -804,11 +793,7 @@ const EN: Dict = {
   'stat.mesh': '{patterns} patterns · {vertices} vertices · {triangles} triangles',
   'stat.frames': 'frame {frame} · {applied} applied · {dropped} dropped · {fps}fps',
   'stat.frames.stalled': ' · ⚠stalled',
-  'snap.exporting': 'Exporting… {sec}s',
-  'snap.downloading': 'Downloading… {loaded}',
-  'snap.downloading.total': 'Downloading… {loaded} / {total}',
-  'snap.parsing': 'Opening the glTF… ({total})',
-  'snap.summary': 'Snapshot {bytes} · {meshes} meshes · {vertices} vertices · {materials} materials · {textures} textures',
+  // ⛔ `snap.*` — 한국어 사전과 같이 뺐다 (H-1)
 
   // ── 상태줄 (#status) ────────────────────────────────────
   'status.closed': 'The connection dropped (code={code})',
@@ -819,10 +804,7 @@ const EN: Dict = {
   'status.body.failed': 'Applying the body shape failed: {why}',
   'status.surface.failed': 'Applying the garment size failed: {why}',
   'status.cleared': 'The scene was unloaded — press [Load] to see it again',
-  'status.snap.making': 'Making a snapshot… (fetching a glTF with the avatar and materials)',
-  'status.snap.showing': 'Showing a snapshot — {name}',
-  'status.snap.failed': 'Snapshot failed: {why}',
-  'status.mode.snapshot': 'Showing a snapshot',
+  // ⛔ `status.snap.*` · `status.mode.snapshot` — 한국어 사전과 같이 뺐다 (H-1)
   'status.mode.live': 'Live view — drawing the simulation result',
   'status.scenes.failed': 'Could not read the scene list: {why}',
   'status.loading': 'Loading the scene… (about a second for 103MB)',

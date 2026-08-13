@@ -12,12 +12,18 @@
  * 사라지고 수동 확인만 남는다. 그래서 여기 있는 것은 (a) frame → `push`,
  * (b) rAF → `drain`, (c) 결과를 화면에 찍기, 셋뿐이다.
  *
- * ── 스냅샷이 여기 남긴 것도 배선이다 ────────────────────────
- * 익스포트한 glTF(아바타·머티리얼·텍스처가 든 정지 화면)를 세우는 순서는
- * `viewer3d/snapshot.ts` 가 전부 정한다. 이 파일에 있는 것은 버튼 두 개와
- * 진행률을 찍는 콜백뿐이다. **모드 전환은 `viewer.setMode` 한 곳만 부른다** —
- * 실시간 옷과 스냅샷은 좌표계가 달라(ISSUE-011) 겹쳐 보이면 안 되는데, 그
- * 불변식을 지키는 유일한 방법이 "visible 을 정하는 자리를 하나로 두는 것" 이다.
+ * ── ⛔ 스냅샷 배선은 2026-08-13 에 여기서 내려갔다 (H-1) ─────
+ * 버튼 두 개(`#snap`·`#mode`)와 진행률 슬롯(`#snapstat`), 그리고 그것들을
+ * 먹이던 `SnapshotLoader` 가 이 파일에서 사라졌다. 데스크톱 앱에 대응하는
+ * 기능이 없기 때문이다(회사 코드에 snapshot 0 건, 있는 것은 기능 #10
+ * `Export gltf` 뿐). 자세한 사유는 `index.html` 의 그 자리 주석에 있다.
+ *
+ * **모듈은 살아 있다** — `viewer3d/snapshot.ts` · `viewer3d/snapshotView.ts`
+ * 와 뷰어의 `live`/`snapshot` 모드 기계는 그대로다. 스모크 §8-8·§8-9·§8-10
+ * (단언 87건)이 그 위에서 익스포트 경로를 계속 검사한다 — ISSUE-012·013 이
+ * 열려 있는 동안 그것이 유일하게 감시하는 눈이다. 화면에서 스냅샷 모드로
+ * 들어가는 길이 없어졌을 뿐이라, 아래 `returnToLive()` 와
+ * `returnToLiveForPlayback()` 은 계약만 남고 실제로는 돌지 않는다.
  *
  * ── 재생 컨트롤(#14)이 여기 남긴 것도 배선이다 ──────────────
  * 상태(재생/정지/씬 없음/로드 중)와 전이는 전부 `panels/playback.ts` 에 있다.
@@ -69,7 +75,8 @@ import {
 } from './panels/index.ts';
 import {
   decodePatterns,
-  downloadExport,
+  // ⛔ `downloadExport` 는 스냅샷 로더만 쓰던 것이라 H-1 에서 같이 뗐다.
+  //    `protocol/http.ts` 의 함수 자체는 남아 있고 스모크 §8-10 이 쓴다.
   fetchHealth,
   GatewayClient,
   listScenes,
@@ -96,13 +103,12 @@ import {
   FrameStream,
   installTopology,
   showScene,
-  SnapshotLoader,
-  SnapshotStaleError,
+  // ⛔ `SnapshotLoader`·`SnapshotStaleError`·`ParsedSnapshot`·
+  //    `SnapshotLoaderStats` 는 H-1 에서 뗐다. **모듈은 그대로 있다** —
+  //    `viewer3d/index.ts` 가 계속 내보내고 스모크 §8-8·§8-9 가 쓴다.
   Viewer3D,
   type DecodedTopology,
   type FrameStreamStats,
-  type ParsedSnapshot,
-  type SnapshotLoaderStats,
 } from './viewer3d/index.ts';
 
 // ── 언어 (I-1) ──────────────────────────────────────────────
@@ -145,9 +151,8 @@ const ui = {
   // 저장된 드레이프 적용 (W-1). 사유·결과는 툴팁이 아니라 `#drapestat` 글자다
   drape: el<HTMLButtonElement>('drape'),
   drapestat: el<HTMLElement>('drapestat'),
-  snap: el<HTMLButtonElement>('snap'),
-  mode: el<HTMLButtonElement>('mode'),
-  snapstat: el<HTMLElement>('snapstat'),
+  // ⛔ `#snap`·`#mode`·`#snapstat` 은 H-1 에서 화면과 함께 뗐다. `el()` 은
+  //    없는 id 에 던지므로, 남겨 두면 첫 화면이 통째로 죽는다.
   sim: el<HTMLElement>('sim'),
   frames: el<HTMLElement>('frames'),
   stat: el<HTMLElement>('stat'),
@@ -206,7 +211,7 @@ function log(line: string): void {
 /**
  * ── 지난 문장을 **값이 아니라 다시 만드는 법으로** 기억한다 (I-1) ──
  *
- * 상태줄·메시 통계·스냅샷 요약은 한 번 찍히면 다음 조작까지 화면에 남는다.
+ * 상태줄·메시 통계·파일 이름은 한 번 찍히면 다음 조작까지 화면에 남는다.
  * 그동안 언어를 바꾸면 그 세 자리만 옛 언어로 굳는다 — 다시 그릴 근거(키와
  * 값)를 우리가 안 들고 있기 때문이다. 그래서 **찍는 함수 자체**를 슬롯에
  * 넣어 두고, 언어가 바뀌면 그대로 한 번 더 부른다.
@@ -214,7 +219,8 @@ function log(line: string): void {
  * 값을 저장하지 않는 이유: 값(패턴 24개, 4.3초…)과 키가 짝을 이뤄야 문장이
  * 되는데, 그 짝을 따로 들고 다니면 한쪽만 갱신되는 날이 온다.
  */
-type TextSlot = 'status' | 'stat' | 'snapstat' | 'filename';
+// ⛔ 'snapstat' 슬롯은 H-1 에서 뺐다 — 그 글자를 찍던 자리가 화면에 없다.
+type TextSlot = 'status' | 'stat' | 'filename';
 const slotPainters = new Map<TextSlot, () => void>();
 
 function say(slot: TextSlot, paint: (() => void) | null): void {
@@ -330,7 +336,6 @@ client.on('open', ({ reconnected, attempt }) => {
   refreshParams();
   if (!reconnected) return;
   log(`재연결됨 (${attempt}회) — 새 워커 세션이므로 씬을 다시 로드합니다`);
-  paintSnap();
   if (currentScene) void show(currentScene, { refit: false });
 });
 
@@ -340,10 +345,6 @@ client.on('close', ({ code, willReconnect }) => {
   playback.connectionLost();
   // 소켓이 없으면 파라미터를 읽을 수도 보낼 수도 없다. 패널이 그렇게 말해야 한다.
   refreshParams();
-  // 스냅샷은 **버리지 않는다.** 이미 화면에 서 있는 것은 소켓과 무관하게
-  // 유효한 정지 화면이라, 끊겼다고 지우면 볼 수 있는 것까지 사라진다.
-  // 새로 찍는 것만 막는다 (paintSnap 이 client.connected 를 본다).
-  paintSnap();
   statusT(willReconnect ? 'status.closed.retry' : 'status.closed', { code }, true);
   if (code === 1006 && !willReconnect) {
     // 브라우저는 핸드셰이크 거절의 본문을 못 읽는다. 되물어야 안다.
@@ -425,15 +426,14 @@ const stream = new FrameStream({
 // 그대로 돌린다. 카메라(원근 ↔ 정사영)는 `viewer3d/viewer.ts` 의 `setUnfold` 다.
 //
 // ── 배타 모드와 어떻게 맞물리는가 ───────────────────────────
-// **맞물리지 않는다 — 2D 는 세 번째 뷰가 아니다.** `ViewMode` 는 여전히
+// **맞물리지 않는다 — 2D 는 세 번째 뷰가 아니다.** 뷰어의 `ViewMode` 는 여전히
 // `live | snapshot` 둘뿐이고, 펼침은 **실시간 옷의 자세**를 바꾼다(같은 메시,
-// 같은 그룹, 정점만 이동). 그래서 `setMode` 의 불변식("둘 다 켜짐을 표현할 수
-// 없다")도, UI 하네스 §7 이 검사하는 것도 그대로다.
+// 같은 그룹, 정점만 이동). 그래서 `viewer.setMode` 의 불변식("둘 다 켜짐을
+// 표현할 수 없다")도 그대로다.
 //
-// 스냅샷을 보는 중에 펼치면 어떻게 되는가 — **화면은 안 바뀐다.** 펼쳐지는
-// 것은 숨어 있는 실시간 옷이고, 스냅샷(익스포트한 glTF)은 도면 좌표를 갖고
-// 있지 않다. 그래서 아래에서 스냅샷 모드일 때는 슬라이더를 만지면 실시간으로
-// 돌아온다 — 재생 버튼이 하는 것(`returnToLiveForPlayback`)과 같은 판단이다.
+// 아래 스냅샷 갈래는 **H-1 이후 실제로는 돌지 않는다** — 화면에서 스냅샷으로
+// 들어가는 길이 없어져 `viewer.mode` 가 항상 'live' 다. 그래도 남겨 둔 이유는
+// 모드 기계가 살아 있고(스모크 §8-9), 훅 계약을 바꾸지 않기로 했기 때문이다.
 const unfolder = new Unfolder();
 const unfoldControl = new UnfoldController();
 
@@ -456,7 +456,7 @@ ui.unfold.addEventListener('input', () => {
   // 실시간으로 돌려놓는다(원인이 화면 어디에도 안 남는 실패를 만들지 않는다).
   if (viewer.mode === 'snapshot' && Number(ui.unfold.value) > 0) {
     log('펼침 — 스냅샷에는 2D 배치가 없어 실시간 뷰로 돌아갑니다 (스냅샷은 남아 있습니다)');
-    setMode('live');
+    returnToLive();
   }
   unfoldControl.set(Number(ui.unfold.value) / 100);
   paintUnfold();
@@ -1121,7 +1121,8 @@ function clearScene(): void {
   // 몸도 씬에 딸려 있다 (AM-1). 옷만 지우면 **몸만 남아 서 있어서** 씬이 아직
   // 있는 것처럼 보인다 — 가운데 칸에서 커브만 남던 것과 같은 계열의 사고다.
   avatarView.clear();
-  dropSnapshot();
+  // ⛔ 여기 있던 `dropSnapshot()` 은 H-1 에서 뺐다 — 세울 스냅샷이 없으니
+  //    버릴 것도 없다.
   stream.resume();
   // 도면 좌표는 씬에 딸려 있다. 남겨 두면 다음 씬의 패턴에 옛 배치가 섞인다.
   unfolder.clear();
@@ -1291,153 +1292,38 @@ function fmtBytes(n: number): string {
   return n >= 1 << 20 ? `${(n / (1 << 20)).toFixed(1)}MB` : `${(n / 1024).toFixed(0)}KB`;
 }
 
-// ── 스냅샷 (아바타 + 진짜 색) ───────────────────────────────
+// ── 실시간 뷰로 되돌리기 ────────────────────────────────────
 //
-// 여기 있는 것도 배선뿐이다. 순서·중복 방지·세대 관리는 전부
-// `viewer3d/snapshot.ts` 에 있고 그 파일은 DOM 을 안 만진다.
+// ⛔ 여기 있던 스냅샷 배선은 2026-08-13 에 통째로 뺐다 (H-1):
+//    `SnapshotLoader` 인스턴스 · `takeSnapshot()` · `paintSnap()` ·
+//    `dropSnapshot()` · 버튼 두 개(`#snap`·`#mode`)의 리스너. 데스크톱 앱에
+//    대응하는 기능이 없어서다 — 사유는 `index.html` 의 그 자리 주석에 있다.
 //
-// ── 왜 버튼인가 (자동이 아닌 이유) ──────────────────────────
-// 익스포트는 sample.zls 1.5초 / 사용자 씬 36.5MB 4.3초다(#10 실측). 씬을 열
-// 때마다 자동으로 돌리면 (a) 첫 화면이 그만큼 늦어지고 (b) 사용자가 안 볼
-// 수도 있는 36MB 를 워커가 매번 디스크에 쓴다. 반면 얻는 것은 "정지 화면
-// 하나" 다 — 지금 필요한 순간에만 만드는 것이 맞다.
+// **모듈은 안 지웠다.** `viewer3d/snapshot.ts` · `viewer3d/snapshotView.ts`
+// 와 뷰어의 `live`/`snapshot` 모드 기계는 그대로 있고, 스모크 §8-8·§8-9·
+// §8-10(단언 87건)이 그 위에서 익스포트 경로를 계속 검사한다 —
+// ISSUE-012·ISSUE-013 이 열려 있는 동안 그것이 유일하게 감시하는 눈이다.
 //
-// ── 재생 중에도 막지 않는다 ─────────────────────────────────
-// 시뮬이 도는 중에 찍으면 **그 시점의 포즈**가 나온다. 막을 이유가 없고
-// 오히려 쓸모가 있다(원하는 순간의 드레이프를 아바타와 함께 본다). 대신
-// 값이 흔들린다는 사실을 로그에 남긴다 — 익스포트가 도는 4.3초 동안 시뮬도
-// 계속 진행하므로 **버튼을 누른 프레임과 파일에 담긴 프레임은 다르다.**
-// 자동으로 pause 를 걸지 않는 이유는 사용자가 지시하지 않은 상태 변경이라서다.
-
-const snapshots = new SnapshotLoader<ParsedSnapshot>({
-  source: {
-    // ⚠️ path 를 넣지 않는다 — 게이트웨이가 거부한다. 형식 하나뿐이다.
-    requestExport: (format) => client.exportScene(format),
-    download: (url, onProgress, expectedBytes) =>
-      downloadExport(url, {
-        expectedBytes,
-        onProgress: ({ loaded, total }) => onProgress(loaded, total),
-      }),
-  },
-  // `viewer.snapshot` 이 `SnapshotTarget` 을 이미 구현한다. 어댑터가 없다.
-  target: viewer.snapshot,
-  onProgress: (p) => {
-    // 진행률은 1초에 몇 번씩 갈리므로 슬롯에 넣지 않는다 (I-1) — 다음 갱신이
-    // 바로 오고, 끝나면 아래 `takeSnapshot()` 이 요약을 슬롯에 넣는다.
-    if (p.phase === 'exporting') {
-      ui.snapstat.textContent = t('snap.exporting', { sec: (p.elapsedMs / 1000).toFixed(1) });
-    } else if (p.phase === 'downloading') {
-      ui.snapstat.textContent = p.total
-        ? t('snap.downloading.total', { loaded: fmtBytes(p.loaded), total: fmtBytes(p.total) })
-        : t('snap.downloading', { loaded: fmtBytes(p.loaded) });
-    } else if (p.phase === 'parsing') {
-      // 36.5MB 파싱은 메인 스레드를 잡는다. 미리 말해 두지 않으면 "멈췄다" 로 읽힌다.
-      ui.snapstat.textContent = t('snap.parsing', { total: fmtBytes(p.total) });
-    } else if (p.phase === 'idle') {
-      ui.snapstat.textContent = '';
-    }
-  },
-  now: () => performance.now(),
-});
-
-/** 스냅샷 버튼을 눌렀다 */
-async function takeSnapshot(): Promise<void> {
-  if (!currentScene || !client.connected) return;
-  ui.snap.disabled = true;
-  if (playback.playing) {
-    log('재생 중 스냅샷 — 파일에 담기는 포즈는 버튼을 누른 시점보다 몇 프레임 뒤입니다');
-  }
-  statusT('status.snap.making');
-  try {
-    const r = await snapshots.load();
-    // 성공했으니 화면을 스냅샷으로 돌린다. 이 한 줄이 유일한 전환 지점이다.
-    setMode('snapshot', { refit: true });
-    say('snapstat', () => {
-      ui.snapstat.textContent = t('snap.summary', {
-        bytes: fmtBytes(r.info.bytes),
-        meshes: r.stats.meshes,
-        vertices: r.stats.vertices.toLocaleString('ko-KR'),
-        materials: r.stats.materials,
-        textures: r.stats.textures,
-      });
-    });
-    log(
-      `스냅샷 완료 ${r.elapsedMs}ms `
-      + `(익스포트 ${r.timings.exportMs} / 다운로드 ${r.timings.downloadMs}`
-      + ` / 파싱 ${r.timings.parseMs} / 부착 ${r.timings.installMs})`,
-    );
-    // ⛔ `r.info.name` 은 익스포트 파일명이라 번역하지 않는다
-    statusT('status.snap.showing', { name: r.info.name });
-  } catch (err: unknown) {
-    if (err instanceof SnapshotStaleError) {
-      // 취소다. 사용자가 그 사이에 다른 씬을 눌렀다는 뜻이므로 오류가 아니다.
-      log(err.message);
-    } else {
-      say('snapstat', null);
-      ui.snapstat.textContent = '';
-      statusT('status.snap.failed', { why: message(err) }, true);
-    }
-  } finally {
-    paintSnap();
-  }
-}
+// 남은 것은 아래 한 함수다. 화면에서 스냅샷으로 들어가는 길이 없어져
+// `viewer.mode` 는 항상 'live' 이고, 이 함수를 부르는 두 자리(펼침 슬라이더 ·
+// `returnToLiveForPlayback`)는 그 앞의 `viewer.mode === 'snapshot'` 가드에서
+// 먼저 돌아선다. **그래도 지우지 않는다** — 훅 계약(ISSUE-017)을 이 단위에서
+// 바꾸지 않기로 했고, 모드 기계가 살아 있는 한 이 갈래가 되살아날 자리다.
 
 /**
- * 실시간 ↔ 스냅샷. **뷰어의 `setMode` 하나만 부른다** — 두 그룹의 visible 을
- * 여기서 만지기 시작하면 "둘 다 보이는" 상태가 만들어질 수 있게 된다.
+ * 스냅샷을 보고 있었다면 실시간 뷰로 되돌린다. **뷰어의 `setMode` 하나만
+ * 부른다** — 두 그룹의 visible 을 여기서 만지기 시작하면 "둘 다 보이는"
+ * 상태가 만들어질 수 있게 된다.
  */
-function setMode(
-  mode: 'live' | 'snapshot',
-  opts: { refit?: boolean; quiet?: boolean } = {},
-): void {
-  if (mode === 'snapshot' && !snapshots.present) return;
-  viewer.setMode(mode);
-  // 스냅샷은 아바타까지 있어 경계가 옷보다 훨씬 크다. 처음 세울 때는 맞춰
-  // 주고, 되돌아올 때는 사용자가 잡아 둔 시점을 빼앗지 않는다.
-  if (opts.refit) viewer.frameCamera();
-  paintSnap();
-  // ★ 화면이 바뀌면 상태줄도 같이 바뀌어야 한다 (#14 에서 함께 고침).
-  //   실시간으로 돌아왔는데 "스냅샷 표시 중" 이 남아 있으면 ISSUE-009 와 같은
-  //   계열의 거짓말이다 — 화면과 글자가 서로 다른 것을 말한다. 여기 쓰는 문구를
-  //   **시뮬 상태로 채우지 않는 이유**는 그 값이 곧 낡기 때문이다. 시뮬의 지금
-  //   상태는 `#sim` 이 4/s 로 계속 갱신하므로 상태줄은 "무엇을 보고 있는가" 만
-  //   말한다.
-  if (!opts.quiet) {
-    statusT(mode === 'snapshot' ? 'status.mode.snapshot' : 'status.mode.live');
-  }
-}
-
-/** 스냅샷이 사라져야 할 때. **씬이 바뀌면 이전 씬의 아바타는 거짓이다** */
-function dropSnapshot(): void {
-  snapshots.clear();
+function returnToLive(): void {
   viewer.setMode('live');
-  say('snapstat', null);
-  ui.snapstat.textContent = '';
-  paintSnap();
+  // ★ 화면이 바뀌면 상태줄도 같이 바뀌어야 한다 (#14 에서 함께 고침).
+  //   화면은 실시간인데 글자가 다른 것을 말하면 ISSUE-009 와 같은 계열의
+  //   거짓말이다. 여기 쓰는 문구를 **시뮬 상태로 채우지 않는 이유**는 그 값이
+  //   곧 낡기 때문이다 — 시뮬의 지금 상태는 `#sim` 이 4/s 로 계속 갱신하므로
+  //   상태줄은 "무엇을 보고 있는가" 만 말한다.
+  statusT('status.mode.live');
 }
-
-function paintSnap(): void {
-  const has = snapshots.present;
-  ui.snap.disabled = busy || currentScene === null || !client.connected || snapshots.busy;
-  // `data-i18n` 자리채움을 뗀다 — 안 떼면 언어 전환이 "🧍 다시 찍기" 를
-  // "🧍 스냅샷" 으로 되돌린다 (I-1).
-  ui.snap.removeAttribute('data-i18n');
-  ui.mode.removeAttribute('data-i18n');
-  ui.snap.textContent = has ? t('bar.snap.again') : t('bar.snap');
-  ui.mode.hidden = !has;
-  ui.mode.disabled = !has;
-  ui.mode.textContent = viewer.mode === 'snapshot' ? t('bar.mode.live') : t('bar.mode.snapshot');
-}
-
-ui.snap.addEventListener('click', () => {
-  void takeSnapshot();
-});
-
-ui.mode.addEventListener('click', () => {
-  // 스냅샷으로 갈 때만 카메라를 다시 맞춘다 — 경계가 크게 달라지는 방향이다.
-  const next = viewer.mode === 'snapshot' ? 'live' : 'snapshot';
-  setMode(next, { refit: next === 'snapshot' });
-});
 
 async function refreshScenes(select?: string): Promise<SceneSummary[]> {
   let scenes: SceneSummary[] = [];
@@ -1476,7 +1362,6 @@ function setBusy(on: boolean): void {
   ui.load.disabled = on || ui.scene.value === '';
   ui.upload.disabled = on || !ui.file.files?.length;
   ui.scene.disabled = on;
-  ui.snap.disabled = on || currentScene === null || !client.connected || snapshots.busy;
   // 재생 컨트롤 네 개의 활성 조건은 `playback.view` 가 정한다. 여기서 따로
   // 계산하면 조건이 두 곳에 생기고, 둘이 갈라지는 날 버튼이 거짓말을 한다.
   paintPlayback();
@@ -1594,10 +1479,8 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
   //   도착한 옛 왕복이 방금 연 씬 위에 이전 씬의 토폴로지를 세운다.
   //   `busy` 가드는 **앞으로의** 겹침만 막지, 이미 날고 있는 것은 못 막는다.
   restageSeq += 1;
-  // ★ 다른 씬이면 스냅샷을 버린다. 이전 씬의 아바타가 새 씬 위에 남아 있으면
-  //   화면만 봐서는 절대 못 알아챈다 — 아바타는 씬이 달라도 거의 같아 보인다.
-  //   재연결로 **같은 씬**을 다시 로드하는 경우(refit:false)에는 유지한다.
-  if (sceneId !== currentScene) dropSnapshot();
+  // ⛔ 여기 있던 "다른 씬이면 스냅샷을 버린다" 는 H-1 에서 뺐다 — 세울
+  //    스냅샷이 없다.
   setBusy(true);
   // ★ ISSUE-009 를 닫는 자리다. 워커의 `load` 는 시뮬 상태를 초기화하고
   //   `maxFrame` 을 -1 로 되돌린다 — **로드가 시작된 순간 "재생 중" 이라는
@@ -1692,7 +1575,6 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
     statusT('status.load.failed', { why: message(err) }, true);
   } finally {
     setBusy(false);
-    paintSnap();
     // 믿음을 사실로 덮어쓴다. 로드 성공/실패 어느 쪽이든 워커가 지금 무엇을
     // 들고 있는지는 물어봐야 안다 — 실패했을 때가 특히 그렇다(요청이 워커에
     // 닿기는 했는지 우리는 모른다).
@@ -1727,7 +1609,6 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
  */
 async function act(action: PlaybackCommand): Promise<void> {
   const ok = await RUN[action]();
-  paintSnap();
   if (ok) return;
   const err = playback.lastError;
   // 실패가 아니라 "지금은 할 수 없다"(다른 op 왕복 중 등)면 조용히 넘긴다 —
@@ -1766,12 +1647,15 @@ const LABEL: Record<PlaybackCommand, string> = {
  *
  * 스냅샷은 정지 화면이라, 스냅샷을 보는 채로 시뮬을 켜면 "재생을 눌렀는데
  * 아무것도 안 움직인다" 가 된다. 원인이 화면 어디에도 안 남는 실패다.
- * 스냅샷 자체는 버리지 않으므로 `#mode` 버튼으로 언제든 다시 볼 수 있다.
+ *
+ * ⚠️ **H-1 이후 이 함수는 실제로는 아무 일도 안 한다** — 화면에서 스냅샷으로
+ *    들어가는 길이 없어져 첫 줄의 가드가 항상 먼저 돌아선다. 훅 계약
+ *    (`PlaybackHooks.beforePlay`, ISSUE-017)을 바꾸지 않기로 해서 그대로 둔다.
  */
 function returnToLiveForPlayback(): void {
   if (viewer.mode !== 'snapshot') return;
   log('재생 — 스냅샷은 정지 화면이라 실시간 뷰로 돌아갑니다 (스냅샷은 남아 있습니다)');
-  setMode('live');
+  returnToLive();
 }
 
 ui.play.addEventListener('click', () => void act('toggle'));
@@ -1864,14 +1748,13 @@ function repaintForLang(): void {
   langSwitch.render();
   paintHint();
 
-  // ② 지난 문장 (상태줄·메시 통계·스냅샷 요약). 위 `say()` 머리말 참고
+  // ② 지난 문장 (상태줄·메시 통계·파일 이름). 위 `say()` 머리말 참고
   for (const paint of slotPainters.values()) paint();
 
   // ③ 스스로 다시 그리는 위젯들. 순서에 뜻은 없다 — 전부 멱등이다
   paintPlayback();
   paintDraping();
   paintUnfold();
-  paintSnap();
   paintFrames();
   paintMeasure();
   paintAvatarView();
@@ -2002,7 +1885,9 @@ declare global {
     viewer2d: Viewer2D;
     unfolder2d: Unfolder;
     stream: FrameStream;
-    snapshots: SnapshotLoader<ParsedSnapshot>;
+    // ⛔ `snapshots`·`snap`·`mode`·`snapStats` 는 H-1 에서 뺐다 — 화면에
+    //    스냅샷 진입점이 없어져 진단할 대상 자체가 없다. 스냅샷 모듈의
+    //    검사는 스모크 §8-8·§8-9·§8-10 이 계속 맡는다.
     playback: PlaybackController;
     /**
      * #16 의 진단 표면. `params.phase` 가 'ready' 가 아니면 화면의 값은
@@ -2021,11 +1906,8 @@ declare global {
     unfoldControl: UnfoldController;
     show: typeof show;
     play: (on: boolean) => Promise<boolean>;
-    snap: typeof takeSnapshot;
-    mode: typeof setMode;
     get frames(): number;
     get stats(): FrameStreamStats;
-    get snapStats(): SnapshotLoaderStats;
     get playbackView(): PlaybackView;
   };
 }
@@ -2040,15 +1922,12 @@ globalThis.cobalt = {
   viewer2d,
   unfolder2d,
   stream,
-  snapshots,
   playback,
   params,
   unfolder,
   unfoldControl,
   show,
   play: (on: boolean) => (on ? playback.play() : playback.pause()),
-  snap: takeSnapshot,
-  mode: setMode,
   get frames(): number {
     return stream.stats.received;
   },
@@ -2057,10 +1936,5 @@ globalThis.cobalt = {
   },
   get playbackView(): PlaybackView {
     return playback.view;
-  },
-  // 스냅샷이 안 보일 때의 진단 표면: `phase` 가 'ready' 인데 화면이 비었으면
-  // 모드(`cobalt.viewer.mode`)나 카메라이고, 'error' 면 `lastError` 가 이유다.
-  get snapStats(): SnapshotLoaderStats {
-    return snapshots.stats;
   },
 };

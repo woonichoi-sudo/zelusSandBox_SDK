@@ -205,8 +205,19 @@ const DIST = path.resolve(FRONTEND, 'dist');
 
 let failures = 0;
 
+/**
+ * 절마다 몇 건을 냈는가.
+ *
+ * §20(H-1)이 "남기기로 한 절이 **실제로 돌았다**"를 판정하는 데 쓴다. 소스에
+ * 함수가 남아 있어도 `main()` 의 호출 한 줄이 빠지면 그 절은 조용히 안 돈다 —
+ * 소스 대조만으로는 그것을 못 본다.
+ */
+const SECTION_CHECKS = new Map<string, number>();
+let currentSection = '(절 밖)';
+
 function check(label: string, ok: boolean, detail = ''): void {
   console.log(`${ok ? '  OK ' : '  실패'}  ${label}${detail ? `  — ${detail}` : ''}`);
+  SECTION_CHECKS.set(currentSection, (SECTION_CHECKS.get(currentSection) ?? 0) + 1);
   if (!ok) failures++;
 }
 
@@ -216,7 +227,20 @@ function note(label: string, detail: string): void {
 }
 
 function section(title: string): void {
+  currentSection = title;
   console.log(`\n── ${title} ──`);
+}
+
+/**
+ * 절 번호로 그 절이 낸 건수를 센다. **0 이면 안 돌았다는 뜻이다.**
+ *
+ * 접두사에 마침표까지 넣어 부를 것 — `'§8-1'` 로 부르면 `§8-10`·`§8-11`·
+ * `§8-12`·`§8-13` 까지 함께 세어 버린다.
+ */
+function checksIn(prefix: string): number {
+  let n = 0;
+  for (const [title, c] of SECTION_CHECKS) if (title.startsWith(prefix)) n += c;
+  return n;
 }
 
 function ms(t: number): string {
@@ -10398,6 +10422,273 @@ function sectionI18nSources(): void {
 }
 
 // ─────────────────────────────────────────────────────────────
+// §20. H-1 — 스냅샷 진입점이 화면에서 내려갔다 (A안)
+//
+// **이 절은 기능을 더한 것이 아니라 뺀 것을 지킨다.** 그래서 보통의 단언이
+// 안 통한다:
+//
+//   - 화면 요소를 지우는 것은 **타입 검사도 통과하고 런타임 예외도 안 난다.**
+//     증상은 "글자가 조용히 사라진다" 하나뿐이라, 소스를 읽는 것 말고는 잡을
+//     길이 없다(I-1 의 ③ 소스 대조와 같은 수법이다).
+//
+//   - ⚠️⚠️ **"없다" 는 단언은 대조군이 없으면 공짜로 통과한다.** 파일 경로에
+//     오타를 내면 빈 문자열을 읽고 "`#snap` 이 없다" 가 초록으로 뜬다. 이
+//     프로젝트에서 §15-2 와 §16-3 이 이미 두 번 겪은 실패 모드다. 그래서
+//     **모든 부정 단언 옆에 "읽은 것이 진짜 그 파일이다" 를 세운다.**
+//
+// ── A안과 B안을 가르는 자리 ─────────────────────────────────
+// 사용자가 고른 것은 **A안**이다 — 화면 진입점만 내리고 `viewer3d/snapshot.ts`
+// · `viewer3d/snapshotView.ts` 와 스모크 §8-8·§8-9·§8-10 은 남긴다. 그 셋이
+// 익스포트 경로를 자동으로 검사하는 **유일한 자리**이고 ISSUE-012·013 이 아직
+// 열려 있다. 통째로 지우면(B안) 감시하는 눈이 0 이 된다.
+//
+// 그래서 ④ 는 소스에 함수가 남아 있는지가 아니라 **그 절이 실제로 몇 건을
+// 냈는지**(`checksIn`)로 본다 — `main()` 의 호출 한 줄만 빠져도 소스는 멀쩡한
+// 채 절이 조용히 안 돈다.
+//
+// ⚠️ **자동으로 못 덮는 것**
+//   - 버튼 두 개가 사라진 뒤 **상단 바의 배치가 깨지지 않는가.** DOM 이 있어야
+//     보이고 `verify:ui` 는 GPU 보류라 못 돌린다 — 사람이 브라우저로 본다.
+//   - `verify/ui.ts` 의 댕글링 참조는 `npm run typecheck` 로만 확인된다.
+//     여기서는 **문자열 셀렉터**만 본다(타입 검사가 못 보는 쪽이다).
+// ─────────────────────────────────────────────────────────────
+
+/** H-1 에서 두 사전에서 함께 뺀 14키. 이 목록이 이 절의 정본이다 */
+const H1_REMOVED_KEYS = [
+  'bar.snap',
+  'bar.snap.again',
+  'bar.snap.title',
+  'bar.mode.live',
+  'bar.mode.snapshot',
+  'snap.exporting',
+  'snap.downloading',
+  'snap.downloading.total',
+  'snap.parsing',
+  'snap.summary',
+  'status.snap.making',
+  'status.snap.showing',
+  'status.snap.failed',
+  'status.mode.snapshot',
+] as const;
+
+/**
+ * 따옴표 안의 **키 문자열**만 잡는다. 식별자는 안 잡으므로
+ * `viewer.mode === 'snapshot'`(살아 있는 모드 기계)이나 `snap.load()` 같은
+ * 자리에 걸리지 않는다 — `'snapshot'` 에는 `snap.` 뒤에 올 점이 없다.
+ */
+const H1_DEAD_KEY = /['"](snap\.[\w.]+|status\.snap\.[\w.]+|bar\.snap(?:\.[\w.]+)?|bar\.mode\.[\w.]+)['"]/g;
+
+const SMOKE_TS = path.resolve(HERE, 'smoke.ts');
+const VERIFY_UI_TS = path.resolve(FRONTEND, 'src/verify/ui.ts');
+
+function sectionSnapshotEntryRemoved(): void {
+  section('§20. H-1 — 스냅샷 진입점이 화면에서 내려갔다 (소스 대조, A안)');
+
+  // ── ① `index.html` ──────────────────────────────────────────
+  const rawHtml = existsSync(INDEX_HTML) ? readFileSync(INDEX_HTML, 'utf8') : '';
+  // 주석을 걷는다. 뺀 이유를 적어 둔 주석에 `#snap`·`#mode` 라는 글자가
+  // 그대로 들어 있어서, 안 걷으면 **주석이 단언을 빨갛게 만든다**.
+  const html = rawHtml.replace(/<!--[\s\S]*?-->/g, '');
+
+  // ★ 대조군 먼저. 이것이 없으면 아래 세 개의 부정 단언이 전부 공짜다.
+  const stillThere = ['viewport3d', 'play', 'drape', 'drapestat', 'sim', 'status']
+    .filter((id) => new RegExp(`\\bid=["']${id}["']`).test(html));
+  check(
+    '★ 대조군: 읽은 것이 진짜 `index.html` 이다 (경로가 틀리면 아래 "없다" 가 전부 공짜로 통과한다)',
+    rawHtml.length > 20_000 && stillThere.length === 6,
+    `${rawHtml.length}바이트 · 남아 있어야 할 id ${stillThere.length}/6 [${stillThere.join(',')}]`,
+  );
+
+  const deadIds = ['snap', 'mode', 'snapstat']
+    .filter((id) => new RegExp(`\\bid=["']${id}["']`).test(html));
+  check(
+    '★★ ① `index.html` 에 `#snap`·`#mode`·`#snapstat` 이 없다 (H-1: 데스크톱에 대응 기능이 없다)',
+    deadIds.length === 0,
+    deadIds.length === 0 ? '3개 다 없다' : `아직 있다: ${deadIds.join(', ')}`,
+  );
+
+  const htmlDeadKeys = [...html.matchAll(H1_DEAD_KEY)].map((m) => m[1] ?? '');
+  check(
+    '★ `index.html` 의 `data-i18n` 에 뺀 키가 남아 있지 않다',
+    htmlDeadKeys.length === 0,
+    htmlDeadKeys.length === 0 ? '' : htmlDeadKeys.slice(0, 5).join(', '),
+  );
+
+  // ── ② 사전 두 벌 ────────────────────────────────────────────
+  const ko = Object.keys(MESSAGES.ko);
+  const en = Object.keys(MESSAGES.en);
+
+  // ★ 대조군. 개수를 **관계와 하한**으로 박는다 — 296 처럼 못박으면 앞으로
+  //   문구 하나 늘 때마다 이 자리가 빨개진다. 대칭 자체는 §16-1 이 본다.
+  check(
+    '★ 대조군: 사전 두 벌이 살아 있고 크기가 같다 (통째로 날아가도 아래 "사라졌다" 는 통과한다)',
+    ko.length === en.length && ko.length >= 280,
+    `ko ${ko.length}키 · en ${en.length}키`,
+  );
+
+  const leftKo = H1_REMOVED_KEYS.filter((k) => k in MESSAGES.ko);
+  const leftEn = H1_REMOVED_KEYS.filter((k) => k in MESSAGES.en);
+  check(
+    `★★ ② 뺀 ${H1_REMOVED_KEYS.length}키가 두 사전에서 **양쪽 다** 사라졌다`,
+    leftKo.length === 0 && leftEn.length === 0,
+    leftKo.length === 0 && leftEn.length === 0
+      ? `${H1_REMOVED_KEYS.length}키 확인`
+      : `ko 에 남음 [${leftKo.join(', ')}] · en 에 남음 [${leftEn.join(', ')}]`,
+  );
+
+  // ★ 너무 많이 지운 쪽. 위 단언은 사전이 통째로 비어도 통과한다.
+  const neighbours = ['bar.load', 'bar.drape', 'status.mode.live', 'status.cleared', 'stat.mesh'];
+  const missing = neighbours.filter((k) => !(k in MESSAGES.ko) || !(k in MESSAGES.en));
+  check(
+    '★ 대조군: 남기기로 한 이웃 키가 살아 있다 (`status.mode.live` 는 `returnToLive()` 가 아직 부른다)',
+    missing.length === 0,
+    missing.length === 0 ? neighbours.join(', ') : `사라졌다: ${missing.join(', ')}`,
+  );
+
+  // §16-1 의 대칭 단언이 이 단위의 안전망이다 — 한쪽 사전에만 되살리는 회귀는
+  // 저기가 잡는다. **그 단언이 아직 있는지**를 여기서 같이 못박는다.
+  const smokeSrc = existsSync(SMOKE_TS) ? readFileSync(SMOKE_TS, 'utf8') : '';
+  check(
+    '★ §16-1 의 "두 사전의 키 집합이 같다" 단언이 아직 살아 있다 (한쪽만 되살리는 회귀는 저기가 잡는다)',
+    smokeSrc.length > 100_000 && smokeSrc.includes('★★ 두 사전의 키 집합이 같다'),
+    `smoke.ts ${smokeSrc.length}바이트`,
+  );
+
+  // ── ③ 부르지 않는 키를 안 남겼다 ────────────────────────────
+  //
+  // 사전에서 지웠는데 부르는 자리가 남으면 **화면에 키 문자열이 그대로 뜬다**
+  // (사전이 모르는 키를 그대로 돌려주기 때문이다 — 의도된 설계다).
+  // §16-3 이 "부르는 키가 전부 사전에 있다" 로 겹쳐 보지만, 저기는 `t()` 호출
+  // 형태만 본다. 여기는 **키 문자열이 어디에 있든** 본다.
+  const scanned: string[] = [];
+  const callers: string[] = [];
+  let liveCalls = 0;
+  for (const f of i18nScanTargets()) {
+    if (f === SMOKE_TS) continue; // 이 절 자신이 14키를 목록으로 들고 있다
+    const src = stripComments(readFileSync(f, 'utf8'));
+    scanned.push(f);
+    for (const m of src.matchAll(H1_DEAD_KEY)) callers.push(`${path.relative(FRONTEND, f)} → ${m[1]}`);
+    for (const _ of src.matchAll(LITERAL_KEY_CALL)) liveCalls++;
+  }
+  // `panels/i18n.ts` 는 `i18nScanTargets()` 가 빼 놓는다(§16-3 참고). 사전
+  // 본문에 주석으로 남은 `bar.snap*` 도 있으니 주석을 걷고 따로 훑는다.
+  if (existsSync(I18N_TS)) {
+    const dict = stripComments(readFileSync(I18N_TS, 'utf8'));
+    scanned.push(I18N_TS);
+    for (const m of dict.matchAll(H1_DEAD_KEY)) callers.push(`panels/i18n.ts → ${m[1]}`);
+  }
+
+  check(
+    '★ 대조군: 스캔이 실제로 소스를 보고 있다 (0 파일·0 호출이면 아래가 공짜로 통과한다)',
+    scanned.length > 20 && liveCalls > 100,
+    `${scanned.length}파일 · 살아 있는 키 호출 ${liveCalls}회`,
+  );
+  check(
+    '★★ ③ 뺀 키를 부르는 자리가 0 이다 (남으면 그 자리에 키 문자열이 그대로 뜬다)',
+    callers.length === 0,
+    callers.length === 0 ? `${scanned.length}파일 + index.html` : callers.slice(0, 5).join(' / '),
+  );
+
+  // `main.ts` 의 진입점 자체. 위 ③ 은 **키**를 보고 이쪽은 **배선**을 본다.
+  const mainSrc = existsSync(MAIN_TS) ? stripComments(readFileSync(MAIN_TS, 'utf8')) : '';
+  check(
+    '★ 대조군: 읽은 것이 진짜 `main.ts` 다 (다른 버튼의 배선이 그대로 있다)',
+    mainSrc.length > 20_000 && mainSrc.includes("el<HTMLButtonElement>('play')")
+    && mainSrc.includes("el<HTMLButtonElement>('drape')"),
+    `${mainSrc.length}바이트`,
+  );
+  const deadWiring = ['takeSnapshot', 'paintSnap', 'dropSnapshot', "el<HTMLButtonElement>('snap')", "el('snapstat')"]
+    .filter((s) => mainSrc.includes(s));
+  check(
+    '★ `main.ts` 에 스냅샷 버튼의 배선이 남아 있지 않다',
+    deadWiring.length === 0,
+    deadWiring.length === 0 ? '' : `아직 있다: ${deadWiring.join(', ')}`,
+  );
+
+  // `verify/ui.ts` 는 GPU 보류로 **돌릴 수 없다.** 타입 검사가 문자열 셀렉터를
+  // 못 보므로, 여기서 소스로 본다. 그 이상은 사람이 확인한다.
+  const uiSrc = existsSync(VERIFY_UI_TS) ? stripComments(readFileSync(VERIFY_UI_TS, 'utf8')) : '';
+  const uiDead = ['#snapstat', '#snap', '#mode'].filter((s) => uiSrc.includes(`'${s}'`) || uiSrc.includes(`"${s}"`));
+  check(
+    '★ `verify/ui.ts` 에 사라진 요소를 집는 셀렉터가 없다 (⚠️ GPU 보류로 하네스 자체는 못 돌린다)',
+    uiSrc.length > 20_000 && uiDead.length === 0,
+    uiSrc.length > 20_000 ? (uiDead.length === 0 ? '' : uiDead.join(', ')) : `읽지 못했다 (${uiSrc.length}바이트)`,
+  );
+
+  // ── ④ 남기기로 한 것이 살아 있다 (A안 ↔ B안) ───────────────
+  //
+  // ★★ 이 단위에서 제일 중요한 단언이다. 위 ①②③ 은 "지웠다" 만 보므로,
+  //    **통째로 지워도(B안) 전부 초록**이다. 여기가 유일하게 그것을 가른다.
+  for (const rel of ['src/viewer3d/snapshot.ts', 'src/viewer3d/snapshotView.ts']) {
+    const p = path.resolve(FRONTEND, rel);
+    const size = existsSync(p) ? statSync(p).size : 0;
+    check(`★★ ④ 모듈이 살아 있다 — ${rel} (A안: 화면만 내렸다)`, size > 5_000, `${size}바이트`);
+  }
+  check(
+    '★ 배럴이 두 모듈을 아직 재export 한다',
+    (() => {
+      const p = path.resolve(FRONTEND, 'src/viewer3d/index.ts');
+      if (!existsSync(p)) return false;
+      const s = readFileSync(p, 'utf8');
+      return s.includes("./snapshot.ts") && s.includes("./snapshotView.ts");
+    })(),
+    '',
+  );
+  check(
+    '★ 뷰어의 `live`/`snapshot` 모드 기계가 그대로다 (`setMode` 를 없애면 viewer·cloth·avatar 로 번진다)',
+    (() => {
+      const p = path.resolve(FRONTEND, 'src/viewer3d/viewer.ts');
+      if (!existsSync(p)) return false;
+      const s = stripComments(readFileSync(p, 'utf8'));
+      return s.includes('setMode') && s.includes("'snapshot'") && s.includes("'live'");
+    })(),
+    '',
+  );
+
+  // ★★ 소스가 아니라 **실행 결과**로 본다. `main()` 의 호출 한 줄이 빠지면
+  //    함수는 멀쩡히 남은 채 그 절이 조용히 안 돈다 — 소스 대조는 그것을
+  //    못 본다. 건수는 **하한**으로 박는다: 87 을 못박으면 정상적인 단언
+  //    추가에도 빨개진다. Builder 실측 §8-8=43 · §8-9=19 · §8-10=25 → 87.
+  const c88 = checksIn('§8-8.');
+  const c89 = checksIn('§8-9.');
+  const c810 = checksIn('§8-10.');
+  check(
+    '★★ ④ 스모크 §8-8(스냅샷 상태 기계)이 실제로 돌았다 — 43건 이상',
+    c88 >= 43,
+    `${c88}건`,
+  );
+  check(
+    '★★ ④ 스모크 §8-9(스냅샷 부착)가 실제로 돌았다 — 19건 이상',
+    c89 >= 19,
+    `${c89}건`,
+  );
+  // §8-10 은 워커 exe 와 sample.zls 가 있어야 돈다(없으면 스스로 생략한다).
+  // 그 환경 차이 때문에 이 단언이 빨개지면 안 된다.
+  if (existsSync(EXE) && existsSync(ZLS)) {
+    check(
+      '★★ ④ 스모크 §8-10(실제 워커 익스포트 종단)이 실제로 돌았다 — 25건 이상',
+      c810 >= 25,
+      `${c810}건`,
+    );
+    check(
+      '★★ ④ 세 절의 합이 87건 이상이다 (ISSUE-012·013 을 지키는 유일한 눈이다)',
+      c88 + c89 + c810 >= 87,
+      `${c88} + ${c89} + ${c810} = ${c88 + c89 + c810}건`,
+    );
+  } else {
+    note('§8-10 판정 생략', `워커가 없다 (exe=${existsSync(EXE)}, zls=${existsSync(ZLS)}) — 아래 소스 단언만 남는다`);
+  }
+  // 실행이 생략된 환경에서도 **절이 지워지지는 않았는지**는 소스로 본다.
+  const wired = ['sectionSnapshotMachine()', 'sectionSnapshotObject()', 'sectionSnapshotRealExport()']
+    .filter((s) => smokeSrc.includes(`await ${s}`) || smokeSrc.includes(`  ${s};`));
+  check(
+    '★ 세 절이 `main()` 에 아직 배선돼 있다 (실행 판정이 생략되는 환경을 위한 대역)',
+    wired.length === 3,
+    `${wired.length}/3`,
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
 // §9. 좀비 프로세스
 // ─────────────────────────────────────────────────────────────
 
@@ -10513,6 +10804,10 @@ async function main(): Promise<void> {
   sectionI18nDict();
   sectionI18nLookup();
   sectionI18nSources();
+  // H-1 스냅샷 진입점 제거. 워커도 DOM 도 안 쓴다 — 소스를 읽는다.
+  // ⚠️ **반드시 §8-8·§8-9·§8-10 뒤에 와야 한다.** 그 세 절이 실제로 몇 건을
+  //    냈는지(`checksIn`)로 A안을 확인하기 때문이다.
+  sectionSnapshotEntryRemoved();
   await sectionZombies();
 
   clearInterval(keepAlive);

@@ -388,9 +388,11 @@ interface Snapshotish {
   tickError: string | null;
   statText: string;
   statusText: string;
-  snapstatText: string;
   playText: string;
-  modeHidden: boolean;
+  // ⛔ `snapstatText`·`modeHidden` 은 H-1 에서 뺐다 — `#snapstat`·`#mode` 가
+  //    화면에 없어 늘 ''·true 로만 읽히는, 없는 요소를 가리키는 값이 된다.
+  //    `snapVisible`·`snapBox` 는 남긴다: 저쪽은 뷰어의 살아 있는 모드 기계를
+  //    읽는 것이라 §6·§7 이 없어져도 여전히 사실이다.
 }
 
 /** 화면 상태 한 벌. 한 번의 evaluate 로 모아 온다 — 왕복마다 시점이 어긋나지 않게 */
@@ -416,9 +418,7 @@ function readState(page: Page): Promise<Snapshotish> {
       tickError: v.lastTickError ? v.lastTickError.message : null,
       statText: text('stat'),
       statusText: text('status'),
-      snapstatText: text('snapstat'),
       playText: text('play'),
-      modeHidden: (document.getElementById('mode') as HTMLButtonElement | null)?.hidden ?? true,
     };
   });
 }
@@ -704,8 +704,9 @@ async function main(): Promise<void> {
     await sectionPlayback(page);
     await sectionOrbit(page);
     await sectionPauseResume(page);
-    const colors = await sectionSnapshot(page);
-    await sectionExclusive(page, colors);
+    // ⛔ 여기 있던 §6(스냅샷)·§7(배타 모드)은 2026-08-13 에 뺐다 (H-1) —
+    //    화면에서 `#snap` 버튼이 내려가 클릭할 대상이 없다. 스냅샷 모듈
+    //    자체의 검사는 스모크 §8-8·§8-9·§8-10 이 계속 맡는다.
     await sectionPlaybackControls(page);
     await sectionParams(page, sent);
     await sectionUnfold(page);
@@ -1058,306 +1059,20 @@ async function sectionPauseResume(page: Page): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────
-// §6. 스냅샷 — 아바타와 진짜 색
+// ⛔ §6(스냅샷 — 아바타 + 진짜 색)과 §7(배타 모드 — 실시간 ↔ 스냅샷)은
+//    2026-08-13 에 뺐다 (H-1). 둘 다 `#snap` 을 클릭하는 것으로 시작했는데,
+//    그 버튼이 화면에서 내려갔다 — 데스크톱 앱에 대응하는 기능이 없어서다
+//    (사유는 `index.html` 의 그 자리 주석에 있다).
 //
-// ⚠️ **시뮬을 돌린 뒤에 찍어야 옷이 입혀진다.** 익스포트는 찍는 순간의 포즈를
-//    담으므로, 0프레임에서 찍으면 옷이 아바타 위에 얹히기 전 상태가 나온다.
-//    그래서 이 절은 §3~§5 뒤에 있고, 순서를 바꾸면 "아바타는 나오는데 옷이
-//    몸에서 떨어져 있다"로 보인다 — ISSUE-011 회귀와 구별되지 않는 그림이다.
+//    **모듈은 안 지웠다.** `viewer3d/snapshot.ts` · `viewer3d/snapshotView.ts`
+//    와 뷰어의 `live`/`snapshot` 모드 기계는 그대로이고, 스모크
+//    §8-8·§8-9·§8-10(단언 87건)이 익스포트 경로를 계속 검사한다. 화면에서만
+//    확인되던 것 — 두 `visible` 이 그림으로 배타인가, 스냅샷의 색이 파일에서
+//    오는가 — 은 진입점이 돌아오면 여기로 같이 돌아온다.
 //
-// 먼저 정지시키는 이유: 익스포트 4.5초 동안 시뮬이 계속 진행하면 화면의 옷과
-// 파일 속 포즈가 달라져 §7 의 화면 비교가 흔들린다.
+// ⚠️ 남은 것 중 `bucketOf()`(:311)는 이 두 절이 유일한 호출자였다. 색 분석
+//    도구라 지우지 않고 뒀다 — 진입점이 돌아오면 그대로 다시 쓴다.
 // ─────────────────────────────────────────────────────────────
-
-interface SnapshotColors {
-  live: ScreenColors;
-  snap: ScreenColors;
-}
-
-async function sectionSnapshot(page: Page): Promise<SnapshotColors> {
-  section('§6. 스냅샷 — 아바타 + 진짜 색');
-
-  return await timed('§6 스냅샷', async () => {
-    await ensurePlaying(page, false);
-    await untilPage(page, () => globalThis.cobalt.stats.fps === 0, 8_000);
-
-    // 실시간 화면의 색 분포. §7 의 비교 기준이자, 아래 "진짜 색" 판정의 대조군이다.
-    const liveShot = await shot(page, 'live-before-snapshot');
-    const before = await readState(page);
-
-    const t0 = performance.now();
-    await page.click('#snap');
-    const done = await page
-      .waitForFunction(
-        () => ['ready', 'error'].includes(globalThis.cobalt.snapStats.phase),
-        null,
-        { timeout: SNAPSHOT_TIMEOUT },
-      )
-      .then(() => true, () => false);
-    const elapsed = performance.now() - t0;
-
-    const snapStats = await page.evaluate(() => {
-      const s = globalThis.cobalt.snapStats;
-      return {
-        phase: s.phase,
-        succeeded: s.succeeded,
-        failed: s.failed,
-        present: s.present,
-        error: s.lastError ? s.lastError.message : null,
-        bytes: s.lastResult?.info.bytes ?? 0,
-        name: s.lastResult?.info.name ?? '',
-        meshes: s.lastResult?.stats.meshes ?? 0,
-        vertices: s.lastResult?.stats.vertices ?? 0,
-        materials: s.lastResult?.stats.materials ?? 0,
-        textures: s.lastResult?.stats.textures ?? 0,
-        timings: s.lastResult?.timings ?? null,
-      };
-    });
-
-    check('★ 스냅샷이 완성된다', done && snapStats.phase === 'ready',
-      `${snapStats.phase} · ${ms(elapsed)}${snapStats.error ? ` · ${snapStats.error}` : ''}`);
-    check('실패 없이 한 번에 성공', snapStats.succeeded >= 1 && snapStats.failed === 0,
-      `성공 ${snapStats.succeeded} / 실패 ${snapStats.failed}`);
-    check('내려받은 glTF 가 비어 있지 않다', snapStats.bytes > 1_000_000,
-      `${(snapStats.bytes / (1 << 20)).toFixed(1)}MB · ${snapStats.name}`);
-
-    // 아바타가 정말 들어 있는가 — 메시 수·정점 수가 옷보다 훨씬 크다는 관계로
-    // 본다. 절대값을 박으면 씬을 바꾸는 순간 깨진다.
-    check(
-      '★ 스냅샷에 옷 말고도 무언가가 들어 있다 (= 아바타)',
-      snapStats.meshes > before.patterns * 2 && snapStats.vertices > before.vertices,
-      `메시 ${snapStats.meshes} (옷 패턴 ${before.patterns}) · 정점 ${fmt(snapStats.vertices)} (옷 ${fmt(before.vertices)})`,
-    );
-    check(
-      '★ 머티리얼과 임베드 텍스처가 딸려 왔다',
-      snapStats.materials > 0 && snapStats.textures > 0,
-      `머티리얼 ${snapStats.materials} · 텍스처 ${snapStats.textures}`,
-    );
-
-    const after = await readState(page);
-    check('화면이 스냅샷 모드로 넘어갔다', after.mode === 'snapshot', after.mode);
-    check('스냅샷 상태줄이 채워진다', after.snapstatText.includes('스냅샷'), `"${after.snapstatText}"`);
-    check('모드 전환 버튼이 나타난다', !after.modeHidden, after.modeHidden ? '숨겨져 있다' : '보인다');
-
-    // 아바타가 옷보다 위아래로 넘친다 — 발은 옷단보다 아래, 머리는 옷보다 위.
-    // 두 경계 상자가 같은 공간(cm)에 있다는 것까지 한 번에 지킨다.
-    const sMin = after.snapBox.min[1] ?? Number.NaN;
-    const sMax = after.snapBox.max[1] ?? Number.NaN;
-    const cMin = after.clothBox.min[1] ?? Number.NaN;
-    const cMax = after.clothBox.max[1] ?? Number.NaN;
-    check(
-      '★ 아바타가 옷보다 위아래로 넘친다 (두 뷰가 같은 좌표계에 있다)',
-      sMin < cMin && sMax > cMax,
-      `스냅샷 y ${sMin.toFixed(1)}~${sMax.toFixed(1)} vs 옷 y ${cMin.toFixed(1)}~${cMax.toFixed(1)}`,
-    );
-    check(
-      '스냅샷이 사람 키 규모다 (SNAPSHOT_SCALE 이 살아 있다)',
-      sMax - sMin > 100 && sMax - sMin < 300,
-      `${(sMax - sMin).toFixed(1)}cm`,
-    );
-
-    // ── 픽셀 검사: "진짜 색"이 화면에 나오는가 ─────────────
-    //
-    // 파싱했다는 것과 그 색이 픽셀이 됐다는 것은 다른 명제다. 판정 방법은
-    // **대조**다 — 실시간 옷의 색은 `cloth.ts` 의 디버그 팔레트 5색이고,
-    // 스냅샷의 색은 glTF 머티리얼·텍스처에서 온다. 두 화면의 지배색이
-    // 서로에게 거의 없는 색이면, 스냅샷 화면의 색은 팔레트로 만들 수 없는
-    // 색 = **파일에서 온 색**이다.
-    //
-    // 특정 색 이름(노랑·민트)을 단언하지 않는 이유: 그건 씬이 정하는 값이라
-    // .zls 를 바꾸면 깨진다. 색 이름은 note 로 남기고 단언은 관계로 한다.
-    const snapShot = await shot(page, 'snapshot');
-    const sc = snapShot.colors;
-    const lc = liveShot.colors;
-
-    check(
-      '★ 스냅샷 화면에 색이 실제로 칠해져 있다',
-      sc.saturated > sc.total * 0.005,
-      describe(sc),
-    );
-    const snapDomInLive = bucketOf(lc, sc.dominant);
-    const liveDomInSnap = bucketOf(sc, lc.dominant);
-    check(
-      '★ 스냅샷의 지배색이 실시간 화면에는 거의 없다 (팔레트가 아니라 파일의 색이다)',
-      bucketOf(sc, sc.dominant) > 2_000 && snapDomInLive < bucketOf(sc, sc.dominant) * 0.2,
-      `${hueName(sc.dominant)} — 스냅샷 ${fmt(bucketOf(sc, sc.dominant))}px / 실시간 ${fmt(snapDomInLive)}px`,
-    );
-    check(
-      '★ 반대로 실시간의 지배색은 스냅샷에 거의 없다 (두 화면이 섞이지 않았다)',
-      liveDomInSnap < bucketOf(lc, lc.dominant) * 0.2,
-      `${hueName(lc.dominant)} — 실시간 ${fmt(bucketOf(lc, lc.dominant))}px / 스냅샷 ${fmt(liveDomInSnap)}px`,
-    );
-    // ── 그리고 색 이름까지 (씬을 아는 유일한 판정) ──────────
-    //
-    // 위 두 단언은 씬을 몰라도 성립하지만, 그 대가로 **어느 색인지는 말하지
-    // 못한다** — 파일에서 온 색이기만 하면 회색이어도 통과한다. 실측 basecolor
-    // 를 아는 씬에서는 거기까지 확인한다. 씬이 다르면 단언하지 않고 넘어간다
-    // (씬을 바꿨다고 빨간불이 되면 아무도 이 하네스를 안 믿게 된다).
-    const KNOWN_SCENE = 'W_Bra top & Leggings';
-    if (snapStats.name.includes(KNOWN_SCENE)) {
-      // 민트는 옅은 쪽에서, 노랑은 진한 쪽에서 센다 — 이유는 MINT_BAND 주석.
-      const mint = band(sc.pale, MINT_BAND[0], MINT_BAND[1]);
-      const yellow = band(sc.buckets, YELLOW_BAND[0], YELLOW_BAND[1]);
-      const liveMint = band(lc.pale, MINT_BAND[0], MINT_BAND[1]);
-      const liveYellow = band(lc.buckets, YELLOW_BAND[0], YELLOW_BAND[1]);
-      // 문턱 1,000px 은 1280×800(102만px)의 0.1% 다. 실측(민트 2,564 · 노랑
-      // 16,134)과는 두 배~열 배 여유가 있고, 안티에일리어싱 경계가 우연히
-      // 넘을 수 있는 수(실시간 민트띠 198px)는 확실히 넘는다.
-      const FLOOR = 1_000;
-      check(
-        '★ 스냅샷에 민트가 실제 픽셀로 있다 (실측 basecolor [0.733,0.886,0.816] → 152.5°, 옅은 띠)',
-        mint > FLOOR,
-        `색조 ${MINT_BAND[0] * 10}~${(MINT_BAND[1] + 1) * 10}° · 채도 옅음 ${fmt(mint)}px`,
-      );
-      check(
-        '★ 스냅샷에 노랑이 실제 픽셀로 있다 (실측 basecolor [0.925,0.812,0.471] → 45.1°)',
-        yellow > FLOOR,
-        `색조 ${YELLOW_BAND[0] * 10}~${(YELLOW_BAND[1] + 1) * 10}° ${fmt(yellow)}px`,
-      );
-      // 두 색이 팔레트에서 올 수 있었다면 위 둘은 아무것도 증명하지 않는다.
-      // 실시간 화면에서 **같은 띠를 같은 채도 구간으로** 재서 그 길을 닫는다.
-      check(
-        '★ 그 두 색은 디버그 팔레트로 만들 수 없다 (실시간 화면의 같은 띠가 비어 있다)',
-        liveMint < mint * 0.2 && liveYellow < yellow * 0.2,
-        `실시간 민트띠(옅은) ${fmt(liveMint)}px vs 스냅샷 ${fmt(mint)}px`
-        + ` · 노랑띠 ${fmt(liveYellow)}px vs ${fmt(yellow)}px`,
-      );
-      note(
-        '팔레트 색조',
-        `${LIVE_PALETTE_BUCKETS.map((k) => `${k * 10}°`).join(' · ')}`
-        + ' — 노랑띠와 겹치지 않고, 민트빛(130°)은 채도 0.289 라 옅은 띠에 못 들어간다',
-      );
-    } else {
-      note(
-        '색 이름 판정',
-        `건너뛴다 — 실측 basecolor 를 아는 씬("${KNOWN_SCENE}")이 아니라 "${snapStats.name}" 이 열려 있다`,
-      );
-    }
-
-    note('실시간 화면', describe(lc));
-    note('스냅샷 화면', describe(sc));
-    if (snapStats.timings) {
-      const t = snapStats.timings;
-      note('스냅샷 소요', `익스포트 ${t.exportMs}ms · 다운로드 ${t.downloadMs}ms · 파싱 ${t.parseMs}ms · 부착 ${t.installMs}ms`);
-    }
-
-    return { live: lc, snap: sc };
-  });
-}
-
-// ─────────────────────────────────────────────────────────────
-// §7. 배타 모드 — 동시에 보이지도, 둘 다 안 보이지도 않는다
-//
-// `Viewer3D.setMode` 는 두 `visible` 을 한 값에서 파생시켜 "둘 다 켜짐"을
-// 표현할 수 없게 만든 함수다. 그 불변식이 **화면에서** 지켜지는지는 여기서만
-// 확인된다 — Node 스모크는 렌더러가 없어 판정할 수 없다.
-// ─────────────────────────────────────────────────────────────
-
-async function sectionExclusive(page: Page, colors: SnapshotColors): Promise<void> {
-  section('§7. 배타 모드 — 실시간 ↔ 스냅샷');
-
-  await timed('§7 배타 모드', async () => {
-    const inSnap = await readState(page);
-
-    // §6 이 실패했으면 `#mode` 버튼이 `hidden` 이라 클릭이 30초를 기다리다
-    // 던지고, **하네스가 통째로 중단된다** — 실측으로 §8·§9 를 통째로 잃었다.
-    // 전제가 없으면 이 절만 접는다. §6 이 이미 이유를 적어 놓았다.
-    if (inSnap.modeHidden) {
-      note('§7 건너뜀', '스냅샷이 없어 모드 전환을 시험할 수 없다 — 원인은 §6 에 있다');
-      check('★ 배타 모드를 판정할 수 있다 (스냅샷이 있다)', false, '스냅샷이 없다');
-      return;
-    }
-    check(
-      '★ 스냅샷 모드: 스냅샷만 보인다',
-      inSnap.snapVisible && !inSnap.clothVisible,
-      `cloth ${inSnap.clothVisible} / snapshot ${inSnap.snapVisible}`,
-    );
-
-    await page.click('#mode');
-    await sleep(500);
-    const inLive = await readState(page);
-    check(
-      '★ 되돌리면 실시간만 보인다',
-      inLive.clothVisible && !inLive.snapVisible,
-      `cloth ${inLive.clothVisible} / snapshot ${inLive.snapVisible}`,
-    );
-    check('모드 값도 따라온다', inLive.mode === 'live', inLive.mode);
-
-    const backShot = await shot(page, 'back-to-live');
-
-    // 화면이 실제로 되돌아왔는가 — 상태값이 아니라 픽셀로 본다.
-    //
-    // ⚠️ **아까 찍은 실시간 화면과 픽셀을 맞대면 안 된다.** 처음엔 그렇게
-    //    짰다가 빨간불이 났고, 원인은 회귀가 아니라 카메라였다: 스냅샷으로
-    //    갈 때는 `setMode('snapshot', { refit: true })` 가 아바타 경계(약
-    //    177cm)에 맞춰 카메라를 다시 잡고, 되돌아올 때는 **일부러 다시 잡지
-    //    않는다** (`main.ts:326` — "사용자가 잡아 둔 시점을 빼앗지 않는다").
-    //    그래서 돌아온 화면은 §6 때와 같은 옷을 **다른 화각에서** 본 그림이고,
-    //    색조별 픽셀 수는 당연히 다르다. 실측으로 주황이 12,267 → 2,929px 로
-    //    떨어지면서 지배색이 파랑으로 바뀌었다 — 정상 동작이다.
-    //
-    // 그래서 화각이 바뀌어도 성립하는 명제로 판정한다: **스냅샷의 색이
-    // 사라졌는가.** 이게 "상태만 바뀌고 그림은 그대로"를 잡는 데 필요한 전부다
-    // (그림이 안 바뀌었다면 스냅샷 색이 그대로 남아 있다).
-    const snapDom = colors.snap.dominant;
-    check(
-      '★ 되돌린 화면에서 스냅샷의 색이 사라졌다 (상태만 바뀌고 그림이 안 바뀌는 경우를 막는다)',
-      bucketOf(backShot.colors, snapDom) < bucketOf(colors.snap, snapDom) * 0.2,
-      `${hueName(snapDom)} — 스냅샷 ${fmt(bucketOf(colors.snap, snapDom))}px → 되돌린 뒤 ${fmt(bucketOf(backShot.colors, snapDom))}px`,
-    );
-    // 그리고 그 자리를 실시간 팔레트가 채우고 있는가. 팔레트 칸은 카메라
-    // 각도와 무관하게(패턴 24개가 전부 화면에 있으므로) 나타난다.
-    const palettePx = LIVE_PALETTE_BUCKETS.reduce(
-      (n, k) => n + band(backShot.colors.buckets, k - 1, k + 1),
-      0,
-    );
-    check(
-      '★ 되돌린 화면이 실시간 팔레트 색으로 채워져 있다',
-      palettePx > backShot.colors.saturated * 0.5,
-      `팔레트 칸 ${fmt(palettePx)}px / 유채색 ${fmt(backShot.colors.saturated)}px`,
-    );
-    check(
-      '★ 둘 다 안 보이는 상태가 아니다 (화면이 비지 않았다)',
-      backShot.colors.saturated > backShot.colors.total * 0.005,
-      describe(backShot.colors),
-    );
-    note('되돌린 화면', describe(backShot.colors));
-
-    // 왕복. 한 방향만 보면 "한 번은 되는데 다시 가면 안 되는" 경우를 놓친다.
-    await page.click('#mode');
-    await sleep(500);
-    const again = await readState(page);
-    check(
-      '★ 다시 스냅샷으로 가도 배타가 유지된다',
-      again.snapVisible && !again.clothVisible && again.mode === 'snapshot',
-      `cloth ${again.clothVisible} / snapshot ${again.snapVisible} / mode ${again.mode}`,
-    );
-    const againShot = await shot(page, 'snapshot-again');
-    check(
-      '★ 왕복해도 화면이 비지 않는다',
-      againShot.colors.saturated > againShot.colors.total * 0.005,
-      describe(againShot.colors),
-    );
-
-    // 재생을 누르면 실시간으로 돌아온다 (main.ts 의 returnToLiveForPlayback).
-    // 스냅샷을 보는 채로 시뮬을 켜면 "재생을 눌렀는데 아무것도 안 움직인다"가
-    // 되는데, 그 실패는 화면 어디에도 원인이 안 남는다.
-    await ensurePlaying(page, true);
-    await sleep(700);
-    const afterPlay = await readState(page);
-    check(
-      '★ 재생을 누르면 실시간 뷰로 돌아온다 (정지 화면 위에서 시뮬을 켜지 않는다)',
-      afterPlay.mode === 'live' && afterPlay.clothVisible && !afterPlay.snapVisible,
-      `mode ${afterPlay.mode} · cloth ${afterPlay.clothVisible} / snapshot ${afterPlay.snapVisible}`,
-    );
-    check(
-      '스냅샷은 버려지지 않는다 (모드 버튼이 남아 있다)',
-      !afterPlay.modeHidden,
-      afterPlay.modeHidden ? '버튼이 사라졌다' : '버튼이 남아 있다',
-    );
-    await ensurePlaying(page, false); // 정리: 시뮬을 멈춰 둔다
-  });
-}
 
 // ─────────────────────────────────────────────────────────────
 // §10. 재생 컨트롤 (#14) — 버튼·키가 실제로 화면을 움직인다

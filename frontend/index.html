@@ -639,19 +639,23 @@
       -->
       <button id="drape" disabled data-i18n="bar.drape">👗 드레이프</button>
       <!--
-        스냅샷 = 익스포트한 glTF(아바타 + 진짜 머티리얼)를 화면에 세운다.
-        **버튼이다. 자동이 아니다** — 사용자 씬 기준 36.5MB / 4.3초라 씬을 열
-        때마다 자동으로 돌리면 첫 화면이 그만큼 늦어진다.
-        `#mode` 는 실시간 ↔ 스냅샷 전환. 둘이 **동시에 보이는 상태는 없다**
-        (좌표계가 다르다 — ISSUE-011).
+        ⛔ 여기 있던 `#snap`(🧍 스냅샷)·`#mode`(↩ 실시간)·`#snapstat` 은
+           **2026-08-13 에 뺐다 (H-1).** 데스크톱 앱에 대응하는 기능이 없다 —
+           회사 코드에 snapshot 이라는 낱말이 0 건이고, 데스크톱에 있는 것은
+           기능 #10 `Export gltf`(파일로 저장하고 끝)뿐이다. 스냅샷 뷰가 생긴
+           이유(실시간 뷰에 아바타가 없고 색이 임의였다)도 E그룹이 2026-08-12 에
+           끝나면서 사라졌다 — 지금은 실시간 뷰가 아바타·머티리얼·텍스처를 다
+           갖췄고 색이 스냅샷과 소수점까지 같다.
+
+           **화면에서만 내렸다. 코드는 살아 있다** — `viewer3d/snapshot.ts` ·
+           `viewer3d/snapshotView.ts` 와 뷰어의 `live`/`snapshot` 모드 기계,
+           그리고 스모크 §8-8·§8-9·§8-10(단언 87건)이 그대로다. 그 셋이
+           익스포트 경로를 자동으로 검사하는 **유일한 자리**이고
+           ISSUE-012·ISSUE-013 이 아직 열려 있다.
       -->
-      <button id="snap" disabled data-i18n="bar.snap" data-i18n-title="bar.snap.title"
-              title="지금 포즈를 glTF 로 내보내 아바타와 함께 세웁니다">🧍 스냅샷</button>
-      <button id="mode" disabled hidden data-i18n="bar.mode.live">↩ 실시간</button>
       <span class="spacer"></span>
       <!-- 드레이프의 사유·결과 (W-1). 위 버튼 주석 참고 -->
       <span id="drapestat" class="stat"></span>
-      <span id="snapstat" class="stat"></span>
       <!--
         `#sim` 은 **워커가 말하는 상태**(재생/정지 · 프레임)이고 `#frames` 는
         **브라우저가 실제로 그린 것**(적용/버림/fps)이다. 출처가 다르므로 둘 다
