@@ -61,6 +61,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -2843,9 +2844,59 @@ int RunProtocolLoop(ZestManager& manager)
                     maxFrame.store(-1);
                     curFrame.store(-1);
                     lastEmitted = -1;
+
+                    // ★ 엔진은 실패 이유를 `std::cout` 으로만 말한다. 예:
+                    //     [Open zls]'...' Failed to open ZLS.
+                    //     The file was created with a newer version.
+                    //   그런데 `OutputChannels` 가 cout 을 stderr 로 돌려 두므로
+                    //   (머리말 참고) 그 줄은 **워커 로그에만** 남고 응답에는 실리지
+                    //   않았다. 그래서 화면이 말할 수 있는 것이 "zls 로드 실패"
+                    //   뿐이었고, 사용자는 왜 안 되는지 모른 채 같은 파일을 반복해
+                    //   올린다 — 2026-08-24에 실제로 네 번 올렸다.
+                    //
+                    //   로드하는 동안만 cout 을 따로 받아 두고, 실패하면 그 문장을
+                    //   응답에 함께 싣는다. 성공 경로의 진행 메시지도 같이 잡히므로
+                    //   잡은 것은 그대로 stderr 로 흘려보내 로그를 보존한다.
+                    std::ostringstream engineOut;
+                    std::streambuf* const prevCout = std::cout.rdbuf(engineOut.rdbuf());
                     ok = manager.LoadZls(ztString(path));
-                    if (!ok) error = "zls 로드 실패";
-                    else     result = json{ { "loaded", true }, { "path", path } };
+                    std::cout.rdbuf(prevCout);
+
+                    const std::string engineText = engineOut.str();
+                    if (!engineText.empty())
+                    {
+                        std::cerr << engineText;
+                        if (engineText.back() != '\n') std::cerr << '\n';
+                    }
+
+                    if (!ok)
+                    {
+                        error = "zls 로드 실패";
+
+                        // 엔진이 찍은 마지막 의미 있는 줄이 이유다.
+                        std::string reason;
+                        {
+                            std::istringstream lines(engineText);
+                            std::string line;
+                            while (std::getline(lines, line))
+                            {
+                                while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+                                    line.pop_back();
+                                if (!line.empty()) reason = line;
+                            }
+                        }
+                        if (!reason.empty()) error += " — " + reason;
+
+                        // ⚠️ 이 갈래는 **다시 올려도 절대 열리지 않는다.** 그 사실을
+                        //    말해 주지 않으면 사용자가 재시도로 시간을 태운다.
+                        if (engineText.find("newer version") != std::string::npos)
+                        {
+                            error += " (이 씬은 현재 엔진보다 새 버전으로 저장됐습니다. "
+                                     "다시 올려도 열리지 않습니다 — 낮은 버전으로 다시 "
+                                     "내보내거나 엔진을 올려야 합니다)";
+                        }
+                    }
+                    else result = json{ { "loaded", true }, { "path", path } };
                 }
             }
             else if (op == "clear")
