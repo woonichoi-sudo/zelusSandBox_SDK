@@ -1913,7 +1913,11 @@ async function findOrUploadScene(base: string): Promise<SceneSummary | null> {
   }
   const t0 = performance.now();
   const data = await readFile(ZLS);
-  const up = await uploadScene('sample.zls', data);
+  // ⚠️ `base` 를 반드시 넘긴다. 빠뜨리면 상대 URL 이 만들어지는데, 브라우저는
+  //    현재 문서 주소로 채워 주지만 Node 의 fetch 는 못 채워 ERR_INVALID_URL 로
+  //    죽는다. 이 절은 워커 exe 가 없는 머신에서 통째로 생략되므로 그동안
+  //    드러나지 않았다 (2026-08-24, 워커를 새로 빌드하고서야 밟았다).
+  const up = await uploadScene('sample.zls', data, { base });
   note('씬 업로드', `${up.id} (${up.bytes}바이트, ${ms(performance.now() - t0)})`);
   return up;
 }
@@ -3118,10 +3122,33 @@ function sectionClothMaterial(): void {
       mm?.color.getHex() === 0x7ea8d8,
       `mesh 색 #${mm?.color.getHex().toString(16)} / 실린 재질 [${p?.material?.color.join(',')}]`,
     );
+    // ★★ **2026-08-24에 뒤집혔다.** 예전 단언은 "씬은 1.0 인데 뷰는 여전히
+    //    0.78 이다" 였다 — materials-a 가 워커 쪽만 고쳤다는 경계를 못박은
+    //    장치였고, 위 주석이 예고한 "의도적 빨간불" 이 이 자리다.
+    //    이제 옷도 아바타(`avatar.ts:305-306`)·데스크톱(`Renderer3D.cpp:340-345`)
+    //    처럼 **씬의 값을 쓴다.** 색은 여전히 팔레트인 것에 유의 — 무늬가 꺼져
+    //    있으면 `plan` 이 null 이라 tint 를 안 쓰고, roughness/metalness 는
+    //    그것과 **무관하게** 씬 값을 쓴다. 두 축이 갈린다는 것이 이 단언의 뜻이다.
     check(
-      '★★ roughness·metalness 도 mesh 로 안 샌다 (씬은 1.0 인데 뷰는 여전히 0.78 이다)',
-      mm?.roughness === 0.78 && mm.metalness === 0,
+      '★★★ roughness·metalness 는 씬 값이 mesh 까지 온다 (색은 팔레트인데 이 둘은 씬 값이다)',
+      mm?.roughness === 1 && mm.metalness === 0,
       `mesh r${mm?.roughness}/m${mm?.metalness} vs 재질 r${p?.material?.roughness}/m${p?.material?.metalness}`,
+    );
+    cloth.clear();
+  }
+
+  // ── ③-b 대조군: 재질이 없으면 옛 상수로 떨어진다 ─────────────
+  //
+  // ★ 이것이 없으면 위 단언은 "씬 값을 쓴다" 와 "우연히 1.0 을 하드코딩했다" 를
+  //   구분하지 못한다. `sample.zls` 처럼 재질이 안 실리는 씬이 실제로 있다.
+  {
+    const cloth = new ClothObject();
+    cloth.setTopology([patternMat('y', null)]);
+    const mm = cloth.patterns[0]?.mesh.material as THREE.MeshStandardMaterial | undefined;
+    check(
+      '★★ 재질이 없으면 0.78 / 0 으로 떨어진다 (폴백이 살아 있다)',
+      mm?.roughness === 0.78 && mm.metalness === 0,
+      `mesh r${mm?.roughness}/m${mm?.metalness}`,
     );
     cloth.clear();
   }
