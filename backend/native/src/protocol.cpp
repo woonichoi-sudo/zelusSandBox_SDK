@@ -19,6 +19,7 @@
                                    // ztAvatarManager.h 는 전방선언만 한다 —
                                    // 없으면 zsTriMesh 로 업캐스트가 안 된다
 #include <ztDesignZeta.h>          // SetMeasurementParam / UpdateBodyParams (치수→체형)
+#include <ztDesignUpdateManager.h> // skipRecomputeAvatar — 체형 쓰기의 재빌드를 막는다
 #include <ztSimulationManager.h>   // 체형 단계마다 Step / Pause
 #include <ztDesignSurface.h>       // ztDesignSurfaceData::name (옷 사이즈)
 #include <ztDesign2DTransform.h>   // 서피스 2D 배치 (MeshData의 transform2d)
@@ -335,7 +336,76 @@ bool WriteAvatarBody(ZestManager& manager, const json& body,
         applied.push_back(it.key());
     }
 
-    if (!applied.empty()) qi->UpdateAvatar(uuid, next);
+    if (applied.empty()) return true;
+
+    // ── 왜 `UpdateAvatar` 한 번으로 끝내지 않는가 ──────────────────
+    //
+    // ⛔ **`UpdateAvatar` 만 부르면 몸통 표면이 접힌다.** 그것은 씬 데이터를
+    //    갈아 끼우고 `Synchronize` → `ztDesignZeta::Recompute()` 를 태우는데, 거기
+    //    (`Zest/design/ztDesignZeta.cpp:220-231`)가 치수 정보를 이렇게 만든다:
+    //
+    //        copyRealValues[i].isLock = true;   // ← 20여 개를 **전부** 잠근다
+    //        copyRealValues[i].value  = data.zetaData.measurementRealValues[i];
+    //        mAvatarManager->SetMeasurementParam(copyRealValues, bodyParams, true, true);
+    //
+    //    `isLock` 의 기본값은 false 인데(`ztAvatarShaper.h:166`) 이 자리만 덮는다.
+    //    그러면 `SetMeasurementParam` 이 잠긴 치수마다 "새 체형이 만드는 치수" 와
+    //    "씬에 저장된 옛 치수" 의 오차를 재고, 5mm 를 넘으면 `AccurateMeasure` 로
+    //    **정점별 오프셋**을 만들어 살을 옛 둘레로 끌어당긴다. 셰이퍼는 몸을
+    //    부풀리고 그 잠금은 되당기므로, 두 힘이 부딪히는 가슴·허리·배가
+    //    구겨진다. 실측(fatness, Body 파트 5,630 삼각형 중 뒤집힌 수):
+    //
+    //        0.4 → 0    0.5 → 0    0.55 → 134    0.8 → 269    1.0 → 338
+    //
+    //    씬에 저장된 값(0.5) 근처에서 0 이고 **양방향**으로 멀어질수록 커진다
+    //    (0.25 → 59, 0.0 → 115). 오차가 5mm 를 넘는 순간부터 당기기 시작한다는
+    //    설명과 정확히 맞는다. bust_size·belly 등 다른 파라미터도 같다.
+    //
+    // ★ 그래서 둘로 나눈다. 씬 데이터는 재빌드 없이 갱신하고(①), 실제 몸은
+    //   셰이퍼 전용 입구로 만든다(②). `SetBodyParam` 이
+    //   `mAccurateVertexOffsets` 를 비우므로 되당김이 사라진다
+    //   (`Zest/avatar/ztAvatarManager.cpp:401-406`).
+    //
+    // ⚠️ 데스크톱 앱에는 이 경로를 밟는 자리가 아예 없다(`zelusSandBox` 전체에
+    //    `bodyParams` · `SetMeasurementParam` 호출이 0건이다). 참고할 선례가
+    //    없다는 뜻이므로, 고칠 때 위 실측을 기준선으로 쓸 것.
+
+    // ① 씬 데이터만 갱신한다 — `ReadAvatarBody` 의 되읽기와 `.zls` 저장이 이 값을
+    //    본다. 플래그는 `Recompute()` 첫 줄이 보고 그대로 돌아 나가는 것이다.
+    {
+        const bool prevSkip = ztDesignUpdateManager::mUpdateFlag.skipRecomputeAvatar;
+        ztDesignUpdateManager::mUpdateFlag.skipRecomputeAvatar = true;
+        qi->UpdateAvatar(uuid, next);
+        ztDesignUpdateManager::mUpdateFlag.skipRecomputeAvatar = prevSkip;
+    }
+
+    // ② 살아 있는 제타에 셰이퍼 값을 넣고 몸을 다시 만든다.
+    //
+    // ⚠️ 제타가 아닌 아바타(마네킹·FBX)는 `dynamic_cast` 가 실패해 **몸이 안
+    //    변한다.** 그 사실은 응답의 `avatar` 되읽기가 드러낸다 — 씬 값은 바뀌고
+    //    `measurementSource` 가 `sceneData` 로 남는다(`ReadAvatarBody` 참고).
+    {
+        const ztDesignAvatarStorage& avatars = qi->GetAvatars();
+        const auto found = avatars.find(uuid);
+        if (found != avatars.end())
+        {
+            if (ztDesignZeta* zeta = dynamic_cast<ztDesignZeta*>(found->second.get()))
+            {
+                // 29개를 전부 실어 보낸다. 안 바꾼 것은 지금 값 그대로이므로
+                // 결과가 같고, 부분만 보내면 `SetBodyParam` 이 배열을 통째로
+                // 대입하는 탓에 나머지가 dirty 표시를 잃는다.
+                ztAvatarManager::BodyParamInfos infos;
+                for (int i = 0; i < (int)ztAvatarBodyParam::Count; ++i)
+                {
+                    infos[i] = std::make_pair(true, next.zetaData.bodyParams[i]);
+                }
+
+                zeta->SetBodyParam(infos);
+                zeta->UpdateBodyParams(true, true);
+            }
+        }
+    }
+
     return true;
 }
 
