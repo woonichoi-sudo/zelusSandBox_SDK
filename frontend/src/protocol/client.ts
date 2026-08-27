@@ -45,6 +45,8 @@ import {
   type AvatarBodyResult,
   type AvatarMeasurementTargets,
   type AvatarMeshResult,
+  type DrapingItemsResult,
+  type DrapingThumbnailResult,
   type LoadDrapingResult,
   type SetAvatarBodyResult,
   type SetAvatarMeasurementsResult,
@@ -566,18 +568,54 @@ export class GatewayClient {
   }
 
   /**
-   * `.zls` 에 저장된 자동 드레이프를 적용한다 (W-1) — 펼쳐진 옷이 입혀진다.
+   * 씬에 저장된 드레이핑 아이템 목록 (DB-1). **씬을 안 바꾼다.**
    *
-   * ⚠️ **`applied:false` 는 실패가 아니다.** 그 씬에 자동 드레이프가 저장돼
-   *    있지 않을 뿐이고(`reason:'noAutoItem'`), 게이트웨이도 성공으로 중계한다.
-   *    씬이 로드되지 않았을 때만 `GatewayError` 로 던진다.
+   * `loadDraping()` 도 목록을 같이 돌려주지만 이쪽은 **적용하지 않는다** —
+   * 보드를 그리려면 아무것도 씌우기 전에 목록이 있어야 한다.
+   *
+   * ⚠️ 이름이 빈 아이템은 목록에 안 나온다(엔진의 필터, 데스크톱 앱과 같다).
+   *    `count` 는 **고를 수 있는 것**의 수이지 파일 안의 총수가 아니다.
+   */
+  drapingItems(): Promise<DrapingItemsResult> {
+    return this.request<DrapingItemsResult>('drapingItems');
+  }
+
+  /**
+   * `.zls` 에 저장된 드레이프를 적용한다 (W-1 / DB-1) — 펼쳐진 옷이 입혀진다.
+   *
+   * `uuid` 를 주면 그 아이템을, **없으면 자동 아이템**을 적용한다.
+   *
+   * ⚠️ **`applied:false` 는 실패가 아니다.** 자동 드레이프가 없거나
+   *    (`reason:'noAutoItem'`) 준 uuid 가 목록에 없을 뿐이고(`'notFound'`),
+   *    게이트웨이도 성공으로 중계한다. 씬이 로드되지 않았을 때만
+   *    `GatewayError` 로 던진다.
    *
    * ★ **`applied:true` 면 워커가 프레임 카운터를 -1 로 되돌린다** (엔진이 안에서
    *   `Reset()` 한다). 즉 화면에는 `reset` 과 **같은 무게**의 op 이다 — 재생
    *   상태·프레임 표시·화면의 포즈를 리셋과 똑같이 갱신해야 한다.
    */
-  loadDraping(): Promise<LoadDrapingResult> {
-    return this.request<LoadDrapingResult>('loadDraping');
+  loadDraping(uuid?: string): Promise<LoadDrapingResult> {
+    // 인자가 없으면 필드 자체를 안 싣는다. 빈 문자열이 새어 나가면 게이트웨이가
+    // 거절하고(buildLoadDraping), 그 전에 새어 나갔다면 워커가 "자동" 으로 읽어
+    // **다른 것이 적용되고 성공으로 보인다** — 고르는 화면에서 최악의 실패다.
+    return uuid === undefined
+      ? this.request<LoadDrapingResult>('loadDraping')
+      : this.request<LoadDrapingResult>('loadDraping', { uuid });
+  }
+
+  /**
+   * 아이템 하나의 미리보기 이미지 (DB-1). **base64 로 온다** — 실측 60~75KB
+   * PNG 가 약 4/3 배로 부풀어 ~100KB 다.
+   *
+   * ★ **목록에는 바이트가 안 실린다.** 화면이 필요한 것만 하나씩 받고, 받은
+   *   것은 부르는 쪽이 캐시한다 — 같은 씬에서 안 변한다.
+   *
+   * ⚠️ **`hasImage:false` 는 실패가 아니다.** 없는 uuid(`'notFound'`), 미리보기
+   *    없이 저장된 아이템(`'noImage'`), 모르는 형식(`'unsupportedFormat'`)이
+   *    전부 여기로 온다.
+   */
+  drapingThumbnail(uuid: string): Promise<DrapingThumbnailResult> {
+    return this.request<DrapingThumbnailResult>('drapingThumbnail', { uuid });
   }
 
   /** 서피스(패턴) 목록과 크기. **cm 다** (L-3b) */

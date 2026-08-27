@@ -88,6 +88,9 @@ export type {
   AvatarMeasurementTargets,
   SetAvatarMeasurementsResult,
   DrapingItem,
+  DrapingItemsResult,
+  DrapingThumbnailInfo,
+  DrapingThumbnailResult,
   LoadDrapingResult,
   // 옷 사이즈 (L-3b)
   SurfaceInfo,

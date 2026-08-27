@@ -47,9 +47,15 @@ export type {
   AvatarMeshResult,
   AvatarPart,
   AvatarPartMaterial,
-  // 드레이프 (W-1). ⚠️ `applied:false` 는 에러가 아니라 "그 씬에 자동 드레이프가
-  // 없다" 이고, `applied:true` 는 프레임 카운터를 -1 로 되돌린다(= reset 과 같은 자리)
+  // 드레이핑 보드 (W-1 / DB-1). 아이템 하나는 프레임이 아니라 **세이브스테이트**다
+  // (솔버 월드 + 씬 사본 + 미리보기 PNG). ⚠️ `applied:false` 는 에러가 아니라
+  // "자동 드레이프가 없다"(noAutoItem) 나 "그 uuid 가 목록에 없다"(notFound) 이고,
+  // `applied:true` 는 프레임 카운터를 -1 로 되돌린다(= reset 과 같은 자리).
+  // ⚠️ 썸네일 바이트는 목록에 안 실린다 — `drapingThumbnail` 로 하나씩 받는다
   DrapingItem,
+  DrapingItemsResult,
+  DrapingThumbnailInfo,
+  DrapingThumbnailResult,
   LoadDrapingResult,
   // 옷 사이즈 (L-3b). 크기는 cm 다
   SurfaceInfo,

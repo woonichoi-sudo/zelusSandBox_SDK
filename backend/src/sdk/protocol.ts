@@ -35,8 +35,17 @@ export type Request =
       simulationIterations?: number;
       bodyDimensionStepCm?: number;
     }
-  /** `.zls` 에 저장된 자동 드레이프를 적용한다 (W-1) */
-  | { id: number; op: 'loadDraping' }
+  /** 씬에 저장된 드레이핑 아이템 목록. 부작용이 없다 (DB-1) */
+  | { id: number; op: 'drapingItems' }
+  /**
+   * `.zls` 에 저장된 드레이프를 적용한다 (W-1 / DB-1).
+   *
+   * `uuid` 를 주면 그 아이템을, **없으면 자동 아이템**을 적용한다 — 인자 없이
+   * 부르던 옛 호출이 한 글자도 안 달라진다.
+   */
+  | { id: number; op: 'loadDraping'; uuid?: string }
+  /** 아이템 하나의 미리보기 이미지 (base64). 목록에는 안 실린다 (DB-1) */
+  | { id: number; op: 'drapingThumbnail'; uuid: string }
   | { id: number; op: 'surfaces' }
   | { id: number; op: 'setSurfaceSize'; uuid: string; width?: number; height?: number }
   | { id: number; op: 'fabrics' }
@@ -697,10 +706,35 @@ export interface SetAvatarMeasurementsResult {
   avatar: AvatarBodyResult;
 }
 
-// ── 드레이프 (W-1) ──────────────────────────────────────────
+// ── 드레이핑 보드 (W-1 / DB-1) ──────────────────────────────
 //
 // `.zls` 는 "입혀진 상태" 를 드레이핑 아이템으로 저장해 둔다. 그냥 로드하면
-// 옷이 펼쳐진 채로 나오고, 이 op 이 그 저장된 상태를 씌운다.
+// 옷이 펼쳐진 채로 나오고, 이 op 들이 그 저장된 상태를 씌운다.
+//
+// ★ 아이템 하나는 프레임 한 장이 아니라 **완전한 세이브스테이트**다 —
+//   솔버 월드 통째(2.1~2.8MB) + 그 시점의 씬 데이터 전체 사본 + 미리보기 PNG.
+//   그래서 적용은 "다시 계산" 이 아니라 "그 순간으로 되돌아가기" 다.
+//
+// ★ **W-1 은 자동 아이템 하나만 적용할 수 있었다.** DB-1 이 그것을 보드로
+//   넓혔다: `drapingItems` 로 목록을 읽고, `loadDraping({uuid})` 로 아무거나
+//   고르고, `drapingThumbnail` 로 미리보기를 받는다. 인자 없는 `loadDraping`
+//   은 **한 글자도 안 달라졌다**.
+
+/** 아이템의 미리보기 이미지 **메타데이터**. 바이트는 안 실린다 */
+export interface DrapingThumbnailInfo {
+  /** 실측 512×512 */
+  width: number;
+  height: number;
+  /** 원본(인코딩된) 바이트 수. base64 로 받으면 약 4/3 배가 된다 */
+  bytes: number;
+  /**
+   * 워커가 **매직 바이트로 가려낸** 형식. 실측 sample.zls 는 전부 `image/png`.
+   *
+   * ⚠️ 엔진의 `ztImage::FileType()` 은 `.zls` 에서 온 이미지에 대해 언제나
+   *    UNKNOWN 이라(`SetCompressData` 가 그 필드를 안 채운다) 못 쓴다.
+   */
+  mime: string;
+}
 
 /** 씬에 저장된 드레이프 아이템 하나 */
 export interface DrapingItem {
@@ -708,33 +742,108 @@ export interface DrapingItem {
   name: string;
   /**
    * 자동 드레이프(`ztDrapingItem::AUTO_ITEM_UUID`)인가.
-   * **`loadDraping` 이 적용하는 것은 이것 하나다** — 나머지는 목록에만 나온다.
+   * **인자 없는 `loadDraping` 이 적용하는 것이 이것**이다.
    */
   isAuto: boolean;
+  /**
+   * 그 상태가 몇 프레임째였는가. 쿼리 인터페이스를 못 얻으면 없다.
+   *
+   * ⚠️ 이 값은 적용 뒤 워커가 되돌리는 프레임 카운터(-1)와 **다른 축이다** —
+   *    저장 당시의 번호일 뿐, 적용 후 화면이 그 번호에서 시작하지 않는다.
+   */
+  frameNo?: number;
+  /**
+   * 저장 시각, **unix 초**. 없을 수 있다 — 엔진이 무효값(-1)이나 1970-01-01(0)
+   * 을 주면 아예 안 싣는다("1970년에 저장됨" 은 없는 것만 못하다).
+   *
+   * ⚠️ **시간대가 불명이다.** `ztDateTime` 은 시간대를 안 들고 다니고
+   *    (헤더 주석), 저장한 쪽이 UTC 였는지 로컬이었는지 기록이 없다. 화면에
+   *    분 단위 정확도를 약속하지 말 것.
+   */
+  savedAt?: number;
+  /** 미리보기가 있으면. 없으면 **키가 아예 없다** */
+  thumbnail?: DrapingThumbnailInfo;
+}
+
+/** `drapingItems` — 목록만. 부작용이 없다 */
+export interface DrapingItemsResult {
+  items: DrapingItem[];
+  count: number;
+  /**
+   * 엔진이 말하는 활성 아이템. 쿼리 인터페이스가 없으면 없을 수 있다.
+   *
+   * ⚠️ 씬을 갓 로드했을 때 이것이 무엇인지는 **씬이 정한다** — 우리가 아직
+   *    아무것도 적용하지 않았어도 비어 있지 않을 수 있다.
+   */
+  activeUuid?: string;
+  activeName?: string;
 }
 
 /**
- * ⚠️ **`applied: false` 는 에러가 아니다.** 씬에 자동 드레이프가 저장돼 있지
- * 않을 뿐이고(`reason: 'noAutoItem'`), 그 경우에도 op 자체는 성공으로 답한다.
- * 씬이 로드되지 않았을 때만 `ok:false` 가 된다.
+ * ⚠️ **`applied: false` 는 에러가 아니다.** 씬에 자동 드레이프가 없거나
+ * (`noAutoItem`) 준 uuid 가 목록에 없을 뿐이고(`notFound`), 그 경우에도 op
+ * 자체는 성공으로 답한다. 씬이 로드되지 않았을 때만 `ok:false` 가 된다.
  *
  * ★ **`applied: true` 면 워커가 프레임 카운터를 -1 로 되돌린다** —
  *   `LoadDrapingItem` 이 안에서 `ztSimulationManager::Reset()` 을 부르기
  *   때문이다. 즉 **`reset` op 과 같은 자리**이고, 화면의 재생 상태·프레임
  *   표시도 리셋과 똑같이 갱신돼야 한다.
+ *
+ * ⛔ **`applied:true` 를 "솔버 상태까지 복원됐다" 로 읽지 말 것.** 엔진이
+ *   돌려주는 값은 변수 이름이 `noShield` 이고 성공 여부가 아니다 — 시뮬이
+ *   돌고 있거나 역직렬화가 실패해도 `true` 로 빠져나간다
+ *   (`Zest/simulation/ztSimulationManager.cpp:482`). 확실한 것은 아래
+ *   `activeUuid` 가 바뀌었다는 것("씬이 그 아이템으로 갈아탔다")까지다.
  */
-export interface LoadDrapingResult {
+export interface LoadDrapingResult extends DrapingItemsResult {
   applied: boolean;
-  /** 왜 못 했는가. `applied: true` 면 없다 */
-  reason?: 'noAutoItem' | 'loadFailed';
-  items: DrapingItem[];
-  count: number;
   /**
-   * 엔진이 말하는 활성 아이템. **이것이 적용 여부의 증거다** — 요청을 메아리친
-   * 값이 아니다. 쿼리 인터페이스가 없으면 없을 수 있다.
+   * 왜 못 했는가. `applied: true` 면 없다. 셋은 **다른 화면을 뜻한다**:
+   *
+   *   noAutoItem  씬에 자동 드레이프가 없다. **인자 없이 불렀을 때만** 난다
+   *   notFound    준 uuid 가 목록에 없다. 목록이 낡았거나 uuid 를 지어냈다
+   *   loadFailed  엔진이 거절했다
    */
-  activeUuid?: string;
-  activeName?: string;
+  reason?: 'noAutoItem' | 'notFound' | 'loadFailed';
+  /**
+   * 무엇을 고르려 했는가. `reason:'notFound'` 면 없다.
+   *
+   * ★ 위 `activeUuid`(엔진이 말하는 것)와 **다를 수 있고, 다르면 그것 자체가
+   *   진단이다** — 엔진이 우리가 고른 것과 다른 자리에 있다는 뜻이다.
+   */
+  appliedUuid?: string;
+}
+
+/**
+ * `drapingThumbnail` — 아이템 하나의 미리보기.
+ *
+ * ⚠️ **`hasImage:false` 는 에러가 아니다.** "그런 아이템의 그림이 있는가" 가
+ *    질문이고 "없다" 는 그 질문의 정당한 답이다 — 없는 uuid(`notFound`)도
+ *    여기로 온다(`loadDraping` 의 `notFound` 와 같은 채널이다). 씬이 로드되지
+ *    않았을 때만 `ok:false` 가 된다.
+ */
+export interface DrapingThumbnailResult {
+  uuid: string;
+  /** 아이템 이름. `notFound` 면 없다 */
+  name?: string;
+  hasImage: boolean;
+  /**
+   *   notFound           그 uuid 의 아이템이 목록에 없다
+   *   noImage            아이템은 있는데 미리보기 없이 저장됐다
+   *   unsupportedFormat  압축되지 않은 생픽셀이거나 모르는 매직 —
+   *                      **실측에서 본 적 없다**. 났다면 그 자체가 발견이다
+   */
+  reason?: 'notFound' | 'noImage' | 'unsupportedFormat';
+  width?: number;
+  height?: number;
+  mime?: string;
+  /** 원본 바이트 수 (base64 길이가 아니다) */
+  bytes?: number;
+  /**
+   * **base64 로 인코딩된 이미지 파일 바이트.** 픽셀이 아니라 PNG/JPEG 파일
+   * 통째이므로, `data:${mime};base64,${data}` 로 바로 `<img>` 에 물릴 수 있다.
+   */
+  data?: string;
 }
 
 // ── 옷 사이즈 (L-3b) ────────────────────────────────────────

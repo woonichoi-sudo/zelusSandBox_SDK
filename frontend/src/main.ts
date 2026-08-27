@@ -95,6 +95,7 @@ import {
   SideTabs,
   SideDrawer,
   SurfacePanel,
+  DrapingBoardPanel,
   TextureSwitch,
 } from './ui/index.ts';
 import { Unfolder, UnfoldController, Viewer2D } from './viewer2d/index.ts';
@@ -171,6 +172,8 @@ const ui = {
   avatarMeasure: el<HTMLElement>('avatarMeasure'),
   // 옷 사이즈 패널 (L-3b). 같은 칸의 두 번째 탭이다
   surfacePanel: el<HTMLElement>('surfacePanel'),
+  // 오른쪽 칸의 세 번째 탭 — 드레이핑 보드 (DB-1)
+  drapingPanel: el<HTMLElement>('drapingPanel'),
   // 오른쪽 칸의 탭 바 (L-3c). 버튼은 `ui/sideTabs.ts` 가 만든다
   sideTabs: el<HTMLElement>('sideTabs'),
   // 탭 전환 시 위치를 기억·복원할 스크롤 상자
@@ -1045,18 +1048,70 @@ const draping: DrapingPanel = new DrapingPanel({
       // 프레임 카운터가 -1 이 됐고 시뮬 모드도 달라졌을 수 있다. 믿음이 아니라
       // 워커의 사실로 덮어쓴다.
       await playback.syncFromWorker();
+
+      // ★★ **씬이 통째로 갈아끼워졌다.** 드레이핑 아이템은 프레임이 아니라
+      //   그 시점의 `sceneDataStore`(씬 데이터 전체 사본)를 들고 있고, 적용은
+      //   `SetActiveDrapingItem` → `SetSceneData(...)` 로 그것을 **씬에 덮어쓴다**
+      //   (`ztSceneQueryInterface.cpp:13452`). 즉 사용자가 이 세션에서 만진
+      //   체형·옷 사이즈가 **아이템에 저장돼 있던 값으로 되돌아간다.**
+      //
+      //   실측 (`W_Slit dress.zls`, "Final" 적용):
+      //     옷 폭   23.89 → 33.45(내가 바꿈) → **23.89**
+      //     체형    0.5   → 0.95            → **0.5**   (몸 높이 207.10 → 182.95cm)
+      //
+      //   그래서 다시 읽지 않으면 화면이 자기모순에 빠진다 — 3D 아바타는 원래
+      //   몸으로 돌아갔는데 슬라이더는 0.95 를 가리킨다. 증상이 사용자에게는
+      //   **"적용이 안 먹었다"** 로 보인다(실제로는 먹었고 되돌아간 것이다).
+      //
+      // ⛔ **데스크톱 앱이 이미 하는 일이다.** `MainGUI.cpp:201` 이 Apply 직후
+      //   `UpdateUIData()` 를 부르고, 그 함수가 서피스 목록·옷 사이즈·직물
+      //   목록을 다시 읽는다(`MainGUI.cpp:1035-1103`). 여기를 빼면 웹만
+      //   데스크톱보다 못한 상태가 된다 — 없던 버그를 새로 만드는 자리다.
+      //
+      // 새 함수를 만들지 않는다. 씬 로드가 쓰는 것과 **같은 두 함수**이고,
+      // 그래야 "씬이 바뀌면 무엇을 다시 읽는가" 의 답이 한 곳에만 있다.
+      // (체형은 데스크톱에 UI 가 아예 없어 저쪽 목록에 없다. 우리가 웹에서
+      //  새로 노출한 것이라 같은 이유로 같이 읽는다.)
+      //
+      // 왕복은 순서를 안 타므로 함께 보낸다 — 워커가 stdin 을 순차 처리한다.
+      // 화면 갱신보다 **뒤**인 이유는 옷이 먼저 보여야 하기 때문이다(글자는
+      // 몇십 ms 늦어도 되지만, 옷이 늦으면 눌린 것 같지 않다).
+      await Promise.all([refreshSurfaces(), refreshAvatarBody()]);
     },
   },
 });
 
-/** 버튼 하나와 글자 한 줄. **상태는 만들지 않는다 — 받은 것만 그린다** */
+/**
+ * 상단 바의 버튼 하나와 글자 한 줄 + 오른쪽 칸의 보드.
+ * **상태는 만들지 않는다 — 받은 것만 그린다**
+ */
 function paintDraping(view: DrapingView = draping.view): void {
   ui.drape.disabled = busy || !view.canApply;
   ui.drapestat.textContent = view.text;
   ui.drapestat.classList.toggle('err', view.isError);
+  // 보드도 같은 사실로 그린다 (DB-1). 상단 바 버튼과 보드의 [적용] 은
+  // **같은 조작**이라, 둘이 다른 것을 보고 있으면 하나만 켜지는 순간이 생긴다.
+  drapingBoard.render(view);
 }
 
+// 상단 바의 버튼. 인자가 없으므로 **고른 것**(없으면 자동)이 적용된다 —
+// 보드를 한 번도 안 연 사용자에게는 W-1 때와 동작이 같다.
 ui.drape.addEventListener('click', () => void draping.apply());
+
+// ── 드레이핑 보드 (DB-1) ────────────────────────────────────
+//
+// 오른쪽 칸의 세 번째 탭. 판단은 `panels/draping.ts`, 그리는 것은
+// `ui/drapingBoardPanel.ts`, 배선만 여기다 — 옷 사이즈 패널과 같은 3층이다.
+const drapingBoard = new DrapingBoardPanel({
+  root: ui.drapingPanel,
+  panel: draping,
+  onSelect: (uuid) => { draping.select(uuid); },
+  onApply: () => void draping.apply(),
+  onRefresh: () => void draping.refresh(),
+  // 그리는 도중에 불린다. **던지지 않아야 한다** — `loadThumbnail` 이 이미
+  // 던지지 않는 규약이고, `void` 로 받아 렌더링과 분리한다.
+  onNeedThumb: (uuid) => void draping.loadThumbnail(uuid),
+});
 
 // 연결 전에도 이유가 보여야 한다 — 빈 자리에는 "왜 못 누르는지" 가 없다.
 paintDraping();

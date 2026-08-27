@@ -728,37 +728,134 @@ std::string MeasureApplyErrorText(MeasureApplyError err)
     return "알 수 없는 실패";
 }
 
-// ── 자동 드레이핑 ───────────────────────────────────────────
+// ── 드레이핑 보드 ───────────────────────────────────────────
 //
 // `.zls` 는 펼쳐진 패턴만이 아니라 **입혀진 상태(드레이프)** 도 같이 담는다.
-// 우리 워커는 여태 `LoadZls` 만 했기 때문에 옷이 펼쳐진 채로 나왔다. 회사의
-// `consoleApplication/main.cpp:41-61` 이 그 뒤에 하는 일이 이것이다:
-// 드레이핑 아이템 중 `ztDrapingItem::AUTO_ITEM_UUID` 인 항목을 찾아
-// `LoadDrapingItem` 으로 적용한다.
+// 그냥 `LoadZls` 만 하면 옷이 펼쳐진 채로 나온다. 회사의
+// `consoleApplication/main.cpp:41-61` 이 그 뒤에 하는 일이 이것이다.
 //
-// ★ 크래시 방지용 `ztSimulationManager::Reset()` 은 **우리가 부를 필요가
-//   없다.** 우리가 컴파일하는 `zelusSandBox/ZestManager.cpp:435-437` 의
-//   `LoadDrapingItem` 안에 이미 들어 있고(원본 주석까지 동일),
-//   `consoleApplication` 쪽 구현과 바이트 단위로 같은 코드다. 즉 이 op 은
-//   호출만 하면 된다.
+// ── 아이템 하나가 무엇인가 ──────────────────────────────────
+//
+// 프레임 한 장이 아니라 **완전한 세이브스테이트**다. `ztDrapingItem`
+// (`Zest/scene/ztSceneData.h:392`) 이 담는 것:
+//
+//   simWorldData     Zelus `zsSimulationWorld` 통째 직렬화 (실측 2.1~2.8MB)
+//   sceneDataStore   그 시점의 **씬 데이터 전체 사본** (패턴·심·아바타)
+//   image            미리보기 (실측 512×512 PNG, 60~75KB)
+//   frameNo          그 상태가 몇 프레임째였는가
+//
+// 실측 — `Zest/testing/sdk/sample.zls` 의 zip 안:
+//
+//   drapingBoard/drapingBoardHeader                          68 B
+//   drapingBoard/222971026478300_101/    "Auto draping item"  2.7MB
+//   drapingBoard/1023437106320000_10240/ "advance"            3.4MB
+//   drapingBoard/1023470989221200_10991/ "legacy"             2.7MB
+//
+// ★ 여태 이 워커는 **AUTO 하나만** 적용할 수 있었다. 이름 붙은 나머지는
+//   목록에만 나오고 쓸 수가 없었다 — 데스크톱 앱의 `Draping board` 패널은
+//   아무거나 골라 Apply 하는데(`MainGUI.cpp:197-203`) 우리 쪽만 못 했다.
+//   그 구멍을 `loadDraping` 의 **선택 인자 `uuid`** 로 메운다. 인자가 없으면
+//   여태와 똑같이 AUTO 를 적용한다 — 옛 클라이언트가 그대로 돈다.
 //
 // ⚠️ 아이템이 **없는 씬도 있다.** 그때는 에러가 아니다 — 씬이 잘못된 것이
 //    아니라 저장된 드레이프가 없을 뿐이고, 화면은 그 상태로도 정상 동작해야
-//    한다. `ok:true` + `applied:false` + `reason:"noAutoItem"` 으로 답한다.
-//    에러로 만들면 게이트웨이가 로드 실패와 구분하지 못한다.
+//    한다. `ok:true` + `applied:false` + 사유로 답한다. 에러로 만들면
+//    게이트웨이가 로드 실패와 구분하지 못한다.
+//
+// ⚠️ **이름 없는 아이템은 목록에 안 나온다.** `ZestManager::GetDrapingItems`
+//    (`zelusSandBox/ZestManager.cpp:414`)가 이름이 빈 항목을 거른다. 그 필터를
+//    그대로 쓰는 이유는 데스크톱 앱과 같은 목록이 나와야 해서다. 갓 만들어진
+//    빈 AUTO 아이템이 여기 해당하고, 목록에 없으니 고를 수도 없다 — 고를 것이
+//    없는 게 맞다(이름이 없으면 화면에서 구별할 방법도 없다).
+//
+// ⛔ **`applied:true` 를 "솔버 상태까지 복원됐다" 로 읽지 말 것.** 엔진의
+//    `ztSimulationManager::LoadDrapingItem`
+//    (`Zest/simulation/ztSimulationManager.cpp:482`)이 돌려주는 값은 변수
+//    이름이 `noShield` 이고 **성공 여부가 아니다** — 시뮬이 돌고 있거나
+//    `zsDeserializeBinaryBuffer` 가 실패해도 `true` 로 빠져나간다. 그래서
+//    응답에 엔진이 말하는 `activeUuid` 를 같이 싣는다. 다만 그것도
+//    `SetActiveDrapingItem` 이 먼저 바꾸므로 **"씬이 그 아이템으로 갈아탔다"**
+//    까지가 증거이고, 솔버 월드가 실제로 풀렸는지는 프레임을 받아야 안다.
+
+/**
+ * 이미지 바이트의 매직으로 형식을 가린다.
+ *
+ * ⚠️ **엔진에 물어볼 수 없다.** `ztImage::FileType()` 이 있지만
+ *    `SetCompressData`(`Zest/common/ztImage.cpp:225`)가 그 필드를 안 채운다 —
+ *    `Clear()` 가 `UNKNOWN` 으로 돌려놓은 채로 남는다. 즉 `.zls` 에서 온
+ *    이미지의 `FileType()` 은 **언제나 UNKNOWN** 이고, 그걸 믿으면 브라우저에
+ *    쓸모없는 MIME 을 물려 그림이 안 뜬다.
+ *
+ * @return 매직이 맞으면 MIME, 모르는 형식이면 nullptr
+ */
+const char* SniffImageMime(const std::vector<char>& data)
+{
+    const std::size_t n = data.size();
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(data.data());
+
+    if (n >= 8 && p[0] == 0x89 && p[1] == 0x50 && p[2] == 0x4E && p[3] == 0x47
+               && p[4] == 0x0D && p[5] == 0x0A && p[6] == 0x1A && p[7] == 0x0A)
+    {
+        return "image/png";   // 실측 sample.zls 의 3개가 전부 이것이다
+    }
+    if (n >= 3 && p[0] == 0xFF && p[1] == 0xD8 && p[2] == 0xFF)
+    {
+        return "image/jpeg";  // ztImage::Save 의 기본값이 JPEG 이라 있을 수 있다
+    }
+    return nullptr;
+}
 
 /** 드레이핑 아이템 목록과 지금 활성인 것. 되읽기용이므로 부작용이 없다 */
 json ReadDraping(ZestManager& manager)
 {
+    ztSceneQueryInterface* qi = QueryInterface(manager);
     json items = json::array();
 
     for (const auto& entry : manager.GetDrapingItems())
     {
-        items.push_back(json{
+        json item{
             { "uuid",   entry.first.GetString() },
             { "name",   entry.second },
             { "isAuto", entry.first == ztDrapingItem::AUTO_ITEM_UUID },
-        });
+        };
+
+        // 목록에서 **고를 수 있으려면** 이름만으로는 모자란다 — 언제 저장한
+        // 것인지, 몇 프레임째였는지, 미리보기가 있는지.
+        //
+        // ★ **썸네일 바이트는 여기 싣지 않는다.** 개당 60~75KB 라 3개만 돼도
+        //   목록 응답이 200KB 를 넘고, 그 값을 **목록을 열 때마다** 다시 문다.
+        //   `drapingThumbnail` op 으로 갈라 화면이 필요할 때 하나씩 받는다.
+        if (qi != nullptr)
+        {
+            if (const ztDrapingItem* full = qi->GetDrapingItem(entry.first))
+            {
+                item["frameNo"] = full->frameNo;
+
+                // ⚠️ 기본 `ztDateTime` 은 1970-01-01 이고 `AsUnixTime()` 은
+                //    그때 0 을, 무효값이면 -1 을 준다. 0 을 그대로 실으면
+                //    화면이 "1970년에 저장됨" 이라고 말한다 — 없는 편이 낫다.
+                const long long savedAt = (long long)full->dateTime.AsUnixTime();
+                if (full->dateTime.IsValid() && savedAt > 0)
+                {
+                    item["savedAt"] = savedAt;   // unix 초
+                }
+
+                const ztImage& img  = full->image;
+                const char*    mime = img.IsCompressed() ? SniffImageMime(img.GetData()) : nullptr;
+
+                if (mime != nullptr && !img.GetData().empty())
+                {
+                    item["thumbnail"] = json{
+                        { "width",  img.Width() },
+                        { "height", img.Height() },
+                        { "bytes",  (long long)img.GetData().size() },
+                        { "mime",   mime },
+                    };
+                }
+            }
+        }
+
+        items.push_back(std::move(item));
     }
 
     json out{
@@ -768,7 +865,7 @@ json ReadDraping(ZestManager& manager)
 
     // 엔진이 말하는 활성 아이템. **이것이 적용 여부의 증거다** — 요청한
     // uuid 를 메아리치면 엔진이 아무 일도 안 했을 때조차 성공으로 보인다.
-    if (ztSceneQueryInterface* qi = QueryInterface(manager))
+    if (qi != nullptr)
     {
         out["activeUuid"] = qi->GetActiveDrapingItemUuid().GetString();
 
@@ -782,33 +879,181 @@ json ReadDraping(ZestManager& manager)
 }
 
 /**
- * 자동 드레이핑 아이템을 적용한다.
+ * uuid 문자열로 목록에서 아이템을 찾는다.
+ *
+ * ⚠️ **문자열을 `ztUuid` 로 되파싱하지 않는다.** `ztUuidSaver::Convert(string)`
+ *    이 있지만 `ztUuid::GetString()` 과 같은 형식이라는 보장이 헤더에 없다 —
+ *    `setSurfaceSize` 가 같은 이유로 목록을 훑는다. 형식이 어긋나면 "없는
+ *    아이템" 으로 조용히 실패하는데, 그 증상이 화면에서는 "눌렀는데 아무 일도
+ *    안 일어난다" 로만 보인다. 아이템 3개짜리 선형 탐색이라 비용도 없다.
+ *
+ * ★ 이름을 같이 돌려주는 것이 **필수다.** `ZestManager::LoadDrapingItem` 은
+ *   uuid 로 찾은 아이템의 이름이 인자와 같을 때만 적용한다
+ *   (`ZestManager.cpp:433`). 이름을 지어내면 조용히 아무 일도 안 일어난다.
+ */
+bool FindDrapingItem(ZestManager& manager, const std::string& uuid,
+                     std::pair<ztUuid, std::string>& out)
+{
+    for (const auto& entry : manager.GetDrapingItems())
+    {
+        if (entry.first.GetString() == uuid)
+        {
+            out = entry;
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * 드레이핑 아이템을 적용한다. `uuid` 가 없으면 자동 아이템을 고른다.
  *
  * 응답은 **적용 후 상태를 되읽어** 싣는다(setAvatarBody·setSurfaceSize 와
  * 같은 규약). 실패해도 예외를 던지지 않고 `applied:false` + 사유로 답한다.
+ *
+ * 사유는 셋이고 **셋 다 다른 화면을 뜻한다**:
+ *   noAutoItem  씬에 자동 드레이프가 없다. **인자 없이 불렀을 때만** 난다
+ *   notFound    준 uuid 가 목록에 없다. 클라이언트가 틀렸다는 뜻이다 —
+ *               목록이 낡았거나(씬이 바뀌었다) uuid 를 지어냈다
+ *   loadFailed  엔진이 거절했다
  */
-json ApplyAutoDraping(ZestManager& manager)
+json ApplyDrapingItem(ZestManager& manager, const json& req)
 {
-    const auto items = manager.GetDrapingItems();
+    const bool byUuid = req.contains("uuid") && req["uuid"].is_string()
+                        && !req["uuid"].get<std::string>().empty();
 
-    const auto it = std::find_if(items.begin(), items.end(),
-        [](const std::pair<ztUuid, std::string>& p) {
-            return p.first == ztDrapingItem::AUTO_ITEM_UUID;
-        });
+    std::pair<ztUuid, std::string> target;
 
-    if (it == items.end())
+    if (byUuid)
     {
-        json out = ReadDraping(manager);
-        out["applied"] = false;
-        out["reason"]  = "noAutoItem";   // 씬에 자동 드레이프가 저장돼 있지 않다
-        return out;
+        if (!FindDrapingItem(manager, req["uuid"].get<std::string>(), target))
+        {
+            json out = ReadDraping(manager);
+            out["applied"] = false;
+            out["reason"]  = "notFound";
+            return out;
+        }
+    }
+    else
+    {
+        const auto items = manager.GetDrapingItems();
+
+        const auto it = std::find_if(items.begin(), items.end(),
+            [](const std::pair<ztUuid, std::string>& p) {
+                return p.first == ztDrapingItem::AUTO_ITEM_UUID;
+            });
+
+        if (it == items.end())
+        {
+            json out = ReadDraping(manager);
+            out["applied"] = false;
+            out["reason"]  = "noAutoItem";   // 씬에 자동 드레이프가 저장돼 있지 않다
+            return out;
+        }
+
+        target = *it;
     }
 
-    const bool loaded = manager.LoadDrapingItem(it->first, it->second);
+    // ★ 크래시 방지용 `ztSimulationManager::Reset()` 은 **우리가 부를 필요가
+    //   없다.** 우리가 컴파일하는 `zelusSandBox/ZestManager.cpp:435-437` 의
+    //   `LoadDrapingItem` 안에 이미 들어 있고(원본 주석까지 동일),
+    //   `consoleApplication` 쪽 구현과 바이트 단위로 같은 코드다.
+    const bool loaded = manager.LoadDrapingItem(target.first, target.second);
 
     json out = ReadDraping(manager);
     out["applied"] = loaded;
+    // 무엇을 고르려 했는가. `activeUuid`(엔진이 말하는 것)와 **다를 수 있고**,
+    // 다르면 그것 자체가 진단이다.
+    out["appliedUuid"] = target.first.GetString();
     if (!loaded) out["reason"] = "loadFailed";
+    return out;
+}
+
+// 정의는 이 파일 아래쪽(정점 버퍼를 싣는 자리)에 있다. 그쪽으로 옮기지 않고
+// 전방 선언만 두는 이유는 순서다 — op 갈래끼리 붙여 두는 편이 읽기 쉽고,
+// `Base64` 는 특정 op 의 것이 아니라 공용 도구다.
+std::string Base64(const void* data, std::size_t bytes);
+
+/**
+ * 아이템 하나의 미리보기 이미지.
+ *
+ * ── 왜 base64 인가 ──────────────────────────────────────────
+ *
+ * 이 워커에는 큰 것을 내보내는 길이 둘 있다. 텍스처는 **경로**를 주고
+ * (`ReadTextures` 머리말), 정점 버퍼는 **base64** 로 싣는다. 썸네일은
+ * 후자다 — 근거는 크기가 아니라 **출처**다:
+ *
+ *   텍스처   디스크의 파일이다. 경로가 이미 있고, 게이트웨이가 그 파일을
+ *            그대로 서빙하면 브라우저 캐시까지 공짜로 붙는다.
+ *   썸네일   **메모리에만 있다.** `.zls` zip 안의 바이트를 엔진이 풀어
+ *            `ztImage` 로 들고 있을 뿐 파일이 아니다. 경로로 주려면 우리가
+ *            임시 파일을 쓰고 언제 지울지를 새로 정해야 한다 — 60KB 를 위해
+ *            파일 수명 관리를 하나 더 만드는 셈이다.
+ *
+ * 60~75KB 가 base64 로 33% 부풀어 ~100KB 다. 아이템 3개를 전부 받아도
+ * 300KB 이고, **아이템당 한 번이면 되는 물건이라** 프레임 경로에 없다.
+ *
+ * ⚠️ 압축되지 않은 이미지는 **내보내지 않는다.** `IsCompressed()` 가 false 면
+ *    `mData` 는 인코딩된 파일이 아니라 생픽셀이라 브라우저가 못 읽는다.
+ *    PNG 로 인코딩해서 줄 수도 있지만(`zwGltfExporter.cpp` 가
+ *    stb_image_write 를 링크한다) **실측에서 한 번도 본 적 없는 경로다** —
+ *    안 본 것을 위해 코드를 두는 대신 `hasImage:false` + 사유로 **보이게** 남긴다.
+ */
+json ReadDrapingThumbnail(ZestManager& manager, const json& req)
+{
+    const std::string uuid = req.contains("uuid") && req["uuid"].is_string()
+                             ? req["uuid"].get<std::string>() : std::string();
+
+    std::pair<ztUuid, std::string> target;
+
+    if (uuid.empty() || !FindDrapingItem(manager, uuid, target))
+    {
+        return json{
+            { "uuid",     uuid },
+            { "hasImage", false },
+            { "reason",   "notFound" },
+        };
+    }
+
+    json out{
+        { "uuid", target.first.GetString() },
+        { "name", target.second },
+    };
+
+    ztSceneQueryInterface* qi   = QueryInterface(manager);
+    const ztDrapingItem*   full = qi ? qi->GetDrapingItem(target.first) : nullptr;
+
+    if (full == nullptr)
+    {
+        // 목록에는 있는데 쿼리 인터페이스로는 못 얻었다. 목록이 곧 그 인터페이스
+        // 에서 온 것이라 실제로는 안 나야 하지만, 났다면 그것이 사실이다.
+        out["hasImage"] = false;
+        out["reason"]   = "notFound";
+        return out;
+    }
+
+    const ztImage& img  = full->image;
+    const char*    mime = img.IsCompressed() ? SniffImageMime(img.GetData()) : nullptr;
+
+    if (img.GetData().empty())
+    {
+        out["hasImage"] = false;
+        out["reason"]   = "noImage";            // 미리보기 없이 저장된 아이템
+        return out;
+    }
+    if (mime == nullptr)
+    {
+        out["hasImage"] = false;
+        out["reason"]   = "unsupportedFormat";  // 생픽셀이거나 모르는 매직
+        return out;
+    }
+
+    out["hasImage"] = true;
+    out["width"]    = img.Width();
+    out["height"]   = img.Height();
+    out["mime"]     = mime;
+    out["bytes"]    = (long long)img.GetData().size();
+    out["data"]     = Base64(img.GetData().data(), img.GetData().size());
     return out;
 }
 
@@ -3092,6 +3337,40 @@ int RunProtocolLoop(ZestManager& manager)
                     }
                 }
             }
+            else if (op == "drapingItems")
+            {
+                // 순수 읽기다 — 씬을 안 바꾼다.
+                //
+                // ⚠️ 씬을 **요구한다.** `fabrics` 와 판단이 다른 이유는 출처다:
+                //    직물 목록은 설치본의 라이브러리라 씬과 무관하지만,
+                //    드레이핑 아이템은 **씬 파일 안에 들어 있다.** 씬 없이 빈
+                //    목록을 돌려주면 화면이 "이 씬에는 저장된 드레이프가 없다"
+                //    로 읽는데 사실은 씬이 없는 것이다. 둘은 다른 화면이어야 한다.
+                if (!manager.IsLoadedZls())
+                {
+                    ok = false; error = "씬이 로드되지 않았습니다";
+                }
+                else
+                {
+                    result = ReadDraping(manager);
+                }
+            }
+            else if (op == "drapingThumbnail")
+            {
+                // ★ 없는 uuid 를 **에러로 만들지 않는다.** `setSurfaceSize` 는
+                //   없는 uuid 를 에러로 되돌리지만 저쪽은 쓰기다 — 못 썼으면
+                //   실패가 맞다. 여기는 읽기이고 "그런 아이템의 그림이 있는가"
+                //   가 질문이라, "없다" 는 그 질문의 **정당한 답**이다.
+                //   `loadDraping` 의 `notFound` 와도 같은 채널이 된다.
+                if (!manager.IsLoadedZls())
+                {
+                    ok = false; error = "씬이 로드되지 않았습니다";
+                }
+                else
+                {
+                    result = ReadDrapingThumbnail(manager, req);
+                }
+            }
             else if (op == "loadDraping")
             {
                 if (!manager.IsLoadedZls())
@@ -3100,7 +3379,9 @@ int RunProtocolLoop(ZestManager& manager)
                 }
                 else
                 {
-                    result = ApplyAutoDraping(manager);
+                    // `uuid` 가 있으면 그것을, 없으면 자동 아이템을 적용한다.
+                    // 인자가 없을 때의 동작은 예전과 한 글자도 다르지 않다.
+                    result = ApplyDrapingItem(manager, req);
 
                     // LoadDrapingItem 이 안에서 ztSimulationManager::Reset() 을
                     // 부른다. 프레임 카운터를 그대로 두면 화면이 "249프레임째"

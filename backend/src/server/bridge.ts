@@ -411,6 +411,46 @@ const buildSetFabric: Build = (msg) => {
 };
 
 /**
+ * loadDraping: **uuid 는 선택이다** (DB-1).
+ *
+ * 이 테이블에서 build 를 가진 op 중 유일하게 **아무것도 안 줘도 통과한다** —
+ * 인자 없는 호출이 "자동 아이템을 적용하라" 라는 뜻이고, W-1 부터 그렇게
+ * 돌던 경로다. 여기서 uuid 를 요구하면 옛 클라이언트가 통째로 죽는다.
+ *
+ * ⚠️ **빈 문자열을 통과시키지 않는다.** 워커는 빈 uuid 를 "자동" 으로 읽으므로,
+ *    화면이 아이템을 골랐는데 엉뚱하게 자동이 적용되고 **성공으로 보인다.**
+ *    고르는 화면에서 그것이 가장 나쁜 실패다 — 여기서 이유를 남기고 끊는다.
+ *
+ * ⛔ 존재 확인은 **워커가 한다** (`setSurfaceSize` 의 uuid 와 같은 판단).
+ *    게이트웨이가 목록을 들고 있으려면 씬 상태를 따라다녀야 하는데, 그건
+ *    세션이 이미 하는 일을 두 번 하는 것이고 갈라지면 더 나쁘다.
+ */
+const buildLoadDraping: Build = (msg) => {
+  const uuid = msg['uuid'];
+  if (uuid === undefined || uuid === null) return { payload: {} };
+
+  if (typeof uuid !== 'string' || uuid === '') {
+    reject(`uuid 는 비어 있지 않은 문자열이어야 합니다 (받은 값: ${describe(uuid)})`);
+  }
+  return { payload: { uuid } };
+};
+
+/**
+ * drapingThumbnail: uuid 하나. **필수다.**
+ *
+ * `loadDraping` 과 달리 인자 없이 부를 의미가 없다 — "어느 아이템의 그림" 이
+ * 정해지지 않으면 답할 것이 없고, 자동 아이템으로 대신 채우면 화면이 **다른
+ * 아이템의 그림을 그 아이템의 것으로 믿는다.**
+ */
+const buildDrapingThumbnail: Build = (msg) => {
+  const uuid = msg['uuid'];
+  if (typeof uuid !== 'string' || uuid === '') {
+    reject(`uuid 필드가 필요합니다 (문자열, 받은 값: ${describe(uuid)})`);
+  }
+  return { payload: { uuid } };
+};
+
+/**
  * export: 클라이언트는 **형식만** 준다. 산출물 위치는 서버가 정한다 (#10).
  *
  *   { id, op: 'export' }                    → gltf
@@ -661,18 +701,38 @@ const OPS: Record<Op, OpRule> = {
   //    진행률·취소는 계획 밖이다(있다면 워커 프로토콜 쪽 일이다).
   setAvatarMeasurements: { allow: true, build: buildSetAvatarMeasurements },
 
-  // ── 드레이프 (W-1) ────────────────────────────────────────
+  // ── 드레이핑 보드 (W-1 / DB-1) ────────────────────────────
   //
-  // 인자가 없다. 씬 존재 확인은 **워커가 한다** — `setSurfaceSize` 의 uuid 와
-  // 같은 판단이다(게이트웨이가 씬 상태를 따라다니면 세션이 하는 일을 두 번
-  // 하게 되고, 갈라지면 더 나쁘다).
+  // 읽기는 무해하다 — 아이템 몇 개의 이름·시각·미리보기 **메타데이터**를
+  // 돌려줄 뿐이고 씬을 안 바꾼다. 썸네일 바이트는 여기 안 실린다(아래 참고).
   //
-  // ★ **성공해도 `applied:false` 일 수 있다.** 씬에 자동 드레이프가 저장돼
-  //   있지 않은 경우이고 **에러가 아니다** — mapResult 로 실패로 바꾸지 않는다.
-  //   화면이 그 사실을 글자로 말하면 된다.
+  // ⚠️ 씬을 요구하는 것은 **워커의 판단이다.** 씬 없이 부르면 빈 목록이 아니라
+  //    에러가 온다 — "저장된 드레이프가 없는 씬" 과 "씬이 없음" 은 화면에서
+  //    다른 말이어야 하고, 그 구분을 워커가 이미 하고 있다.
+  drapingItems: { allow: true },
+
+  // 쓰기다. **uuid 는 선택** — 없으면 자동 아이템이다(buildLoadDraping 주석).
+  //
+  // ★ **성공해도 `applied:false` 일 수 있다.** 자동 드레이프가 없거나
+  //   (`noAutoItem`) 준 uuid 가 목록에 없는 경우이고(`notFound`) **에러가
+  //   아니다** — mapResult 로 실패로 바꾸지 않는다. 화면이 그 사실을 글자로
+  //   말하면 된다. 셋(없음 / 못 찾음 / 엔진 거절)이 다른 화면이라 사유를 살린다.
   // ★ `applied:true` 면 워커가 프레임 카운터를 -1 로 되돌린다(엔진이 안에서
   //   Reset 한다). 즉 클라이언트에게는 `reset` 과 같은 무게의 op 이다.
-  loadDraping: { allow: true },
+  loadDraping: { allow: true, build: buildLoadDraping },
+
+  // 읽기. **이 테이블에서 base64 바이트를 그대로 내보내는 유일한 op 이다** —
+  // 실측 60~75KB PNG 가 인코딩되어 ~100KB 다.
+  //
+  // 텍스처(`meshData` 의 표)처럼 파일로 서빙하지 않는 이유는 크기가 아니라
+  // **출처**다: 썸네일은 디스크의 파일이 아니라 `.zls` 안에서 풀려 엔진
+  // 메모리에만 있다. 경로로 넘기려면 우리가 임시 파일을 쓰고 수명을 관리해야
+  // 하는데, 60KB 를 위해 저장소를 하나 더 만드는 셈이다(워커 주석 참고).
+  //
+  // 연타를 따로 막지 않는 근거는 `meshData` 와 같다 — 워커가 stdin 을 순차
+  // 처리하고, 무한정 쌓이는 것은 연결당 동시 요청 상한(maxInflight)이 막는다.
+  // 게다가 **아이템당 한 번이면 되는 물건이다**(같은 씬에서 안 변한다).
+  drapingThumbnail: { allow: true, build: buildDrapingThumbnail },
 
   // ── 옷 사이즈 (L-3b) ──────────────────────────────────────
   //

@@ -85,3 +85,12 @@ export {
   type Design2DOptionsOptions,
   type Design2DOptionsView,
 } from './design2dOptions.ts';
+
+/**
+ * 드레이핑 보드 (DB-1). 씬에 저장된 드레이프를 **미리보기 그림으로** 고른다.
+ * 판단은 `panels/draping.ts` 이고 여기는 격자를 그리기만 한다.
+ */
+export {
+  DrapingBoardPanel,
+  type DrapingBoardPanelOptions,
+} from './drapingBoardPanel.ts';

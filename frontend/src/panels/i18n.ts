@@ -141,6 +141,7 @@ const KO: Dict = {
   'side.drawer.title': '아바타 체형·옷 사이즈 칸을 여닫습니다 (Esc 로 닫기)',
   'side.tab.avatar': '아바타',
   'side.tab.surface': '옷 사이즈',
+  'side.tab.draping': '드레이프',
 
   // ── 접힌 상자 ───────────────────────────────────────────
   'params.summary': '⚙ 파라미터',
@@ -274,6 +275,30 @@ const KO: Dict = {
   'drape.noAutoItem': '이 씬에는 저장된 자동 드레이프가 없습니다 — 옷은 그대로입니다',
   'drape.loadFailed': '엔진이 드레이프를 적용하지 못했습니다',
   'drape.failed': '드레이프 적용 실패: {why}',
+
+  // ── 드레이핑 보드 (DB-1) ────────────────────────────────
+  //
+  // ⚠️ 아이템 **이름은 번역하지 않는다** — 씬 파일에 저장된 문자열이다
+  //    (`drape.applied.named` 의 {name} 과 같다).
+  'drape.notFound': '고른 드레이프가 목록에 없습니다 — 목록을 다시 읽으세요',
+  'drape.list.idle': '목록을 아직 읽지 않았습니다',
+  'drape.list.loading': '저장된 드레이프를 읽는 중…',
+  'drape.list.empty': '이 씬에는 저장된 드레이프가 없습니다',
+  'drape.list.failed': '드레이프 목록을 읽지 못했습니다: {why}',
+  'drape.board.title': '드레이핑 보드',
+  'drape.board.refresh': '목록 새로고침',
+  'drape.board.apply': '적용',
+  // 아무것도 안 골랐을 때 [적용] 이 무엇을 하는지. **비워 두지 않는다** —
+  // 빈 선택은 "아무 일도 안 일어난다" 로 읽히는데 실제로는 자동이 적용된다.
+  'drape.board.autoHint': '고른 것이 없으면 자동 드레이프가 적용됩니다',
+  'drape.board.auto': '자동',
+  'drape.board.active': '적용됨',
+  'drape.board.frame': '{frame}프레임',
+  'drape.board.savedAt': '{when} 저장',
+  'drape.board.count': '아이템 {count}개',
+  'drape.board.thumbLoading': '미리보기를 받는 중…',
+  'drape.board.noThumb': '미리보기 없음',
+  'drape.board.thumbFailed': '미리보기를 받지 못했습니다',
 
   // ── 시뮬 상태 (#14) ─────────────────────────────────────
   'sim.atFrame': ' · 프레임 {frame}',
@@ -514,6 +539,7 @@ const EN: Dict = {
   'side.drawer.title': 'Opens and closes the body / garment size panel (Esc to close)',
   'side.tab.avatar': 'Avatar',
   'side.tab.surface': 'Garment size',
+  'side.tab.draping': 'Drape',
 
   // ── 접힌 상자 ───────────────────────────────────────────
   'params.summary': '⚙ Parameters',
@@ -639,6 +665,25 @@ const EN: Dict = {
   'drape.noAutoItem': 'This scene has no saved auto drape — the garment is unchanged',
   'drape.loadFailed': 'The engine could not apply the drape',
   'drape.failed': 'Applying the drape failed: {why}',
+
+  // ── 드레이핑 보드 (DB-1) ────────────────────────────────
+  'drape.notFound': 'The chosen drape is not in the list — refresh it',
+  'drape.list.idle': 'The list has not been read yet',
+  'drape.list.loading': 'Reading the saved drapes…',
+  'drape.list.empty': 'This scene has no saved drapes',
+  'drape.list.failed': 'Could not read the drape list: {why}',
+  'drape.board.title': 'Draping board',
+  'drape.board.refresh': 'Refresh list',
+  'drape.board.apply': 'Apply',
+  'drape.board.autoHint': 'With nothing selected, the auto drape is applied',
+  'drape.board.auto': 'auto',
+  'drape.board.active': 'applied',
+  'drape.board.frame': 'frame {frame}',
+  'drape.board.savedAt': 'saved {when}',
+  'drape.board.count': '{count} item(s)',
+  'drape.board.thumbLoading': 'Loading the preview…',
+  'drape.board.noThumb': 'No preview',
+  'drape.board.thumbFailed': 'Could not load the preview',
 
   // ── 시뮬 상태 (#14) ─────────────────────────────────────
   'sim.atFrame': ' · frame {frame}',

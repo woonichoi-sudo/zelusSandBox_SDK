@@ -123,17 +123,20 @@ export {
 } from './avatarView.ts';
 
 /**
- * 저장된 드레이프 적용 (W-1). **`reset` 과 같은 자리의 op 이다** — 성공하면
- * 워커가 프레임 카운터를 -1 로 되돌린다(원본 머리말 참고).
+ * 드레이핑 보드 (W-1 / DB-1). 씬에 저장된 세이브스테이트를 목록에서 골라
+ * 적용한다. **`reset` 과 같은 자리의 op 이다** — 성공하면 워커가 프레임
+ * 카운터를 -1 로 되돌린다(원본 머리말 참고).
  */
 export {
   DrapingPanel,
   type DrapingHooks,
+  type DrapingListPhase,
   type DrapingOptions,
   type DrapingOutcome,
   type DrapingPhase,
   type DrapingPort,
   type DrapingStats,
+  type DrapingThumbState,
   type DrapingView,
 } from './draping.ts';
 

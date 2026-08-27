@@ -2648,8 +2648,10 @@ async function main(): Promise<void> {
         // ★ 이 표에서 유일하게 세션을 10초 이상 붙잡는 op 이지만, 가짜 릴레이는
         //   즉시 답하므로 여기서 재는 것은 "문이 열려 있는가" 뿐이다.
         ['setAvatarMeasurements', true],
-        // 드레이프 (W-1). 인자가 없다 — 씬 존재 확인은 워커가 한다.
-        ['loadDraping', true],
+        // 드레이핑 보드 (W-1 / DB-1). 목록은 인자가 없고, 적용은 uuid 가
+        // **선택**이며(없으면 자동), 썸네일은 uuid 가 **필수**다 — extra 참고.
+        // 셋 다 씬 존재 확인은 워커가 한다.
+        ['drapingItems', true], ['loadDraping', true], ['drapingThumbnail', true],
         // 옷 사이즈 (L-3b). uuid 검증은 워커가 한다 — 게이트웨이는 타입만 본다.
         ['surfaces', true], ['setSurfaceSize', true],
         // 직물 (UI #50). 읽기는 인자가 없고 씬도 요구하지 않는다. 쓰기는 build 가
@@ -2678,6 +2680,10 @@ async function main(): Promise<void> {
         // build 가 둘 다 요구한다. 없으면 차단이 아니라 **거절**로 떨어져서
         // 화이트리스트가 막은 것과 구분되지 않는다.
         setFabric: { surface: 'x', fabricId: 'y' },
+        // build 가 uuid 를 요구한다. 없으면 차단이 아니라 **거절**로 떨어져서
+        // 화이트리스트가 막은 것과 구분되지 않는다. `loadDraping` 은 반대로
+        // uuid 가 선택이라 여기 없다 — 인자 없이 부르는 것이 정상 경로다.
+        drapingThumbnail: { uuid: 'x' },
       };
 
       let id = 100;
@@ -2698,9 +2704,9 @@ async function main(): Promise<void> {
       //   실제로 W-1/AM-1 의 op 3개(setAvatarMeasurements·loadDraping·avatarMesh)를
       //   이 단언이 잡아냈다. 아래 집합 비교와 짝이라 하나만으로는 부족하다:
       //   집합 비교는 **허용된 것**만 보므로 차단 op 이 늘어도 안 걸린다.
-      check('표가 프로토콜 op 28개를 전부 덮는다', TABLE.length === 28, `${TABLE.length}개`);
+      check('표가 프로토콜 op 30개를 전부 덮는다', TABLE.length === 30, `${TABLE.length}개`);
       check(
-        'allowedOps()가 허용 27개와 정확히 일치 (거부 문구에 실리는 목록)',
+        'allowedOps()가 허용 29개와 정확히 일치 (거부 문구에 실리는 목록)',
         allowedOps().slice().sort().join(',')
           === TABLE.filter(([, a]) => a).map(([o]) => o).sort().join(','),
         allowedOps().join(','),
@@ -3050,13 +3056,51 @@ async function main(): Promise<void> {
         `${measureBlocked}/${badMeasure.length}`,
       );
 
-      // ⑦-4 loadDraping 은 build 가 없다 — 부가 필드를 통째로 버린다.
+      // ⑦-4 loadDraping 은 **uuid 만** 통과시킨다 (DB-1).
+      //
+      // 예전에는 build 가 없어 부가 필드를 통째로 버렸다. DB-1 이 uuid 를
+      // 받게 하면서 build 가 생겼으므로, 이제 확인할 것은 "아무것도 안 실린다"
+      // 가 아니라 **"uuid 말고는 아무것도 안 실린다"** 다 — 경로가 워커까지
+      // 새어 나가지 않는다는 사실은 그대로 지켜져야 한다.
       relay.reset();
-      await ask(ws, { id: 640, op: 'loadDraping', name: 'x', path: 'C:\\Windows\\win.ini' });
+      await ask(ws, {
+        id: 640, op: 'loadDraping',
+        uuid: 'drape-1', name: 'x', path: 'C:\\Windows\\win.ini',
+      });
       check(
-        'loadDraping — 인자가 없는 op 이라 클라이언트 필드가 하나도 안 실린다',
-        relay.last()?.payload === undefined,
+        'loadDraping — uuid 만 실리고 나머지 클라이언트 필드는 버려진다',
+        JSON.stringify(relay.last()?.payload ?? null) === JSON.stringify({ uuid: 'drape-1' }),
         JSON.stringify(relay.last()?.payload ?? null),
+      );
+
+      // uuid 가 아예 없으면 여전히 아무것도 안 싣는다 — 그것이 "자동" 의 표현이다.
+      relay.reset();
+      await ask(ws, { id: 641, op: 'loadDraping', name: 'x' });
+      check(
+        'loadDraping — uuid 없이 부르면 빈 페이로드다 (= 자동 아이템)',
+        JSON.stringify(relay.last()?.payload ?? null) === JSON.stringify({}),
+        JSON.stringify(relay.last()?.payload ?? null),
+      );
+
+      // ⚠️ **빈 문자열은 거절한다.** 통과시키면 워커가 "자동" 으로 읽어,
+      //    아이템을 골랐는데 엉뚱한 것이 적용되고 **성공으로 보인다**.
+      relay.reset();
+      const emptyDrapeUuid = await ask(ws, { id: 642, op: 'loadDraping', uuid: '' });
+      check(
+        'loadDraping — 빈 uuid 는 워커에 닿기 전에 막힌다',
+        emptyDrapeUuid?.['ok'] === false && relay.calls.length === 0,
+        JSON.stringify(emptyDrapeUuid),
+      );
+
+      // ⑦-5 drapingThumbnail 은 uuid 가 **필수**다 (DB-1). `loadDraping` 과
+      //      다른 이유는 대신할 것이 없어서다 — 자동으로 채우면 화면이 **다른
+      //      아이템의 그림을 그 아이템의 것으로 믿는다**.
+      relay.reset();
+      const thumbNoUuid = await ask(ws, { id: 643, op: 'drapingThumbnail' });
+      check(
+        'drapingThumbnail — uuid 없이 부르면 워커에 닿기 전에 막힌다',
+        thumbNoUuid?.['ok'] === false && relay.calls.length === 0,
+        JSON.stringify(thumbNoUuid),
       );
 
       // ⑧ 거부를 그렇게 많이 받고도 세션이 그대로다

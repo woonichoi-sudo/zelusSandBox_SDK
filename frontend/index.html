@@ -470,6 +470,45 @@
         padding-bottom: 0.15rem; border-bottom: 1px solid #2c333f;
       }
       .prow { padding: 0.35rem 0; border-bottom: 1px solid rgba(44, 51, 63, 0.55); }
+
+      /*
+        드레이핑 보드 (DB-1). 카드 격자다 — 목록의 다른 표(`.prow`)와 달리
+        **미리보기 그림이 고르는 근거**라서, 이름 옆에 작게 붙이는 대신
+        그림을 칸의 주인공으로 놓는다. 실측 썸네일이 512×512 정사각이다.
+
+        ⚠️ `minmax(0, 1fr)` 의 0 이 필요하다 — 그냥 `1fr` 이면 긴 아이템
+           이름이 트랙을 밀어 칸이 사이드바 밖으로 삐져나간다.
+      */
+      #drapingPanel .dgrid {
+        display: grid; gap: 0.4rem; margin-top: 0.4rem;
+        grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+      }
+      .dcard {
+        display: flex; flex-direction: column; gap: 0.2rem; padding: 0.3rem;
+        border: 1px solid #2c333f; border-radius: 4px; background: #171b21;
+        cursor: pointer; text-align: left; color: inherit; font: inherit;
+        min-width: 0;
+      }
+      .dcard:hover { border-color: #3a4453; }
+      /* 고른 것과 **엔진이 적용 중인 것**은 다른 표시다 — 아래 주석 참고 */
+      .dcard.sel { border-color: #6ea8fe; background: #1b2330; }
+      .dcard .dthumb {
+        width: 100%; aspect-ratio: 1 / 1; border-radius: 3px; background: #101318;
+        display: flex; align-items: center; justify-content: center; overflow: hidden;
+      }
+      .dcard .dthumb img { width: 100%; height: 100%; object-fit: contain; display: block; }
+      .dcard .dthumb .dnone {
+        font-size: 10px; opacity: 0.45; padding: 0.2rem; text-align: center; line-height: 1.3;
+      }
+      /* 이름은 씬이 정한 문자열이라 길이를 우리가 못 정한다. 잘라서 보인다 */
+      .dcard .dname {
+        font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .dcard .dmeta { font-size: 10px; opacity: 0.5; display: flex; gap: 0.25rem; flex-wrap: wrap; }
+      .dcard .dtags { display: flex; gap: 0.2rem; flex-wrap: wrap; }
+      #drapingPanel .dbar { display: flex; gap: 0.35rem; align-items: center; flex-wrap: wrap; }
+      #drapingPanel .dstat { font-size: 11px; opacity: 0.8; margin-top: 0.35rem; }
+      #drapingPanel .dstat.err { color: #ff9a9a; opacity: 1; }
       /* 비활성은 흐리게 **하되**, 아래 `.pwhy` 가 이유를 글자로 남긴다 */
       .prow.off { opacity: 0.75; }
       .phead { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
@@ -828,6 +867,17 @@
              위 `#sideScroll > .sidepane[hidden]` 규칙이 그 관계에 걸려 있다.
         -->
         <div id="surfacePanel" class="pgroup"></div>
+        <!--
+          드레이핑 보드 (DB-1). 같은 칸의 세 번째 탭이다.
+
+          여기 있는 이유: 아이템 하나가 **그 시점의 씬 데이터 사본을 통째로**
+          들고 있어서, 적용하면 위 두 탭에서 만진 체형·옷 사이즈가 저장 당시
+          값으로 되돌아간다. 세 가지가 같은 칸에 있어야 그 관계가 보인다.
+
+          ⚠️ `#sideScroll` 의 **직계 자식**으로 남아야 한다 —
+             `#sideScroll > .sidepane[hidden]` 규칙이 그 관계에 걸려 있다.
+        -->
+        <div id="drapingPanel" class="pgroup"></div>
       </div>
     </div>
 

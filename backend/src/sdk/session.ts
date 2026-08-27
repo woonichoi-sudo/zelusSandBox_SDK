@@ -16,6 +16,8 @@ import {
   type AvatarBodyResult,
   type AvatarMeshResult,
   type AvatarMeasurementTargets,
+  type DrapingItemsResult,
+  type DrapingThumbnailResult,
   type LoadDrapingResult,
   type SetAvatarBodyResult,
   type SetAvatarMeasurementsResult,
@@ -272,14 +274,49 @@ export class Session extends EventEmitter {
   }
 
   /**
-   * `.zls` 에 저장된 자동 드레이프를 적용한다 (W-1). 펼쳐진 옷이 입혀진다.
+   * 씬에 저장된 드레이핑 아이템 목록 (DB-1). **씬을 안 바꾼다.**
    *
-   * ⚠️ **`applied:false` 는 실패가 아니다** — 그 씬에 자동 드레이프가 없을 뿐이다.
+   * `loadDraping()` 도 목록을 같이 돌려주지만, 이쪽은 **적용하지 않고** 읽기만
+   * 한다 — 화면이 보드를 그리려면 아무것도 씌우기 전에 목록이 있어야 한다.
+   *
+   * ⚠️ 이름이 빈 아이템은 **목록에 안 나온다**(엔진의 필터다, 데스크톱 앱과
+   *    같다). 즉 `count` 는 "고를 수 있는 것" 의 수이지 파일 안의 총수가 아니다.
+   */
+  drapingItems(): Promise<DrapingItemsResult> {
+    return this.#call('drapingItems');
+  }
+
+  /**
+   * `.zls` 에 저장된 드레이프를 적용한다 (W-1 / DB-1). 펼쳐진 옷이 입혀진다.
+   *
+   * `uuid` 를 주면 그 아이템을, **없으면 자동 아이템**을 적용한다.
+   *
+   * ⚠️ **`applied:false` 는 실패가 아니다** — 자동 드레이프가 없거나
+   *   (`noAutoItem`) 준 uuid 가 목록에 없다(`notFound`).
    * ★ **`applied:true` 면 프레임 카운터가 -1 로 되돌아간다** (엔진이 안에서
    *   `Reset()` 한다). 부르는 쪽은 `reset()` 과 같은 뒤처리를 해야 한다.
    */
-  loadDraping(): Promise<LoadDrapingResult> {
-    return this.#call('loadDraping');
+  loadDraping(uuid?: string): Promise<LoadDrapingResult> {
+    // 인자가 없으면 **필드 자체를 안 보낸다.** `uuid: undefined` 를 실으면
+    // JSON 직렬화에서 사라지긴 하지만, 빈 문자열이 섞여 들어올 여지를 남긴다 —
+    // 워커는 빈 문자열을 "자동" 으로 읽으므로 조용히 다른 것이 적용된다.
+    return uuid === undefined
+      ? this.#call('loadDraping')
+      : this.#call('loadDraping', { uuid });
+  }
+
+  /**
+   * 아이템 하나의 미리보기 이미지 (DB-1). **base64 로 온다** — 60~75KB 짜리
+   * PNG 가 약 4/3 배로 부풀어 ~100KB 다.
+   *
+   * ★ **목록에는 바이트가 안 실린다.** 화면이 필요한 것만 하나씩 받고, 받은
+   *   것은 부르는 쪽이 캐시한다(같은 씬에서 안 변한다).
+   *
+   * ⚠️ **`hasImage:false` 는 실패가 아니다** — 없는 uuid, 미리보기 없이 저장된
+   *   아이템, 모르는 형식이 전부 여기로 온다. `reason` 이 셋을 가른다.
+   */
+  drapingThumbnail(uuid: string): Promise<DrapingThumbnailResult> {
+    return this.#call('drapingThumbnail', { uuid });
   }
 
   /** 서피스(패턴) 목록과 크기를 읽는다. **cm 다** (L-3b) */

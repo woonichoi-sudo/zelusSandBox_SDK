@@ -27,7 +27,7 @@
 
 import { t } from './i18n.ts';
 
-export type SideTabId = 'avatar' | 'surface';
+export type SideTabId = 'avatar' | 'surface' | 'draping';
 
 /** 탭 하나의 정의. **순서가 곧 화면 순서다** */
 export interface SideTabDef {
@@ -53,6 +53,11 @@ export interface SideTabDef {
 export const SIDE_TABS: readonly SideTabDef[] = [
   { id: 'avatar', get label(): string { return t('side.tab.avatar'); }, paneId: 'avatarPanel' },
   { id: 'surface', get label(): string { return t('side.tab.surface'); }, paneId: 'surfacePanel' },
+  // 드레이핑 보드 (DB-1). **맨 뒤인 이유**는 위 두 탭과 같은 순서 논리다:
+  // 몸 → 옷 → 그 옷이 입혀진 상태. 저장된 드레이프를 고르는 것은 앞의 둘이
+  // 정해진 다음의 일이고, 실제로 적용하면 앞에서 만진 것이 그 시점 값으로
+  // 되돌아간다(아이템이 씬 데이터 사본을 통째로 들고 있다).
+  { id: 'draping', get label(): string { return t('side.tab.draping'); }, paneId: 'drapingPanel' },
 ];
 
 /** 화면에 그릴 탭 한 개 */
