@@ -52,27 +52,42 @@ else()
     set(OUTPUT_NAME "zelusSandBoxd-demo")
     set(REQUIRES_LICENSE 0)
 
-    # 라이선스 없는 엔진은 두 곳에 있고, 구성에 따라 이름과 위치가 다르다.
+    # 라이선스 없는 엔진은 구성에 따라 이름이 다르다 (SetupConfigs의 debug postfix).
     #
-    #   Debug   저장소의 cmake_build_src   → Zest_debug.lib
-    #   Release 우리가 빌드한 engine-build → Zest.lib
+    #   Debug   → Zest_debug.lib
+    #   Release → Zest.lib
     #
-    # (Debug도 우리 트리에서 빌드하면 통일되지만, 저장소에 이미 있는 걸
-    #  다시 만들 이유가 없어 그대로 쓴다.)
-    set(ENGINE_DEBUG_DIR   "${SANDBOX_REPO}/cmake_build_src")
+    # 위치는 두 곳일 수 있다. 저장소에 `cmake_build_src`가 이미 있으면 Debug는
+    # 그걸 쓰고(다시 만들 이유가 없다), 없으면 우리가 `engine/CMakeLists.txt`로
+    # 빌드한 engine-build를 양쪽 구성 모두에 쓴다.
+    #
+    # ⚠️ `cmake_build_src`는 저장소에 항상 있는 것이 아니다 — 이 워크스페이스를
+    #    새 머신으로 옮기면 없다(2026-08-21에 실제로 밟았다). 그래서 없다고
+    #    구성 단계에서 죽이지 않는다. Release만 필요한 경우가 대부분이고,
+    #    실제로 없는 구성으로 빌드하면 링커가 그때 정확히 지목한다.
     set(ENGINE_RELEASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/engine-build")
 
-    if (NOT EXISTS "${ENGINE_DEBUG_DIR}/lib/Debug/Zest_debug.lib")
-        message(FATAL_ERROR
-            "Debug 엔진을 찾을 수 없음: ${ENGINE_DEBUG_DIR}/lib/Debug\n"
-            "라이선스가 있다면 -D USE_SDK_ENGINE=ON 으로 SDK를 쓰십시오.")
+    if (EXISTS "${SANDBOX_REPO}/cmake_build_src/lib/Debug/Zest_debug.lib")
+        set(ENGINE_DEBUG_DIR "${SANDBOX_REPO}/cmake_build_src")
+    else()
+        set(ENGINE_DEBUG_DIR "${ENGINE_RELEASE_DIR}")
     endif()
 
-    if (NOT EXISTS "${ENGINE_RELEASE_DIR}/lib/Release/Zest.lib")
-        message(WARNING
-            "Release 엔진이 없습니다: ${ENGINE_RELEASE_DIR}/lib/Release\n"
-            "engine/CMakeLists.txt 로 먼저 빌드하십시오. Debug는 그대로 됩니다.")
-    endif()
+    foreach(_cfg Debug Release)
+        if (_cfg STREQUAL "Debug")
+            set(_dir "${ENGINE_DEBUG_DIR}")
+            set(_lib "Zest_debug.lib")
+        else()
+            set(_dir "${ENGINE_RELEASE_DIR}")
+            set(_lib "Zest.lib")
+        endif()
+        if (NOT EXISTS "${_dir}/lib/${_cfg}/${_lib}")
+            message(WARNING
+                "${_cfg} 엔진이 없습니다: ${_dir}/lib/${_cfg}\n"
+                "engine/CMakeLists.txt 로 그 구성을 먼저 빌드하십시오. "
+                "다른 구성은 그대로 됩니다.")
+        endif()
+    endforeach()
 
     set(ENG_DIR "$<IF:$<CONFIG:Debug>,${ENGINE_DEBUG_DIR},${ENGINE_RELEASE_DIR}>")
     set(ENG_SUF "$<$<CONFIG:Debug>:_debug>")
@@ -181,6 +196,14 @@ message(STATUS "zelusSandBoxd 산출물: ${OUTPUT_NAME}.exe "
 
 if (MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE /MP)
+
+    # 우리 소스(src/*.cpp)는 BOM 없는 UTF-8이고 한글 문자열을 담고 있다.
+    # MSVC는 BOM이 없으면 시스템 코드페이지로 읽으므로, 한국어 Windows(CP949)
+    # 에서는 한글 리터럴의 바이트가 깨져 "상수에 줄 바꿈 문자가 있습니다"(C2001)
+    # 와 구문 오류가 수백 건 쏟아진다. 2026-08-21에 새 머신에서 밟았다.
+    # BOM을 붙이는 대신 컴파일러에 인코딩을 알려 준다 — 저장소 소스도 같이
+    # 컴파일하므로 파일을 건드리지 않는 쪽이 안전하다.
+    target_compile_options(${PROJECT_NAME} PRIVATE /utf-8)
     # 저장소 소스가 그대로 만들어내는 경고들 (원본 CMakeLists와 동일하게 억제)
     target_compile_options(${PROJECT_NAME} PRIVATE
         /wd4201 /wd4251 /wd4324 /wd4996 /wd4127 /wd4714 /wd4984 /wd4267 /wd4828)
