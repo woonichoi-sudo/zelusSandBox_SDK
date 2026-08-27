@@ -10221,7 +10221,7 @@ function sectionI18nLookup(): void {
   //    본다 — 되돌림 자체가 깨질 수 있다.
   const before = getLang();
   try {
-    check('기본 언어는 한국어다 (기존 단언들이 한국어 화면 글자로 서 있다)', DEFAULT_LANG === 'ko', DEFAULT_LANG);
+    check('기본 언어는 영어다 (한국어 화면 글자로 선 단언들은 main() 이 못박아 준다)', DEFAULT_LANG === 'en', DEFAULT_LANG);
 
     // ── 조회 ────────────────────────────────────────────────
     check(
@@ -10245,8 +10245,8 @@ function sectionI18nLookup(): void {
     );
     // 모르는 **언어** 로 물어도 화면이 비면 안 된다.
     check(
-      '★ 모르는 언어로 물으면 한국어로 떨어진다 (화면이 비지 않는다)',
-      translate('fr' as Lang, 'bar.load') === MESSAGES.ko['bar.load'],
+      '★ 모르는 언어로 물으면 기본 언어(영어)로 떨어진다 (화면이 비지 않는다)',
+      translate('fr' as Lang, 'bar.load') === MESSAGES.en['bar.load'],
       translate('fr' as Lang, 'bar.load'),
     );
 
@@ -10258,10 +10258,10 @@ function sectionI18nLookup(): void {
       '',
     );
     check(
-      '모르는 값·숫자·null 은 전부 한국어다',
-      normalizeLang('fr') === 'ko' && normalizeLang(123) === 'ko'
-      && normalizeLang(null) === 'ko' && normalizeLang(undefined) === 'ko'
-      && normalizeLang('') === 'ko',
+      '모르는 값·숫자·null 은 전부 영어다',
+      normalizeLang('fr') === 'en' && normalizeLang(123) === 'en'
+      && normalizeLang(null) === 'en' && normalizeLang(undefined) === 'en'
+      && normalizeLang('') === 'en',
       '',
     );
 
@@ -10277,8 +10277,8 @@ function sectionI18nLookup(): void {
       `저장값 '${box.get(LANG_STORAGE_KEY) ?? ''}'`,
     );
     box.set(LANG_STORAGE_KEY, '쓰레기');
-    check('저장소에 이상한 값이 있으면 한국어로 연다', readStoredLang(fake) === 'ko', '');
-    check('저장소가 없으면 한국어로 연다', readStoredLang(null) === 'ko' && !storeLang('en', null), '');
+    check('저장소에 이상한 값이 있으면 영어로 연다', readStoredLang(fake) === 'en', '');
+    check('저장소가 없으면 영어로 연다', readStoredLang(null) === 'en' && !storeLang('en', null), '');
 
     // ★ 사생활 모드의 브라우저는 `localStorage` **접근 자체**가 예외다.
     //   저장이 안 되는 것은 다음 방문에 기본 언어로 열린다는 뜻일 뿐이고,
@@ -10289,14 +10289,14 @@ function sectionI18nLookup(): void {
     };
     let threw = false;
     let stored = true;
-    let read: Lang = 'en';
+    let read: Lang = 'ko';
     try {
       read = readStoredLang(angry);
       stored = storeLang('en', angry);
     } catch { threw = true; }
     check(
       '★ 저장소가 던져도 화면이 죽지 않는다 (사생활 모드)',
-      !threw && read === 'ko' && !stored,
+      !threw && read === 'en' && !stored,
       threw ? '예외가 새어 나왔다' : `읽기 '${read}' · 쓰기 ${String(stored)}`,
     );
 
@@ -10313,7 +10313,7 @@ function sectionI18nLookup(): void {
     check('★ 같은 언어로 다시 불러도 알리지 않는다', setLang('en', null) === 'en' && seen.length === 0, `${seen.length}회`);
 
     seen.length = 0;
-    check('모르는 값으로 부르면 한국어가 된다', setLang('fr', null) === 'ko' && getLang() === 'ko', getLang());
+    check('모르는 값으로 부르면 영어가 된다', setLang('fr', null) === 'en' && getLang() === 'en', getLang());
 
     off();
     seen.length = 0;
@@ -10324,7 +10324,7 @@ function sectionI18nLookup(): void {
     box.set(LANG_STORAGE_KEY, 'en');
     check('`initLang` 이 저장된 값으로 첫 언어를 정한다', initLang(fake) === 'en' && getLang() === 'en', getLang());
     box.set(LANG_STORAGE_KEY, 'ko');
-    check('`initLang` 은 저장된 값이 없으면 한국어다', initLang(null) === 'ko' && getLang() === 'ko', getLang());
+    check('`initLang` 은 저장된 값이 없으면 영어다', initLang(null) === 'en' && getLang() === 'en', getLang());
   } finally {
     setLang(before, null);
   }
@@ -10732,6 +10732,14 @@ async function main(): Promise<void> {
   //    Node가 "할 일 없음"으로 판단하고 **정상 종료**해버린다.
   process.exitCode = 1;
   const keepAlive = setInterval(() => {}, 1_000);
+
+  // ── 언어를 한국어로 못박는다 (I-1) ──────────────────────────
+  //
+  // 화면의 기본값은 **영어**인데(`DEFAULT_LANG`), 아래 절들의 단언은 화면
+  // 글자를 한국어로 적어 뒀다(`playLabel` 이 '재생' 인지 …). 여기서 정해
+  // 두지 않으면 그 단언들이 통째로 빨개진다. §16-2 는 언어를 만졌다가
+  // 되돌리므로 그 뒤의 절들도 계속 한국어를 본다.
+  setLang('ko', null);
 
   sectionEndpoints();
   sectionDecodeLength();

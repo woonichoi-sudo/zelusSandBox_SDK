@@ -695,6 +695,12 @@ async function main(): Promise<void> {
   try {
     browser = await chromium.launch({ headless: !HEADED, channel: CHANNEL });
     const page = await browser.newPage({ viewport: { ...VIEWPORT } });
+    // 화면의 기본 언어는 **영어**인데(`DEFAULT_LANG`), 아래 절들은 버튼
+    // 글자를 한국어로 읽는다('재생' 이 들어 있는가 …). 페이지 스크립트보다
+    // 먼저 저장소에 'ko' 를 넣어 한국어로 열리게 한다 — 첫 그림부터 한국어다.
+    await page.addInitScript(() => {
+      try { localStorage.setItem('cobalt.lang', 'ko'); } catch { /* 사생활 모드 */ }
+    });
     const logs = collect(page);
     // 첫 소켓이 열리기 전에 붙여야 한다 — 페이지가 뜨는 순간 이미 붙는다.
     const sent = collectWsFrames(page);
