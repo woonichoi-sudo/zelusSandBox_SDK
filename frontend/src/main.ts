@@ -180,8 +180,18 @@ const ui = {
   sideScroll: el<HTMLElement>('sideScroll'),
   // 좁은 창에서 서랍이 될 칸 자체. 그 안의 탭·패널은 그대로 굴러간다
   sidePanel: el<HTMLElement>('sidePanel'),
-  // 여닫기 버튼이 들어갈 상단 바
+  // 툴바 (L-4). 예전에는 이 상자가 상단 바 전부였다
   bar: el<HTMLElement>('bar'),
+  // ── 메뉴바 (L-4) ─────────────────────────────────────────
+  // 언어 상자와 설정 칸 여닫기 버튼이 붙는 오른쪽 끝. **`#bar` 가 아니다** —
+  // 둘 다 화면 전체에 걸리는 조작이라 뷰포트별로 갈린 툴바에 속하지 않는다.
+  menuRight: el<HTMLElement>('menuRight'),
+  // 지금 열려 있는 씬 이름. `data-i18n` 이 없는 이유는 index.html 주석 참고
+  docTitle: el<HTMLElement>('docTitle'),
+  // [파일] 메뉴의 손잡이와 그 안의 상자. 여닫기는 아래 `setFileMenu()` 다
+  menuFile: el<HTMLButtonElement>('menuFile'),
+  menuFilePop: el<HTMLElement>('menuFilePop'),
+  menuFileRoot: el<HTMLElement>('menuFileRoot'),
   // 2D 펼침 (#15-b). 슬라이더 하나와 글자 두 자리 — 판단은 `viewer2d/` 다.
   unfold: el<HTMLInputElement>('unfold'),
   unfoldStat: el<HTMLElement>('unfoldStat'),
@@ -980,7 +990,7 @@ const sideTabs = new SideTabs({
 const drawer = new SideDrawer({
   body: document.body,
   panel: ui.sidePanel,
-  bar: ui.bar,
+  bar: ui.menuRight,
   state: new SideDrawerPanel(),
   onChange: (open) => log(`설정 칸 ${open ? '펼침' : '접음'}`),
 });
@@ -1197,6 +1207,7 @@ function clearScene(): void {
   clothTextures = [];
   textureOptions.clear();
   currentScene = null;
+  paintDocTitle();
   // 아바타도 씬에 딸려 있다. `currentScene = null` 뒤에 불러야
   // `refreshAvatarBody` 가 "씬 없음" 갈래로 간다.
   void refreshAvatarBody();
@@ -1208,6 +1219,42 @@ function clearScene(): void {
   refreshParams();
   statusT('status.cleared');
   setBusy(false);
+}
+
+/**
+ * 메뉴바 가운데의 문서 이름 (L-4).
+ *
+ * ★ **씬 상자의 글자를 그대로 쓴다.** 거기에는 이미 크기까지 붙어 있고
+ *   (`W_Slit dress.zls (113.3MB)`), 그 문장을 만드는 곳이 `paintScenes()`
+ *   하나뿐이라야 목록과 제목이 갈라지지 않는다.
+ * ⚠️ 씬 목록보다 `currentScene` 이 **먼저 설 수 있다**(재연결 직후). 짝을 못
+ *   찾으면 id 를 그대로 보여준다 — 빈 제목보다는 낫다.
+ */
+function paintDocTitle(): void {
+  const id = currentScene;
+  if (!id) {
+    ui.docTitle.textContent = t('menu.untitled');
+    ui.docTitle.title = '';
+    return;
+  }
+  const opt = [...ui.scene.options].find((o) => o.value === id);
+  const name = opt?.textContent?.trim() ?? '';
+  const shown = name === '' ? id : name;
+  ui.docTitle.textContent = shown;
+  // 이름이 길면 잘리므로(`.mtitle` 의 ellipsis) 전체는 툴팁에 남긴다
+  ui.docTitle.title = shown;
+}
+
+/**
+ * [파일] 메뉴를 연다/닫는다 (L-4).
+ *
+ * ⚠️ `hidden` 과 `aria-expanded` 를 **둘 다** 건다. 앞은 눈에, 뒤는 스크린
+ *    리더와 `.menubtn[aria-expanded="true"]` 강조에 쓰인다 — 하나만 걸면
+ *    화면과 보조기술이 갈라진다.
+ */
+function setFileMenu(open: boolean): void {
+  ui.menuFilePop.hidden = !open;
+  ui.menuFile.setAttribute('aria-expanded', open ? 'true' : 'false');
 }
 
 /** 버튼 네 개의 글자와 활성 상태. **상태는 만들지 않는다 — 받은 것만 그린다** */
@@ -1555,6 +1602,7 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
       mirror: viewer2d.cloth,
     });
     currentScene = sceneId;
+    paintDocTitle();
     // ★ 옷의 직물 무늬 (materials-c). `showScene` 이 이미 화면에 걸었고, 여기서
     //   하는 일은 화면 글자를 위해 표를 들고 있는 것뿐이다. 아바타 쪽 표는
     //   `avatarView` 가 자기 왕복에서 가져오고, 둘을 합치는 것이 아래 함수다.
@@ -1734,9 +1782,40 @@ window.addEventListener('keydown', (ev: KeyboardEvent) => {
   void act(action);
 });
 
+// ── [파일] 메뉴 (L-4) ───────────────────────────────────────
+//
+// ★ **바깥 클릭은 `document` 에서 듣는다.** 팝업에 blur 를 걸면 안쪽 상자를
+//   옮겨 다닐 때마다(씬 목록 → [로드]) 닫힌다. 어디를 눌렀는지로 판정하는 편이
+//   실제 조작과 맞는다.
+// ⚠️ `contains` 의 기준이 `#menuFileRoot` 다 — 손잡이와 팝업이 **둘 다** 그
+//    안에 있어야 손잡이를 다시 눌러 닫는 길이 아래 토글 하나로 끝난다.
+ui.menuFile.addEventListener('click', () => {
+  setFileMenu(ui.menuFilePop.hidden);
+});
+
+document.addEventListener('pointerdown', (ev: PointerEvent) => {
+  if (ui.menuFilePop.hidden) return;
+  const target = ev.target instanceof Node ? ev.target : null;
+  if (target && ui.menuFileRoot.contains(target)) return;
+  setFileMenu(false);
+});
+
+// Escape 로도 닫힌다. `panels/shortcuts.ts` 를 안 타는 이유는 이것이 화면
+// 조작이 아니라 **열려 있는 상자를 닫는 일**이라, 시뮬 단축키와 같은 판정을
+// 받을 필요가 없어서다.
+window.addEventListener('keydown', (ev: KeyboardEvent) => {
+  if (ev.key !== 'Escape' || ui.menuFilePop.hidden) return;
+  ev.preventDefault();
+  setFileMenu(false);
+  ui.menuFile.focus();
+});
+
 ui.load.addEventListener('click', () => {
   const id = ui.scene.value;
-  if (id) void show(id);
+  if (!id) return;
+  // 씬을 골랐으면 메뉴가 할 일은 끝났다. 열어 두면 로드되는 3D 를 가린다
+  setFileMenu(false);
+  void show(id);
 });
 
 /**
@@ -1770,6 +1849,8 @@ ui.file.addEventListener('change', () => {
 ui.upload.addEventListener('click', () => {
   const file = ui.file.files?.[0];
   if (!file) return;
+  // 위 [로드] 와 같은 이유 — 올린 씬이 곧바로 화면에 선다
+  setFileMenu(false);
   void (async (): Promise<void> => {
     setBusy(true);
     // ⛔ `file.name` 은 사용자가 고른 파일 이름이라 번역하지 않는다
@@ -1808,6 +1889,7 @@ function repaintForLang(): void {
 
   // ③ 스스로 다시 그리는 위젯들. 순서에 뜻은 없다 — 전부 멱등이다
   paintPlayback();
+  paintDocTitle();
   paintDraping();
   paintUnfold();
   paintFrames();
@@ -1823,7 +1905,7 @@ function repaintForLang(): void {
 }
 
 const langSwitch = new LangSwitch({
-  root: ui.bar,
+  root: ui.menuRight,
   onChange: repaintForLang,
 });
 

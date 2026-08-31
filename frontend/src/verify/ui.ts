@@ -180,7 +180,7 @@ interface ScreenColors {
   total: number;
   /** 채도·명도가 충분해 "색"이라 부를 수 있는 픽셀 수 */
   saturated: number;
-  /** 배경(#1b1e24)보다 밝은 픽셀 수. 화면이 통째로 검은지 본다 */
+  /** 배경(#2b2b2b)보다 밝은 픽셀 수. 화면이 통째로 검은지 본다 */
   bright: number;
   /** 10° 칸별 픽셀 수 */
   buckets: number[];
@@ -276,7 +276,8 @@ async function shot(page: Page, label: string): Promise<Shot> {
       const mx = Math.max(r, g, b);
       const mn = Math.min(r, g, b);
       const s = mx === 0 ? 0 : (mx - mn) / mx;
-      // 배경 #1b1e24 는 v≈0.14 다. 그보다 확실히 위만 "밝다"로 센다.
+      // 배경 #2b2b2b 는 v≈0.169 다. 그보다 확실히 위만 "밝다"로 센다.
+      // ⚠️ 배경을 더 밝히면 이 줄도 같이 올려야 한다 — 안 그러면 늘 100% 다.
       if (mx > 0.18) bright++;
       // 배경보다 어두운 것은 색조를 따질 값이 없다. 밝기 문턱은 둘이 공유한다.
       if (mx < 0.22 || s < PALE_MIN) continue;
@@ -1206,6 +1207,34 @@ async function blur(page: Page): Promise<void> {
   });
 }
 
+/**
+ * 씬 조작을 만지기 전에 **[파일] 메뉴를 연다** (L-4).
+ *
+ * 씬 목록·[로드]·파일 입력이 메뉴바의 [파일] 안으로 들어갔다. 닫힌 메뉴는
+ * `display: none` 이라 Playwright 가 **누르지도 포커스하지도 못한다** — 그래서
+ * 이 함수를 거치지 않은 `click('#load')` 는 30초를 기다리다 타임아웃으로 죽는다.
+ *
+ * ⚠️ 열려 있으면 다시 누르지 않는다. [파일] 은 토글이라 두 번 누르면 닫힌다 —
+ *    "열려고 눌렀는데 닫혔다" 는 실패는 원인을 화면에서 읽을 수 없다.
+ * ⓘ 닫는 것은 대개 앱이 한다(`main.ts` 가 [로드]·[업로드] 뒤에 닫는다).
+ *    그 경로를 안 타는 절만 `closeFileMenu` 로 직접 닫는다.
+ */
+async function openFileMenu(page: Page): Promise<void> {
+  const open = await page.evaluate(
+    () => document.getElementById('menuFilePop')?.hasAttribute('hidden') === false,
+  );
+  if (!open) await page.click('#menuFile');
+  await page.waitForSelector('#menuFilePop', { state: 'visible' });
+}
+
+/** 열려 있으면 닫는다. 메뉴가 3D 칸 왼쪽 위를 덮은 채로 다음 절에 넘어가지 않게 */
+async function closeFileMenu(page: Page): Promise<void> {
+  const open = await page.evaluate(
+    () => document.getElementById('menuFilePop')?.hasAttribute('hidden') === false,
+  );
+  if (open) await page.click('#menuFile');
+}
+
 async function sectionPlaybackControls(page: Page): Promise<void> {
   section('§10. 재생 컨트롤 (#14) — 버튼·키가 실제로 화면을 움직인다');
 
@@ -1286,6 +1315,7 @@ async function sectionPlaybackControls(page: Page): Promise<void> {
     {
       const b = await readPlayback(page);
       // 입력 요소에 포커스가 있으면 양보한다.
+      await openFileMenu(page);
       await page.focus('#file');
       await page.keyboard.press('s');
       await sleep(300);
@@ -1295,6 +1325,9 @@ async function sectionPlaybackControls(page: Page): Promise<void> {
         afterInput.playing === b.playing && afterInput.state === b.state,
         `${b.state} → ${afterInput.state}`,
       );
+
+      // 메뉴를 열어 둔 채 다음 절로 넘어가지 않는다 — 3D 칸 왼쪽 위를 덮는다
+      await closeFileMenu(page);
 
       // ⚠️ 버튼에 포커스가 있을 때도 양보한다. 재생 버튼을 누른 직후가 그
       //    상태이고, 양보하지 않으면 한 번의 입력이 두 가지 동작이 된다.
@@ -1338,6 +1371,7 @@ async function sectionPlaybackControls(page: Page): Promise<void> {
       // 로드를 누른다. **로드가 끝나기를 기다리지 않고 곧바로 읽는다** —
       // 103MB 면 1초쯤이고, ISSUE-009 는 그 1초 동안의 거짓말이었다.
       await blur(page);
+      await openFileMenu(page);
       await page.click('#load');
       const during = await readPlayback(page);
       check(
@@ -1469,6 +1503,7 @@ async function sectionPlaybackControls(page: Page): Promise<void> {
         `"${cleared.statusText}" / "${cleared.text}"`);
 
       // 되돌린다 — 잃은 것은 시뮬 진행뿐이라는 것이 확인창을 안 단 근거다.
+      await openFileMenu(page);
       await page.click('#load');
       const back = await page.waitForFunction(
         () => globalThis.cobalt.viewer.cloth.patternCount > 0,
@@ -1689,6 +1724,7 @@ function readPanel(page: Page): Promise<PanelProbe> {
 async function loadScene(page: Page): Promise<void> {
   const syncs = await page.evaluate(() => globalThis.cobalt.playback.stats.syncs);
   await blur(page);
+  await openFileMenu(page);
   await page.click('#load');
   await page.waitForFunction(
     (n: number) =>
@@ -2357,6 +2393,7 @@ async function sectionParams(page: Page, sent: SentOp[]): Promise<void> {
       } else {
         const fallback = paramField('timeStep')?.fallback;
         const hereValue = rows['timeStep']?.value ?? '';
+        await openFileMenu(page);
         await page.selectOption('#scene', other.value);
         await loadScene(page);
         const swapped = await readParamRows(page);
@@ -2375,6 +2412,7 @@ async function sectionParams(page: Page, sent: SentOp[]): Promise<void> {
           !st.simInitialized && swapped['solverType']?.disabled === false && !swapped['solverType'].whyShown,
           `simInitialized=${String(st.simInitialized)} · solverType 잠김=${String(swapped['solverType']?.disabled)}`,
         );
+        await openFileMenu(page);
         await page.selectOption('#scene', here);
         await loadScene(page);
         const back = await readParamRows(page);

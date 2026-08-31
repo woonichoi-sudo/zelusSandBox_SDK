@@ -95,7 +95,9 @@ export class Viewer2D {
 
     this.#renderer = new THREE.WebGLRenderer({ canvas: opts.canvas, antialias: true });
     this.#renderer.setPixelRatio(Math.min(globalThis.devicePixelRatio ?? 1, 2));
-    this.#scene.background = new THREE.Color(opts.background ?? 0x1b1e24);
+    /* 3D 칸보다 한 단 어둡다 — 두 칸이 같은 색이면 경계선 하나로만 갈린다.
+       중성 회색이라야 하는 이유는 `viewer3d/viewer.ts` 의 같은 줄 주석 참고 */
+    this.#scene.background = new THREE.Color(opts.background ?? 0x222222);
 
     // 화각은 `fit()` 이 도면 범위에서 정한다. 여기 값은 도면이 아직 없을 때만
     // 쓰인다 — 빈 칸에 격자만 보이는 상태다.

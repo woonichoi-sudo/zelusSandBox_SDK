@@ -125,6 +125,22 @@ const KO: Dict = {
   //    화면에서 내려갔다. 사유는 `index.html` 의 그 자리 주석에 있다.
   'bar.status.booting': '시작하는 중…',
 
+  // ── 메뉴바 (L-4) ────────────────────────────────────────
+  // ⛔ [편집]·[창]·[도움말] 은 눌리지 않는 껍데기다. 글자만 있는 이유는
+  //    index.html 의 그 자리 주석 참고.
+  'menu.file': '파일',
+  'menu.edit': '편집',
+  'menu.window': '창',
+  'menu.help': '도움말',
+  // 씬이 없을 때 메뉴바 가운데에 서는 글자. 데스크톱의 `Untitled.zls` 자리다
+  'menu.untitled': '제목 없음',
+
+  // ── 상태 바 (L-4) ───────────────────────────────────────
+  // ⚠️ `status.*` 가 아니라 `statusbar.*` 다. 앞의 것은 `statusT()` 가 쓰는
+  //    **지나가는 문장**이고 이것은 바에 늘 서 있는 이름표다 — 같은 이름을
+  //    쓰면 한쪽을 지울 때 다른 쪽이 딸려 나간다.
+  'statusbar.mode': '디자인 모드',
+
   // ── 칸 안의 글자 ────────────────────────────────────────
   'hint.view': '좌드래그 회전 · 우드래그 팬 · 휠 줌  |  격자 한 칸 = 10cm',
   'hint.shortcuts': 'S 재생/정지 · R 리셋 · C 씬 내림',
@@ -522,6 +538,16 @@ const EN: Dict = {
   // ⛔ `bar.snap*` · `bar.mode.*` — 한국어 사전과 같이 뺐다 (H-1). 두 벌의 키
   //    집합은 대칭이어야 한다(스모크 §16-1) — 한쪽만 지우면 거기가 빨개진다.
   'bar.status.booting': 'Starting…',
+
+  // ── 메뉴바 (L-4) ────────────────────────────────────────
+  'menu.file': 'File',
+  'menu.edit': 'Edit',
+  'menu.window': 'Window',
+  'menu.help': 'Help',
+  'menu.untitled': 'Untitled',
+
+  // ── 상태 바 (L-4) ───────────────────────────────────────
+  'statusbar.mode': 'Design mode',
 
   // ── 칸 안의 글자 ────────────────────────────────────────
   'hint.view': 'drag = orbit · right-drag = pan · wheel = zoom  |  one grid cell = 10cm',

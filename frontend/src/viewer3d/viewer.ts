@@ -133,7 +133,19 @@ export class Viewer3D {
     // 레티나에서 2배를 넘겨봐야 눈에 안 보이고 픽셀만 4배가 된다.
     this.#renderer.setPixelRatio(Math.min(globalThis.devicePixelRatio ?? 1, 2));
 
-    this.#scene.background = new THREE.Color(opts.background ?? 0x1b1e24);
+    /*
+      ⚠️ **정확히 중성 회색이라야 한다 (T-1).** `src/verify/ui.ts` 는 화면
+         스크린샷의 색조 분포로 옷이 제대로 그려졌는지 판정하는데, 배경에
+         채도가 조금이라도 있으면(`(max-min)/max > 0.06`) 배경 픽셀이 통째로
+         그 표에 들어가 판정을 덮는다. 옛 값 `0x1b1e24` 는 채도 0.22 로,
+         **파란 칸에 기본 수만 개를 얹고 있었다.** r=g=b 로 두면 채도가 0 이라
+         구조적으로 새지 않는다.
+      ⚠️ **밝기도 0.18 아래라야 한다.** 같은 파일이 "화면이 통째로 검은가" 를
+         `max > 0.18` 로 세는데, 배경이 그 위면 늘 100% 가 나와 그 진단이
+         죽는다. 0x2b = 43/255 = 0.169 다 — 더 밝히려면 그쪽 문턱도 같이
+         올려야 한다.
+    */
+    this.#scene.background = new THREE.Color(opts.background ?? 0x2b2b2b);
 
     // near/far 는 frameCamera() 가 경계에 맞춰 다시 잡는다. 여기 값은 옷이
     // 아직 없을 때(빈 화면)만 쓰인다.
