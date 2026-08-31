@@ -28,6 +28,7 @@
 #include <ztMutex.h>               // ztGlobalMutex — 아바타 메시 읽기 보호 (avatarMesh)
 #include <ztDesignBoundaryCurve.h> // ztBoundaryType (디자인 2D 커브 종류)
 #include <ztDesignClothPattern.h>
+#include <ztDesignLogo.h>          // ztDesignLogoData·ztOverlayMesh (로고)
 #include <ztDesignSeam.h>          // ztDesignSeamData (봉제선)
 #include <ztDesignStitch.h>        // ztDesignStitchData (스티치)
 #include <ztGeomCubicBezierCurve.h> // 커브 세분·구간 잘라내기
@@ -1955,6 +1956,190 @@ private:
     std::map<std::string, int> mIndex;
 };
 
+// ── 로고 (LG-1) ─────────────────────────────────────────────
+//
+// 옷 위에 얹히는 프린트·자수 같은 그래픽이다. **원단 텍스처와 다른 계층**이라,
+// 직물을 아무리 잘 입혀도 이것을 따로 싣지 않으면 화면에 안 나온다.
+//
+// ★★ **로고 메시는 좌표가 아니라 무게중심(barycentric)으로 정의돼 있다.**
+//    `ztOverlayMesh::GetPseudoVertices()` 의 한 점은 `{ idx0, idx1, idx2, ratio }`
+//    이고, 이는 **패턴 메시의 삼각형 하나와 그 안의 비율**을 가리킨다. 그래서
+//    프레임마다 로고를 다시 받을 필요가 없다 — 옷의 정점이 움직이면 받는 쪽에서
+//    같은 식으로 다시 계산하면 로고가 따라 움직인다. 이 사실이 프로토콜의 모양을
+//    정한다(한 번 받고 끝).
+//
+// ⚠️ `idx*` 는 **`meshData` 가 싣는 패턴 정점 배열의 인덱스**여야 짝이 맞는다.
+//    같은 패턴의 `GetSimulationOutputMesh()` 를 쓰는지 여기서 단정하지 않고,
+//    아래에서 정점 수를 같이 실어 **받는 쪽이 대조할 수 있게** 한다 — 어긋나면
+//    로고가 엉뚱한 자리에 뜨는데, 그건 화면만 보고는 원인을 못 읽는다.
+//
+// ⚠️ 이 단위는 **목록까지만**이다. 메시 알맹이(무게중심·UV·인덱스)는 크기를
+//    재고 나서 싣는다 — 로고 하나가 삼각형 수천 개면 프레임과 같은 통로로
+//    보낼 수 없고, 그 판단의 근거가 지금은 없다.
+json ReadLogos(ZestManager& manager)
+{
+    json items = json::array();
+
+    ztSceneQueryInterface* qi = QueryInterface(manager);
+    if (!qi) return json{ { "logos", items } };
+
+    // 패턴 uuid → 시뮬 메시. 무게중심을 실제 좌표로 풀 때와, 정점 수를 대조할 때 쓴다
+    std::map<std::string, const ztDesignTriMesh*> patternMesh;
+    for (const auto& entry : qi->GetClothPatterns())
+    {
+        const ztDesignClothPattern* pattern = entry.second.get();
+        if (!pattern) continue;
+        patternMesh[ztUuidSaver::Convert(entry.first)] =
+            &pattern->GetSimulationOutputMesh().Read();
+    }
+
+    // 로고 그림들. `meshData` 와 **같은 표·같은 규약**이라 게이트웨이의
+    // `mapTextureTable` 이 그대로 id + URL 로 바꿔 준다 — 절대경로는 밖으로
+    // 나가지 않는다. 여기서 새 서빙 경로를 만들면 그 방어를 우회하게 된다.
+    TextureTable textures;
+
+    for (const auto& entry : qi->GetLogos())
+    {
+        const ztDesignLogo* logo = entry.second.get();
+        if (!logo) continue;
+
+        const ztDesignLogoData& d = logo->GetData();
+        const ztOverlayMesh&    base = logo->GetBasePseudoMesh();
+        const ztOverlayMesh&    smooth = logo->GetSmoothingPseudoMesh();
+
+        const std::string patternUuid = ztUuidSaver::Convert(d.patternUuid);
+
+        // 그림 파일. 로고 자산은 `ztAssetType::Logo` 아래에 있고, 앞면 basecolor 가
+        // 우리가 옷에 붙일 그림이다. 없으면 색만 있는 로고이거나 자산이 빠진 것이다
+        std::string tex;
+        std::string assetName;
+        {
+            const ztAssetInfo info = ztAssetManager::GetAssetInfo(d.assetUuid, ztAssetType::Logo);
+            // ⚠️ `Utf8()` 은 `std::wstring` 을 받는다. `ztString` 은 그 자체로는
+            //    안 넘어가므로 `toStdWString()` 을 거친다 (직물 쪽은 이미 wstring 이다)
+            const ztString display = info.displayName.size() == 0 ? info.name : info.displayName;
+            assetName = Utf8(display.toStdWString());
+            const ztString path = info.GetMaterialPath(ztAssetMaterialType::BASE);
+            tex = path.toStdString();
+        }
+
+        json item{
+            { "uuid",        ztUuidSaver::Convert(entry.first) },
+            { "patternUuid", patternUuid },
+            { "assetUuid",   ztUuidSaver::Convert(d.assetUuid) },
+            { "assetName",   assetName },
+            // 크기·자세. 데스크톱의 로고 속성 그대로다
+            { "width",          d.width },
+            { "height",         d.height },
+            { "angle",          d.angle },
+            { "offsetFromMesh", d.offsetFromMesh },
+            { "textureRatio",   d.textureRatio },
+            { "keepRatio",      d.keepRatio },
+            { "isMetal",        d.isMetal },
+            { "shareOnSeam",    d.shareOnSeam },
+            // ⚠️ 꺼져 있으면 3D 에 그리지 않는 것이 **데스크톱과 같은 동작**이다.
+            //    받는 쪽이 이 값을 무시하면 데스크톱에서 안 보이는 로고가 웹에만 뜬다
+            { "showIn3DView",   d.showIn3DView },
+            // 메시 크기 (이 단위의 목적). 알맹이는 아직 안 싣는다
+            { "basePoints",     (long long)base.GetPseudoVertices().size() },
+            { "baseIndices",    (long long)base.GetIndices().size() },
+            { "baseUv",         (long long)base.GetUV().size() },
+            { "smoothPoints",   (long long)smooth.GetPseudoVertices().size() },
+            { "smoothIndices",  (long long)smooth.GetIndices().size() },
+            { "hasTexture",     !tex.empty() },
+            // 경로가 있다고 파일이 있는 것은 아니다 — 직물과 같은 규약이다
+            { "textureExists",  !tex.empty()
+                                && std::filesystem::exists(std::filesystem::u8path(tex)) },
+        };
+
+        const int texIdx = textures.Add(tex);
+        if (texIdx >= 0) item["textureIndex"] = texIdx;
+
+        // 짝이 맞는 패턴이 씬에 있는가. 없으면 받는 쪽이 그릴 자리를 못 찾는다
+        const auto found = patternMesh.find(patternUuid);
+        const ztDesignTriMesh* src = found == patternMesh.end() ? nullptr : found->second;
+        item["patternFound"] = src != nullptr;
+        if (src) item["patternVertices"] = (long long)src->vertices.size();
+
+        // ── 메시 알맹이 ─────────────────────────────────────────
+        //
+        // 실측(`W_Track Pants.zls`): 점 41개 · 삼각형 49개. 이 크기면 목록에
+        // 같이 실어도 부담이 없어서 요청을 두 번으로 가르지 않았다.
+        //
+        // ★ **좌표가 아니라 무게중심을 싣는 것이 핵심이다.** 옷이 매 프레임
+        //   움직이는데 좌표를 실으면 로고도 매 프레임 다시 받아야 한다. 무게중심은
+        //   패턴의 삼각형 하나와 그 안의 비율이라 **한 번 받으면 끝**이고, 받는
+        //   쪽이 그 프레임의 옷 정점으로 다시 풀면 로고가 따라 움직인다.
+        //
+        // ⚠️ 그래서 `positions` 도 같이 싣는다 — **지금 이 순간의 정답**이다.
+        //    받는 쪽이 자기 계산과 이 값을 한 번 대조하면, 무게중심 규약을
+        //    잘못 읽었을 때 로고가 엉뚱한 자리에 뜨는 것을 화면이 아니라
+        //    숫자로 잡을 수 있다. 41개짜리라 비용은 없다.
+        {
+            const std::vector<ztBarycentricPos>& pts = base.GetPseudoVertices();
+            const ZELUS::zsArray<int>& idx = base.GetIndices();
+            const ZELUS::zsArray<ZELUS::zsVector2>& uvs = base.GetUV();
+
+            const std::size_t np = pts.size();
+
+            // 점 하나 = int32 3개(삼각형의 정점) + float 2개(비율) = 20바이트
+            std::vector<std::int32_t> tri;   tri.reserve(np * 3);
+            std::vector<float>        ratio; ratio.reserve(np * 2);
+            std::vector<float>        pos;   pos.reserve(np * 3);
+
+            bool posOk = src != nullptr;
+            for (std::size_t i = 0; i < np; ++i)
+            {
+                const ztBarycentricPos& b = pts[i];
+                tri.push_back(b.idx0);
+                tri.push_back(b.idx1);
+                tri.push_back(b.idx2);
+                ratio.push_back(b.ratio.x);
+                ratio.push_back(b.ratio.y);
+
+                if (!posOk) continue;
+                const std::size_t nv = src->vertices.size();
+                if (b.idx0 < 0 || b.idx1 < 0 || b.idx2 < 0
+                    || (std::size_t)b.idx0 >= nv || (std::size_t)b.idx1 >= nv
+                    || (std::size_t)b.idx2 >= nv)
+                {
+                    // 인덱스가 패턴 밖을 가리킨다. 좌표를 지어내지 않고 **통째로
+                    // 뺀다** — 반만 맞는 배열은 받는 쪽이 검증에 쓸 수 없다
+                    posOk = false;
+                    continue;
+                }
+                const ZELUS::zsVector3& v0 = src->vertices[b.idx0];
+                const ZELUS::zsVector3& v1 = src->vertices[b.idx1];
+                const ZELUS::zsVector3& v2 = src->vertices[b.idx2];
+                pos.push_back(v0.x + (v1.x - v0.x) * b.ratio.x + (v2.x - v0.x) * b.ratio.y);
+                pos.push_back(v0.y + (v1.y - v0.y) * b.ratio.x + (v2.y - v0.y) * b.ratio.y);
+                pos.push_back(v0.z + (v1.z - v0.z) * b.ratio.x + (v2.z - v0.z) * b.ratio.y);
+            }
+
+            std::vector<std::int32_t> ind; ind.reserve(idx.size());
+            for (int i = 0; i < idx.size(); ++i) ind.push_back(idx[i]);
+
+            std::vector<float> uv; uv.reserve(uvs.size() * 2);
+            for (int i = 0; i < uvs.size(); ++i) { uv.push_back(uvs[i].x); uv.push_back(uvs[i].y); }
+
+            if (!tri.empty())   item["tri"]     = Base64(tri.data(), tri.size() * sizeof(std::int32_t));
+            if (!ratio.empty()) item["ratio"]   = Base64(ratio.data(), ratio.size() * sizeof(float));
+            if (!ind.empty())   item["indices"] = Base64(ind.data(), ind.size() * sizeof(std::int32_t));
+            if (!uv.empty())    item["uv"]      = Base64(uv.data(), uv.size() * sizeof(float));
+            if (posOk && !pos.empty())
+                item["positions"] = Base64(pos.data(), pos.size() * sizeof(float));
+        }
+
+        items.push_back(std::move(item));
+    }
+
+    json out{ { "logos", items } };
+    // 빈 표를 실으면 받는 쪽이 "표는 왔는데 다 거절됐다" 로 읽는다 (직물과 같은 규약)
+    if (!textures.Empty()) out["textures"] = textures.ToJson();
+    return out;
+}
+
+
 /**
  * 실어 보낼 슬롯 셋.
  *
@@ -3393,6 +3578,17 @@ int RunProtocolLoop(ZestManager& manager)
                         curFrame.store(-1);
                         lastEmitted = -1;
                     }
+                }
+            }
+            else if (op == "logos")
+            {
+                if (!manager.IsLoadedZls())
+                {
+                    ok = false; error = "씬이 로드되지 않았습니다";
+                }
+                else
+                {
+                    result = ReadLogos(manager);
                 }
             }
             else if (op == "fabrics")

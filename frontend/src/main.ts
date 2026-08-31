@@ -75,6 +75,7 @@ import {
 } from './panels/index.ts';
 import {
   decodePatterns,
+  decodeTextureTable,
   // ⛔ `downloadExport` 는 스냅샷 로더만 쓰던 것이라 H-1 에서 같이 뗐다.
   //    `protocol/http.ts` 의 함수 자체는 남아 있고 스모크 §8-10 이 쓴다.
   fetchHealth,
@@ -108,6 +109,7 @@ import {
   //    `SnapshotLoaderStats` 는 H-1 에서 뗐다. **모듈은 그대로 있다** —
   //    `viewer3d/index.ts` 가 계속 내보내고 스모크 §8-8·§8-9 가 쓴다.
   Viewer3D,
+  type LogoData,
   type DecodedTopology,
   type FrameStreamStats,
 } from './viewer3d/index.ts';
@@ -1570,8 +1572,51 @@ async function restageTopology(cause: string): Promise<RestageOutcome> {
   //   없어도 옷은 서야 하므로 여기서 기다리지 않고, 이 함수는 이미 `staged` 다.
   //   대신 순번을 물려줘서, 늦게 도착한 커브가 새 도면 위에 그려지는 것은
   //   막는다.
+  // 로고도 토폴로지에 딸려 있다 (LG-1). 패턴 메시가 새로 섰으므로 자식도
+  // 다시 붙여야 한다 — 안 하면 로고가 옛 메시와 함께 사라진다
+  void installLogos(cause);
   void refreshDesign2d(() => seq === restageSeq);
   return 'staged';
+}
+
+/**
+ * 옷 위의 그래픽을 세운다 (LG-1).
+ *
+ * **토폴로지가 선 뒤에 부른다** — 로고는 패턴 메시의 자식으로 붙으므로 부모가
+ * 없으면 세울 자리가 없다. 그래서 씬 로드와 `restageTopology` 두 자리에서 부른다
+ * (직물을 갈아입히면 토폴로지가 새로 서고, 그때 로고도 같이 다시 세워야 한다).
+ *
+ * ⚠️ **실패해도 옷은 서야 한다.** 로고가 없거나 그림을 못 받는 것은 씬이 안
+ *    열리는 것과 무게가 다르다 — 던지지 않고 사유만 로그에 남긴다.
+ * ⚠️ 건너뛴 로고의 사유를 그대로 로그에 싣는다. "로고가 안 보인다" 의 원인이
+ *    넷(끔 / 메시 없음 / 패턴 없음 / 그림 없음)인데 화면에서는 넷 다 똑같이
+ *    "안 보인다" 로만 보인다.
+ */
+async function installLogos(cause: string): Promise<void> {
+  if (!currentScene || !client.connected) return;
+  try {
+    const res = await client.logos();
+    const textures = decodeTextureTable(res.textures, '로고 textures');
+    const placed = viewer.cloth.logos.set(
+      res.logos as unknown as LogoData[],
+      (i) => {
+        const asset = textures[i];
+        // 무늬와 **같은 캐시 규약**이다 — 색공간·flipY 를 여기서 다시 정하지 않는다
+        return asset ? viewer.cloth.logoTexture(asset) : null;
+      },
+      (patternUuid) => viewer.cloth.meshOf(patternUuid),
+    );
+    // 좌표는 아직 비어 있다(0으로 만든 버퍼). 지금 옷의 자세로 한 번 푼다 —
+    // 안 하면 첫 프레임이 올 때까지 로고가 원점에 뭉쳐 있다
+    viewer.cloth.logos.update((uuid) => viewer.cloth.positionsOf(uuid));
+
+    if (placed.placed > 0 || placed.skipped.length > 0) {
+      const why = placed.skipped.map((x) => x.why).join(' · ');
+      log(`${cause} — 로고 ${placed.placed}개를 세웠습니다${why === '' ? '' : ` (건너뜀: ${why})`}`);
+    }
+  } catch (err: unknown) {
+    log(`${cause} — 로고를 받지 못했습니다: ${message(err)}`);
+  }
 }
 
 async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<void> {
@@ -1614,6 +1659,8 @@ async function show(sceneId: string, opts: { refit?: boolean } = {}): Promise<vo
     // ★ 2D 도면 좌표를 여기서 한 번 만든다 (#15-b). `uvs`·`transform2d` 는
     //   topology 와 함께 한 번만 오므로 프레임마다 다시 만들 이유가 없다 —
     //   정점 3,022~13,398개에 행렬 곱이 붙는 일을 로드당 1회로 묶는다.
+    // 옷 위의 그래픽 (LG-1). **성패에 묶지 않는다** — 커브와 같은 판단이다
+    void installLogos('로드');
     unfolder.build(viewer.cloth.patterns);
     unfoldControl.setScene(true);
     unfoldControl.setStats(unfolder.stats);

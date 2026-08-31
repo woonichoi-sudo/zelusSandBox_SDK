@@ -51,6 +51,7 @@ import {
   type SetAvatarBodyResult,
   type SetAvatarMeasurementsResult,
   type FabricsResult,
+  type LogosResult,
   type SetFabricResult,
   type SurfacesResult,
   type Design2DResult,
@@ -640,6 +641,18 @@ export class GatewayClient {
    */
   fabrics(): Promise<FabricsResult> {
     return this.request<FabricsResult>('fabrics');
+  }
+
+  /**
+   * 옷 위의 그래픽(로고) 목록과 그 메시 (LG-1). 씬을 안 바꾼다.
+   *
+   * ★ **한 번만 받으면 된다.** 메시가 좌표가 아니라 패턴 기준 무게중심이라
+   *   옷이 움직여도 다시 받을 필요가 없다 — 푸는 것은 `viewer3d/logos.ts` 다.
+   * ⚠️ 그림은 `textures` 표를 탄다 — `meshData` 와 **같은 규약**이라 절대경로가
+   *    아니라 id + URL 로 온다.
+   */
+  logos(): Promise<LogosResult> {
+    return this.request<LogosResult>('logos');
   }
 
   /**

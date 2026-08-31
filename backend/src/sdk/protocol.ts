@@ -46,6 +46,14 @@ export type Request =
   | { id: number; op: 'loadDraping'; uuid?: string }
   /** 아이템 하나의 미리보기 이미지 (base64). 목록에는 안 실린다 (DB-1) */
   | { id: number; op: 'drapingThumbnail'; uuid: string }
+  /**
+   * 옷 위에 얹힌 그래픽(프린트·자수) 목록. 부작용이 없다 (LG-1).
+   *
+   * **원단 텍스처와 다른 계층이다** — 직물을 아무리 잘 입혀도 이것을 따로 싣지
+   * 않으면 로고가 화면에 안 나온다. 지금은 목록·크기까지이고, 메시 알맹이는
+   * 크기를 재고 나서 정한다.
+   */
+  | { id: number; op: 'logos' }
   | { id: number; op: 'surfaces' }
   | { id: number; op: 'setSurfaceSize'; uuid: string; width?: number; height?: number }
   | { id: number; op: 'fabrics' }
@@ -902,6 +910,64 @@ export interface FabricInfo {
    * 뜬다(액세서리 작업에서 실제로 밟았다). **고르기 전에 알 수 있어야 한다.**
    */
   textureExists: boolean;
+}
+
+/**
+ * 옷 위의 그래픽 — 로고 (LG-1).
+ *
+ * ★ **메시가 좌표가 아니라 무게중심이다.** `tri`(패턴 삼각형의 정점 색인 3개)와
+ *   `ratio`(그 안의 비율 2개)로 한 점이 정해지고, 받는 쪽이
+ *   `p = v0 + (v1-v0)·x + (v2-v0)·y` 로 푼다. 옷이 매 프레임 움직여도 **다시
+ *   받을 필요가 없다** — 이 사실이 프로토콜의 모양을 정했다.
+ * ⓘ `positions` 는 그 순간의 정답 좌표다. 받는 쪽이 자기 계산을 한 번 대조해
+ *   규약을 잘못 읽은 것을 숫자로 잡으라고 같이 싣는다(실측 오차 0.000006cm).
+ */
+export interface LogoInfo {
+  uuid: string;
+  /** 이 로고가 붙은 패턴. `meshData` 의 패턴 uuid 와 같은 문자열이다 */
+  patternUuid: string;
+  assetUuid: string;
+  assetName: string;
+  /** cm */
+  width: number;
+  height: number;
+  angle: number;
+  /** 메시에서 띄우는 거리(cm). 0 이면 옷과 같은 면이라 얼룩진다 */
+  offsetFromMesh: number;
+  textureRatio: number;
+  keepRatio: boolean;
+  isMetal: boolean;
+  shareOnSeam: boolean;
+  /** 꺼져 있으면 3D 에 그리지 않는다 — 데스크톱과 같은 동작이다 */
+  showIn3DView: boolean;
+  /** 짝이 되는 패턴이 씬에 있는가. 없으면 받는 쪽이 그릴 자리를 못 찾는다 */
+  patternFound: boolean;
+  patternVertices?: number;
+  basePoints: number;
+  baseIndices: number;
+  baseUv: number;
+  smoothPoints: number;
+  smoothIndices: number;
+  hasTexture: boolean;
+  textureExists: boolean;
+  /** `textures` 표의 색인 */
+  textureIndex?: number;
+  /** base64 — int32 3개씩 */
+  tri?: string;
+  /** base64 — float 2개씩 */
+  ratio?: string;
+  /** base64 — int32 */
+  indices?: string;
+  /** base64 — float 2개씩 */
+  uv?: string;
+  /** base64 — float 3개씩. 지금 이 순간의 정답 좌표 (위 ⓘ) */
+  positions?: string;
+}
+
+export interface LogosResult {
+  logos: LogoInfo[];
+  /** 로고 그림. `meshData` 와 **같은 표**다 — 게이트웨이가 id + URL 로 바꾼다 */
+  textures?: TextureEntry[];
 }
 
 export interface FabricsResult {

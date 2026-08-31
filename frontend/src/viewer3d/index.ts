@@ -30,6 +30,7 @@
  */
 export { AvatarObject, type AvatarPartMesh } from './avatar.ts';
 export { ClothObject, type PatternMesh } from './cloth.ts';
+export { LogoLayer, type LogoData } from './logos.ts';   // 옷 위의 그래픽 (LG-1)
 export {
   FrameStream,
   type DrainOutcome,

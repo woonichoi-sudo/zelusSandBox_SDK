@@ -59,6 +59,7 @@ import { planFor, tintColorProfile } from '../panels/index.ts';
 import type {
   DecodedPattern, PatternMaterial, PatternTransform2D, TextureAsset,
 } from '../protocol/index.ts';
+import { LogoLayer } from './logos.ts';   // 옷 위의 그래픽 (LG-1)
 import { applyPlan, TextureCache } from './textures.ts';
 
 /** 패턴 하나에 대응하는 three 객체 묶음 */
@@ -162,6 +163,16 @@ function toIndexArray(indices: Int32Array): Uint32Array {
 /** 옷 한 벌. `group` 을 씬에 붙이면 된다 */
 export class ClothObject {
   readonly group = new THREE.Group();
+
+  /**
+   * 옷 위의 그래픽 (LG-1). **옷이 소유한다.**
+   *
+   * 배선을 밖에 두면 `updatePositions()` 를 부르는 자리마다(프레임 스트림 ·
+   * 리셋 · 드레이프 · 치수) 로고 갱신을 따로 이어 붙여야 하고, 한 곳을
+   * 빠뜨리는 날 **옷만 움직이고 로고는 옛 자리에 남는다.** 여기 두면
+   * 통로가 하나다.
+   */
+  readonly logos = new LogoLayer();
 
   /** 삽입 순서를 유지한다 — 색 배정이 로드할 때마다 달라지면 안 된다 */
   readonly #byUuid = new Map<string, PatternMesh>();
@@ -375,6 +386,30 @@ export class ClothObject {
    *    `transform` 이 애초에 오지 않고, `Mesh` 에 걸어 둔 값은 우리가 건드리지
    *    않는 한 그대로 살아 있다. 정점만 갈아 끼우는 것이 맞다.
    */
+  /**
+   * 패턴 uuid → 지금 화면에 선 그 패턴의 정점 배열. 로고가 자기 좌표를 풀 때
+   * 쓴다 (LG-1). 없으면 null — 지어내지 않는다.
+   */
+  /** 패턴 uuid → 화면의 그 메시. 로고가 자식으로 붙을 부모다 (LG-1) */
+  meshOf(patternUuid: string): THREE.Mesh | null {
+    return this.#byUuid.get(patternUuid)?.mesh ?? null;
+  }
+
+  /**
+   * 로고 그림 하나 (LG-1). **옷의 캐시를 그대로 쓴다** — 로고가 자기 캐시를
+   * 따로 가지면 씬을 갈아 끼울 때 지우는 자리가 두 곳이 되고, 한쪽만 지우는
+   * 날 옛 씬의 그림이 새 옷에 남는다.
+   */
+  logoTexture(asset: TextureAsset): THREE.Texture {
+    // basecolor 로 읽는다 — sRGB 이고, 옷 무늬와 같은 규약이다
+    return this.#cache.get(asset.url, 'basecolor', false);
+  }
+
+  positionsOf(patternUuid: string): Float32Array | null {
+    const target = this.#byUuid.get(patternUuid);
+    return target ? (target.position.array as Float32Array) : null;
+  }
+
   updatePositions(patterns: readonly DecodedPattern[]): boolean {
     if (patterns.length !== this.#byUuid.size) return false;
 
@@ -397,6 +432,9 @@ export class ClothObject {
       //   그래빙)이 같은 값을 쓴다.
       target.geometry.computeBoundingSphere();
     }
+    // ★ **옷을 쓴 뒤에 부른다** (LG-1). 먼저 부르면 로고가 한 프레임 뒤처져
+    //   빠르게 움직일 때 옷 밖으로 삐져나온다.
+    this.logos.update((uuid) => this.positionsOf(uuid));
     return true;
   }
 
@@ -439,6 +477,9 @@ export class ClothObject {
       if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
       else mat.dispose();
     }
+    // 로고는 패턴 메시의 **자식**이라 위에서 부모를 지우면 화면에서는 같이
+    // 사라지지만, 지오메트리·머티리얼은 남는다. 명시적으로 내린다
+    this.logos.clear();
     this.#byUuid.clear();
     this.#vertices = 0;
     this.#triangles = 0;

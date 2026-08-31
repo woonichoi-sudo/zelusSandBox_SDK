@@ -609,6 +609,15 @@ const buildMeshData: Build = (msg, ctx) => {
  *    법선을 싣는 쪽이 기본이므로, 여기서도 "없으면 true" 로 맞춘다 —
  *    `=== true` 로 접으면 게이트웨이를 지나는 순간 기본값이 뒤집힌다.
  */
+/**
+ * `logos` — 인자가 없다. 옷과 **같은 텍스처 표**를 쓰므로 `build` 가 필요하다
+ * (`mapResult` 는 `OpRule` 이 아니라 build 의 반환값에 실린다).
+ */
+const buildLogos: Build = (_msg, ctx) => ({
+  payload: {},
+  mapResult: mapTextureTable(ctx.textures),
+});
+
 const buildAvatarMesh: Build = (msg, ctx) => {
   const topology = msg['topology'];
   if (topology !== undefined && typeof topology !== 'boolean') {
@@ -733,6 +742,19 @@ const OPS: Record<Op, OpRule> = {
   // 처리하고, 무한정 쌓이는 것은 연결당 동시 요청 상한(maxInflight)이 막는다.
   // 게다가 **아이템당 한 번이면 되는 물건이다**(같은 씬에서 안 변한다).
   drapingThumbnail: { allow: true, build: buildDrapingThumbnail },
+
+  // ── 로고 (LG-1) ───────────────────────────────────────────
+  //
+  // 읽기는 무해하다 — 옷 위 그래픽의 목록과 크기 · 메시 크기를 돌려줄 뿐이고
+  // 씬을 안 바꾼다. 그림 바이트는 여기 안 실린다(경로 여부만 온다).
+  //
+  // ⚠️ 씬을 요구하는 것은 **워커의 판단이다** —  와 같은 규약이라
+  //    "로고가 없는 씬" 과 "씬이 없음" 이 화면에서 다른 말로 갈린다.
+  // `mapResult` 는 `meshData` 와 같은 것을 쓴다 — 워커가 로고 그림을 같은 `textures`
+  // 표로 싣기 때문이다. 절대경로가 아니라 등록된 id + URL 만 밖으로 나간다.
+  // 로고 그림은 `meshData` 와 **같은 `textures` 표**로 오므로 매핑도 같은 함수를
+  // 쓴다 — 절대경로가 아니라 등록된 id + URL 만 밖으로 나간다.
+  logos: { allow: true, build: buildLogos },
 
   // ── 옷 사이즈 (L-3b) ──────────────────────────────────────
   //

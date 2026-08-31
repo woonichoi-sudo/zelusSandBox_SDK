@@ -67,6 +67,10 @@ export type {
   FabricInfo,
   FabricsResult,
   SetFabricResult,
+  // 옷 위의 그래픽 (LG-1). ★ 메시가 좌표가 아니라 **패턴 기준 무게중심**이라
+  // 한 번만 받으면 된다 — 푸는 것은 `viewer3d/logos.ts` 다.
+  LogoInfo,
+  LogosResult,
   // 디자인 기반 2D (D2-a). ★ 좌표가 **월드 2D 다** — 화면이 transform2d 를
   // 다시 곱하면 두 번 적용된다. 원본 주석 참고
   Design2DCurve,
