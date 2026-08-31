@@ -383,12 +383,6 @@
       }
       .menubar .mright { justify-content: flex-end; }
       .menubar .mright label { opacity: 0.55; }
-      .applogo {
-        display: inline-flex; align-items: center; justify-content: center;
-        width: 1.2rem; height: 1.2rem; margin-right: 0.3rem;
-        border-radius: 3px; background: var(--accent-dim); color: var(--accent-hi);
-        font-weight: 700; font-size: 11px; user-select: none;
-      }
       /* 긴 씬 이름이 메뉴를 밀어내지 않게 자른다. 전체 이름은 title 툴팁이다 */
       .mtitle {
         flex: 0 1 auto; min-width: 0;
@@ -886,7 +880,13 @@
     -->
     <div class="menubar" id="menubar">
       <div class="mgroup">
-        <span class="applogo" aria-hidden="true">Z</span>
+        <!--
+          ⛔ **앱 마크를 두지 않는다.** 데스크톱 창은 왼쪽 위 아이콘이 있어야 어느
+             프로그램인지 알 수 있지만, 브라우저는 탭의 파비콘과 제목이 이미 그
+             일을 한다. 글자 한 자로 만든 자리표시는 로고를 아직 안 넣은 것으로
+             읽힌다 — 위 메뉴 주석과 같은 규칙이다(소스가 외부로 나간다).
+             진짜 로고 자산이 생기면 그때 여기에 넣는다.
+        -->
         <!--
           ⚠️ 메뉴 이름은 `<button>` 이라야 한다. `<div>` 에 클릭만 달면 키보드로
              닿지 않는다 — Tab 으로 씬을 열 수 있어야 한다.
@@ -932,13 +932,18 @@
           </div>
         </div>
         <!--
-          ⛔ [편집] · [창] · [도움말] 은 **껍데기다.** 데스크톱의 그 메뉴들에
-             대응하는 기능이 웹에 아직 없어서 눌리지 않게 두었다. 자리를 미리
-             잡아 두는 것과 있는 척하는 것은 다르다 — 그래서 `disabled` 다.
+          ⛔ **[편집] · [창] · [도움말] 을 두지 않는다.** 데스크톱 메뉴바의 모양을
+             맞추려고 눌리지 않는 버튼 셋을 세웠다가 뺐다(2026-08-31). 이 저장소는
+             **소스째로 외부에 나간다** — 받는 쪽에서 동작하지 않는 메뉴는 미완성
+             표시가 아니라 그냥 고장으로 읽힌다.
+
+             툴바에 도형·아바타 생성 아이콘을 안 만든 것과 같은 규칙이다(아래
+             툴바 주석). 자리를 미리 잡아 두는 것과 있는 척하는 것은 다르고,
+             메뉴는 그 규칙에서 예외가 아니다.
+
+             ⓘ 넣는다면 **기능과 함께** 넣는다. 지금 있는 것으로 채울 수 있는
+               후보는 [창](설정 칸 여닫기 · 로그)과 [도움말](단축키 안내)이다.
         -->
-        <button class="menubtn" disabled data-i18n="menu.edit">편집</button>
-        <button class="menubtn" disabled data-i18n="menu.window">창</button>
-        <button class="menubtn" disabled data-i18n="menu.help">도움말</button>
       </div>
       <!-- 지금 열려 있는 씬. `main.ts` 가 채운다 (위 주석 참고) -->
       <div class="mtitle" id="docTitle"></div>

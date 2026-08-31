@@ -126,12 +126,9 @@ const KO: Dict = {
   'bar.status.booting': '시작하는 중…',
 
   // ── 메뉴바 (L-4) ────────────────────────────────────────
-  // ⛔ [편집]·[창]·[도움말] 은 눌리지 않는 껍데기다. 글자만 있는 이유는
-  //    index.html 의 그 자리 주석 참고.
+  // ⛔ `menu.edit`·`menu.window`·`menu.help` 는 **두지 않는다.** 대응 기능이
+  //    없는 메뉴를 만들지 않기로 했다 — 근거는 index.html 의 그 자리 주석.
   'menu.file': '파일',
-  'menu.edit': '편집',
-  'menu.window': '창',
-  'menu.help': '도움말',
   // 씬이 없을 때 메뉴바 가운데에 서는 글자. 데스크톱의 `Untitled.zls` 자리다
   'menu.untitled': '제목 없음',
 
@@ -541,9 +538,6 @@ const EN: Dict = {
 
   // ── 메뉴바 (L-4) ────────────────────────────────────────
   'menu.file': 'File',
-  'menu.edit': 'Edit',
-  'menu.window': 'Window',
-  'menu.help': 'Help',
   'menu.untitled': 'Untitled',
 
   // ── 상태 바 (L-4) ───────────────────────────────────────
